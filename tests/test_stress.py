@@ -231,7 +231,7 @@ async def test_a5_model_learns() -> tuple[bool, str]:
             await val.apply_best_gradients(w, results)
 
         loss_w5 = eval_loss(val.model, env.dataset)
-        init_params = list(make_model(env.cfg).state_dict().values())
+        init_params = list(make_model(env.cfg).to(DEVICE).state_dict().values())
         curr_params = list(val.model.state_dict().values())
         weights_changed = any(not torch.equal(a, b) for a, b in zip(init_params, curr_params))
 

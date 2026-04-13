@@ -23,3 +23,4 @@ class HParams:
     score_ema_alpha: float = 0.3
     eval_timeout: float = 60.0
     apply_timeout: float = 60.0
+    use_amp: bool = False

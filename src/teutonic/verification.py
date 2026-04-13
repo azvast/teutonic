@@ -16,6 +16,7 @@ at the same positions.
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -139,10 +140,12 @@ def verify_loss_ledger(
     loss_ledger: list[float],
     spot_check_indices: list[int],
     device: torch.device | str = "cpu",
+    use_amp: bool = False,
 ) -> LossVerificationResult:
     """Replay selected micro-batches (forward only) and compare losses."""
     model.eval()
     result = LossVerificationResult()
+    amp_ctx = torch.autocast(str(device), dtype=torch.bfloat16) if use_amp else nullcontext()
 
     with torch.no_grad():
         for k in spot_check_indices:
@@ -164,10 +167,11 @@ def verify_loss_ledger(
             inputs = tokens[:, :-1]
             targets = tokens[:, 1:]
 
-            logits = model(inputs)
-            replayed_loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)), targets.reshape(-1)
-            ).item()
+            with amp_ctx:
+                logits = model(inputs)
+                replayed_loss = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)), targets.reshape(-1)
+                ).item()
 
             if not math.isfinite(replayed_loss):
                 logger.warning("verify.loss.replay_nan", index=k)
@@ -204,6 +208,7 @@ def verify_gradient_probes(
     probe_spec: ProbeSpec,
     device: torch.device | str = "cpu",
     n_batches_trained: int | None = None,
+    use_amp: bool = False,
 ) -> ProbeVerificationResult:
     """Replay individual batches and compare per-batch gradient slices.
 
@@ -229,10 +234,12 @@ def verify_gradient_probes(
         inputs = tokens[:, :-1]
         targets = tokens[:, 1:]
 
-        logits = model(inputs)
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)), targets.reshape(-1)
-        )
+        amp_ctx = torch.autocast(str(device), dtype=torch.bfloat16) if use_amp else nullcontext()
+        with amp_ctx:
+            logits = model(inputs)
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)), targets.reshape(-1)
+            )
         loss.backward()
 
         for pp in probe_spec.params:

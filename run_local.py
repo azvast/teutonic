@@ -281,4 +281,6 @@ async def run_local(n_windows: int = 3) -> None:
 
 if __name__ == "__main__":
     setup_logging(level="INFO", json_output=False)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     asyncio.run(run_local())

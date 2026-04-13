@@ -23,7 +23,7 @@ import random
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -173,7 +173,8 @@ class CheatingMiner:
                                  self.hp.n_probe_params, self.hp.probe_slice_size)
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.hp.lr)
         result = train_window(self.model, self.dataset, sampler, optimizer,
-                              device=self.device, probe_params=pp)
+                              device=self.device, probe_params=pp,
+                              use_amp=self.hp.use_amp)
         compressed = compress_model_gradients(self.model, self.compressor)
         compressed = {
             pname: {"idxs": comp["idxs"], "vals": torch.randn_like(comp["vals"]), "shape": comp["shape"]}
@@ -390,7 +391,7 @@ async def run_tier(tier_num: int) -> dict[str, Any]:
           f"layers={cfg.n_layers} heads={cfg.n_heads} seq={cfg.seq_len}")
     print(f"  HParams: max_batches={tier.hp.max_batches} micro_bs={tier.hp.micro_bs} "
           f"topk={tier.hp.topk} n_probes={tier.hp.n_probes}")
-    print(f"  Device: {DEVICE}")
+    print(f"  Device: {DEVICE}  AMP: {tier.hp.use_amp}")
     print("=" * 65)
 
     t_total = time.time()
@@ -455,9 +456,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Model scale-up test")
     parser.add_argument("--tier", type=int, default=None, help="Run a single tier (1-5)")
     parser.add_argument("--all", action="store_true", help="Run all tiers sequentially")
+    parser.add_argument("--amp", action="store_true", help="Enable bf16 autocast")
     args = parser.parse_args()
 
     setup_logging(level="WARNING")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    if args.amp:
+        for t in TIERS.values():
+            t.hp = replace(t.hp, use_amp=True)
 
     if args.all:
         tiers = list(TIERS.keys())

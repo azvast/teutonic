@@ -222,6 +222,7 @@ class Validator:
         loss_result = verify_loss_ledger(
             self.model, self.dataset, sampler,
             submission.loss_ledger, spot_indices, device=self.device,
+            use_amp=self.hp.use_amp,
         )
         result.loss_result = loss_result
         result.loss_score = loss_result.score(atol=self.slash_cfg.loss_atol)
@@ -242,6 +243,7 @@ class Validator:
             self.model, self.dataset, sampler,
             submission.grad_probes, probe_spec, device=self.device,
             n_batches_trained=n_trained,
+            use_amp=self.hp.use_amp,
         )
         result.probe_result = probe_result
         result.probe_score = probe_result.mean_similarity

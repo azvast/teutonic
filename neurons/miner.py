@@ -84,6 +84,7 @@ class Miner:
                 deadline=deadline,
                 upload_budget_s=self.hp.upload_budget_s,
                 probe_params=probe_params,
+                use_amp=self.hp.use_amp,
             )
         except Exception:
             logger.exception("miner.window.crashed", window=window, global_step=self.global_step)

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import time
+from contextlib import nullcontext
 from typing import Any
 
 import structlog
@@ -37,6 +38,7 @@ def train_window(
     deadline: float | None = None,
     upload_budget_s: float = 10.0,
     probe_params: tuple[ProbeParam, ...] = (),
+    use_amp: bool = False,
 ) -> dict[str, Any]:
     """Run one window of pure-accumulation training.
 
@@ -75,8 +77,10 @@ def train_window(
         inputs = tokens[:, :-1]
         targets = tokens[:, 1:]
 
-        logits = model(inputs)
-        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+        amp_ctx = torch.autocast(str(device), dtype=torch.bfloat16) if use_amp else nullcontext()
+        with amp_ctx:
+            logits = model(inputs)
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
         loss_val = loss.item()
 
         if not math.isfinite(loss_val):

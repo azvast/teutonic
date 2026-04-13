@@ -49,7 +49,7 @@ class KingConfig:
 
     hf_repo: str = ""
     hf_token: str = ""
-    local_cache_dir: str = "/tmp/koth/king"
+    local_cache_dir: str = "/tmp/teutonic/king"
 
 
 @dataclass
@@ -74,7 +74,7 @@ class PodConfig:
 
 
 @dataclass
-class KOTHConfig:
+class TeutonicConfig:
     """Top-level configuration for the entire system."""
 
     eval: EvalConfig = field(default_factory=EvalConfig)

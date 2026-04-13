@@ -22,7 +22,7 @@ from pathlib import Path
 import bittensor as bt
 
 from .commit import RevealScanner
-from .config import KOTHConfig
+from .config import TeutonicConfig
 from .king import KingManager
 from .orchestrator import PodOrchestrator, poll_for_verdict
 from .r2 import R2Client
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 class Validator:
     """King of the Hill validator coordinator."""
 
-    def __init__(self, config: KOTHConfig):
+    def __init__(self, config: TeutonicConfig):
         self.config = config
         self.r2 = R2Client(config.r2)
         self.state = ValidatorState(self.r2)
@@ -60,7 +60,7 @@ class Validator:
 
     def initialize(self) -> None:
         """Initialize the validator: load state, download king, wire up scanner."""
-        logger.info("Initializing KOTH validator...")
+        logger.info("Initializing Teutonic validator...")
         self.state.load()
 
         self.scanner = RevealScanner(
@@ -83,7 +83,7 @@ class Validator:
     def run(self) -> None:
         """Main loop: poll for commits, evaluate challengers, update king."""
         self.initialize()
-        logger.info("KOTH validator running. Polling every %ds.", self.config.poll_interval_s)
+        logger.info("Teutonic validator running. Polling every %ds.", self.config.poll_interval_s)
 
         while True:
             try:
@@ -144,7 +144,7 @@ class Validator:
             return
 
         # Spin up eval pod
-        pod_name = f"koth-eval-{challenge_id}"
+        pod_name = f"teutonic-eval-{challenge_id}"
         pod = None
         try:
             pod = self.orchestrator.start_pod(pod_name)

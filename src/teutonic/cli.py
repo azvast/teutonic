@@ -1,4 +1,4 @@
-"""CLI entry points for the KOTH system."""
+"""CLI entry points for the Teutonic system."""
 
 from __future__ import annotations
 
@@ -15,48 +15,48 @@ logging.basicConfig(
 
 
 def _load_config():
-    """Load KOTHConfig from environment variables or a JSON file."""
+    """Load TeutonicConfig from environment variables or a JSON file."""
     from .config import (
-        KOTHConfig, EvalConfig, BoundingBoxConfig, R2Config,
+        TeutonicConfig, EvalConfig, BoundingBoxConfig, R2Config,
         KingConfig, ChainConfig, PodConfig,
     )
 
-    return KOTHConfig(
+    return TeutonicConfig(
         eval=EvalConfig(
-            N=int(os.getenv("KOTH_EVAL_N", "10000")),
-            alpha=float(os.getenv("KOTH_EVAL_ALPHA", "0.01")),
-            sequence_length=int(os.getenv("KOTH_SEQUENCE_LENGTH", "2048")),
+            N=int(os.getenv("TEUTONIC_EVAL_N", "10000")),
+            alpha=float(os.getenv("TEUTONIC_EVAL_ALPHA", "0.01")),
+            sequence_length=int(os.getenv("TEUTONIC_SEQUENCE_LENGTH", "2048")),
         ),
         bounding_box=BoundingBoxConfig(
-            max_linf=float(os.getenv("KOTH_BBOX_MAX_LINF", "0.5")),
-            max_l2_global=float(os.getenv("KOTH_BBOX_MAX_L2_GLOBAL", "0")) or None,
+            max_linf=float(os.getenv("TEUTONIC_BBOX_MAX_LINF", "0.5")),
+            max_l2_global=float(os.getenv("TEUTONIC_BBOX_MAX_L2_GLOBAL", "0")) or None,
         ),
         r2=R2Config(
-            endpoint_url=os.getenv("KOTH_R2_ENDPOINT", ""),
-            bucket_name=os.getenv("KOTH_R2_BUCKET", ""),
-            access_key_id=os.getenv("KOTH_R2_ACCESS_KEY", ""),
-            secret_access_key=os.getenv("KOTH_R2_SECRET_KEY", ""),
+            endpoint_url=os.getenv("TEUTONIC_R2_ENDPOINT", ""),
+            bucket_name=os.getenv("TEUTONIC_R2_BUCKET", ""),
+            access_key_id=os.getenv("TEUTONIC_R2_ACCESS_KEY", ""),
+            secret_access_key=os.getenv("TEUTONIC_R2_SECRET_KEY", ""),
         ),
         king=KingConfig(
-            hf_repo=os.getenv("KOTH_KING_REPO", ""),
+            hf_repo=os.getenv("TEUTONIC_KING_REPO", ""),
             hf_token=os.getenv("HF_TOKEN", ""),
-            local_cache_dir=os.getenv("KOTH_CACHE_DIR", "/tmp/koth/king"),
+            local_cache_dir=os.getenv("TEUTONIC_CACHE_DIR", "/tmp/teutonic/king"),
         ),
         chain=ChainConfig(
-            netuid=int(os.getenv("KOTH_NETUID", "3")),
-            network=os.getenv("KOTH_NETWORK", "finney"),
-            wallet_name=os.getenv("KOTH_WALLET_NAME", "default"),
-            wallet_hotkey=os.getenv("KOTH_WALLET_HOTKEY", "default"),
+            netuid=int(os.getenv("TEUTONIC_NETUID", "3")),
+            network=os.getenv("TEUTONIC_NETWORK", "finney"),
+            wallet_name=os.getenv("TEUTONIC_WALLET_NAME", "default"),
+            wallet_hotkey=os.getenv("TEUTONIC_WALLET_HOTKEY", "default"),
         ),
         pod=PodConfig(
-            gpu_type=os.getenv("KOTH_GPU_TYPE", "rtx4090"),
+            gpu_type=os.getenv("TEUTONIC_GPU_TYPE", "rtx4090"),
         ),
-        poll_interval_s=int(os.getenv("KOTH_POLL_INTERVAL", "12")),
+        poll_interval_s=int(os.getenv("TEUTONIC_POLL_INTERVAL", "12")),
     )
 
 
 def run_validator():
-    """Run the KOTH validator coordinator."""
+    """Run the Teutonic validator coordinator."""
     from .validator import Validator
 
     config = _load_config()
@@ -65,8 +65,8 @@ def run_validator():
 
 
 def run_miner():
-    """Run the KOTH reference miner."""
-    parser = argparse.ArgumentParser(description="KOTH Reference Miner")
+    """Run the Teutonic reference miner."""
+    parser = argparse.ArgumentParser(description="Teutonic Reference Miner")
     parser.add_argument("--king-repo", required=True, help="HF repo of the current king")
     parser.add_argument("--miner-repo", required=True, help="Your HF repo to upload the challenger")
     parser.add_argument("--dataset", default="", help="Path to tokenized .npy dataset shard")
@@ -101,7 +101,7 @@ def run_miner():
 
 def seed_king():
     """Upload an initial seed model to the king repo."""
-    parser = argparse.ArgumentParser(description="Seed the KOTH king model")
+    parser = argparse.ArgumentParser(description="Seed the king model")
     parser.add_argument("--model-dir", required=True, help="Path to the seed model directory")
     parser.add_argument("--king-repo", required=True, help="HF repo for the king")
     args = parser.parse_args()
@@ -110,7 +110,7 @@ def seed_king():
 
     mgr = KingManager(
         hf_repo=args.king_repo,
-        cache_dir="/tmp/koth/king",
+        cache_dir="/tmp/teutonic/king",
         hf_token=os.getenv("HF_TOKEN", ""),
     )
     king_hash = mgr.upload_seed(args.model_dir)
@@ -139,7 +139,7 @@ def show_state():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="King of the Hill")
+    parser = argparse.ArgumentParser(description="Teutonic")
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("validator", help="Run the validator coordinator")

@@ -1,5 +1,5 @@
 [project]
-name = "koth"
+name = "teutonic"
 version = "0.1.0"
 description = "King of the Hill: decentralized pretraining via sequential sign test"
 requires-python = ">=3.11"
@@ -15,11 +15,11 @@ dependencies = [
 ]
 
 [project.scripts]
-koth = "koth.cli:main"
-koth-validator = "koth.cli:run_validator"
-koth-miner = "koth.cli:run_miner"
-koth-seed = "koth.cli:seed_king"
-koth-state = "koth.cli:show_state"
+teutonic = "teutonic.cli:main"
+teutonic-validator = "teutonic.cli:run_validator"
+teutonic-miner = "teutonic.cli:run_miner"
+teutonic-seed = "teutonic.cli:seed_king"
+teutonic-state = "teutonic.cli:show_state"
 
 [build-system]
 requires = ["setuptools>=68"]

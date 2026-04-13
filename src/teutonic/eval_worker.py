@@ -320,10 +320,10 @@ def run_eval(cfg: dict) -> None:
 
     # Download models
     logger.info("Downloading king from %s", cfg["king_repo"])
-    king_dir = download_model(cfg["king_repo"], "/tmp/koth/king", cfg.get("hf_token", ""))
+    king_dir = download_model(cfg["king_repo"], "/tmp/teutonic/king", cfg.get("hf_token", ""))
 
     logger.info("Downloading challenger from %s", cfg["challenger_repo"])
-    challenger_dir = download_model(cfg["challenger_repo"], "/tmp/koth/challenger", cfg.get("hf_token", ""))
+    challenger_dir = download_model(cfg["challenger_repo"], "/tmp/teutonic/challenger", cfg.get("hf_token", ""))
 
     # Load state dicts for validation
     logger.info("Loading state dicts for validation...")
@@ -353,7 +353,7 @@ def run_eval(cfg: dict) -> None:
 
     # Download dataset shard
     shard_key = cfg["dataset_shard_key"]
-    shard_path = f"/tmp/koth/eval_shard.npy"
+    shard_path = "/tmp/teutonic/eval_shard.npy"
     logger.info("Downloading eval shard: %s", shard_key)
     r2.download_file(shard_key, shard_path)
 
@@ -479,7 +479,7 @@ def run_eval(cfg: dict) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="KOTH eval worker")
+    parser = argparse.ArgumentParser(description="Teutonic eval worker")
     parser.add_argument("--config", required=True, help="Path to eval config JSON")
     args = parser.parse_args()
 

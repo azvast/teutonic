@@ -1,6 +1,6 @@
 """Dataset infrastructure: tokenized shards, random batch sampling.
 
-Adapted from templar's SharedShardedDataset for the KOTH eval pipeline.
+Adapted from templar's SharedShardedDataset for the Teutonic eval pipeline.
 The dataset is stored as flat 1D numpy arrays of uint32 token IDs on R2.
 """
 

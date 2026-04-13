@@ -27,7 +27,7 @@ IGNORE_PATTERNS = ["*.bin", "*.pt", "*.pkl", "*.py", "__pycache__/*", ".git/*"]
 
 
 class Miner:
-    """Reference KOTH miner."""
+    """Reference Teutonic miner."""
 
     def __init__(
         self,
@@ -38,7 +38,7 @@ class Miner:
         wallet_name: str = "default",
         wallet_hotkey: str = "default",
         hf_token: str = "",
-        cache_dir: str = "/tmp/koth/miner",
+        cache_dir: str = "/tmp/teutonic/miner",
         learning_rate: float = 1e-5,
         train_steps: int = 100,
         sequence_length: int = 2048,
@@ -65,7 +65,7 @@ class Miner:
 
     def run(self) -> None:
         """Full miner loop: download king, train, upload, commit."""
-        logger.info("Starting KOTH miner")
+        logger.info("Starting Teutonic miner")
 
         # 1. Download king
         king_dir = self._download_king()
@@ -177,7 +177,7 @@ class Miner:
         self.api.upload_folder(
             folder_path=str(model_dir),
             repo_id=self.miner_repo,
-            commit_message="KOTH challenger submission",
+            commit_message="Teutonic challenger submission",
             allow_patterns=["*.safetensors", "config.json", "tokenizer*", "special_tokens*"],
         )
 

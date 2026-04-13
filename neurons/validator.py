@@ -116,6 +116,11 @@ class Validator:
         self.global_step = 0
         self.reporter = reporter or NullReporter()
 
+        if hparams.use_activation_checkpointing and hasattr(self.model, "activation_checkpointing"):
+            self.model.activation_checkpointing = True
+        if hparams.use_compile and str(device) != "cpu":
+            self.model.forward = torch.compile(self.model.forward, mode=hparams.compile_mode)
+
         self.scores: dict[int, float] = {}
         self.score_history: dict[int, deque[float]] = {}
 

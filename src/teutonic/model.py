@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as ckpt
 
 
 @dataclass
@@ -110,10 +112,14 @@ class TinyLlama(nn.Module):
             ),
             persistent=False,
         )
+        self.activation_checkpointing = False
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         x = self.tok_embeddings(tokens)
         for layer in self.layers:
-            x = layer(x, self.freqs)
+            if self.activation_checkpointing and self.training:
+                x = ckpt.checkpoint(layer, x, self.freqs, use_reentrant=False)
+            else:
+                x = layer(x, self.freqs)
         x = self.norm(x)
         return self.output(x)

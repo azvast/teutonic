@@ -391,7 +391,7 @@ async def run_tier(tier_num: int) -> dict[str, Any]:
           f"layers={cfg.n_layers} heads={cfg.n_heads} seq={cfg.seq_len}")
     print(f"  HParams: max_batches={tier.hp.max_batches} micro_bs={tier.hp.micro_bs} "
           f"topk={tier.hp.topk} n_probes={tier.hp.n_probes}")
-    print(f"  Device: {DEVICE}  AMP: {tier.hp.use_amp}")
+    print(f"  Device: {DEVICE}  AMP: {tier.hp.use_amp}  Compile: {tier.hp.use_compile}  Checkpoint: {tier.hp.use_activation_checkpointing}")
     print("=" * 65)
 
     t_total = time.time()
@@ -457,15 +457,24 @@ if __name__ == "__main__":
     parser.add_argument("--tier", type=int, default=None, help="Run a single tier (1-5)")
     parser.add_argument("--all", action="store_true", help="Run all tiers sequentially")
     parser.add_argument("--amp", action="store_true", help="Enable bf16 autocast")
+    parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
+    parser.add_argument("--checkpoint", action="store_true", help="Enable activation checkpointing")
     args = parser.parse_args()
 
     setup_logging(level="WARNING")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
+    overrides: dict[str, Any] = {}
     if args.amp:
+        overrides["use_amp"] = True
+    if args.compile:
+        overrides["use_compile"] = True
+    if args.checkpoint:
+        overrides["use_activation_checkpointing"] = True
+    if overrides:
         for t in TIERS.values():
-            t.hp = replace(t.hp, use_amp=True)
+            t.hp = replace(t.hp, **overrides)
 
     if args.all:
         tiers = list(TIERS.keys())

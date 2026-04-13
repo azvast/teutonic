@@ -24,3 +24,6 @@ class HParams:
     eval_timeout: float = 60.0
     apply_timeout: float = 60.0
     use_amp: bool = False
+    use_compile: bool = False
+    compile_mode: str = "default"
+    use_activation_checkpointing: bool = False

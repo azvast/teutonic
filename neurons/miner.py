@@ -57,6 +57,11 @@ class Miner:
         self.global_step = 0
         self.reporter = reporter or NullReporter()
 
+        if hparams.use_activation_checkpointing and hasattr(self.model, "activation_checkpointing"):
+            self.model.activation_checkpointing = True
+        if hparams.use_compile and str(device) != "cpu":
+            self.model.forward = torch.compile(self.model.forward, mode=hparams.compile_mode)
+
     async def train_window(self, window: int, deadline: float | None = None) -> MinerSubmission:
         """Train as many batches as possible and upload before *deadline*."""
         structlog.contextvars.bind_contextvars(window=window)

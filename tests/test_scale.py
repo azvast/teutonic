@@ -104,12 +104,12 @@ TIERS: dict[int, TierConfig] = {
     5: TierConfig(
         name="941M params",
         cfg=LlamaConfig(vocab_size=32000, hidden_dim=2048, intermediate_dim=5504,
-                        n_layers=16, n_heads=16, seq_len=1024),
-        hp=HParams(max_batches=4, min_batches=2, micro_bs=1, topk=4096,
-                   lr=1e-4, outer_lr=0.2, n_probes=2, n_probe_params=2),
+                        n_layers=16, n_heads=16, seq_len=512),
+        hp=HParams(max_batches=2, min_batches=1, micro_bs=1, topk=4096,
+                   lr=1e-4, outer_lr=0.2, n_probes=1, n_probe_params=2),
         dataset_size=4096,
-        n_phase_b_windows=3,
-        n_phase_c_windows=5,
+        n_phase_b_windows=2,
+        n_phase_c_windows=3,
     ),
 }
 
@@ -393,7 +393,9 @@ async def run_tier(tier_num: int) -> dict[str, Any]:
 
     with tempfile.TemporaryDirectory() as td:
         r_a = await phase_a(tier, td)
+        reset_vram()
         r_b = await phase_b(tier, td)
+        reset_vram()
         r_c = await phase_c(tier, td)
 
     t_total = time.time() - t_total

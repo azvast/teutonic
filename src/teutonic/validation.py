@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +14,13 @@ from safetensors.torch import load_file as load_safetensors
 from .config import BoundingBoxConfig
 
 logger = logging.getLogger(__name__)
+
+REPO_NAME_PATTERN = re.compile(r"^[^/]+/Teutonic-I-.+$")
+
+
+def is_valid_repo_name(repo_id: str) -> bool:
+    """Check that *repo_id* matches the required ``<user>/Teutonic-I-<anything>`` format."""
+    return bool(REPO_NAME_PATTERN.match(repo_id))
 
 
 @dataclass

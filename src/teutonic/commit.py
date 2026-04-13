@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from .validation import is_valid_repo_name
+
 logger = logging.getLogger(__name__)
 
 COMMIT_SEPARATOR = ":"
@@ -38,6 +40,15 @@ class RevealCommit:
         king_hash, hf_repo, model_hash = parts
         if not king_hash or not hf_repo or not model_hash:
             logger.warning("Empty field in reveal from %s", hotkey[:16])
+            return None
+
+        hf_repo = hf_repo.strip()
+        if not is_valid_repo_name(hf_repo):
+            logger.warning(
+                "Rejected reveal from %s: repo '%s' does not match "
+                "required <user>/Teutonic-I-<name> naming",
+                hotkey[:16], hf_repo,
+            )
             return None
 
         return cls(

@@ -18,7 +18,7 @@ import torch
 from huggingface_hub import HfApi, snapshot_download
 from safetensors.torch import load_file as load_safetensors, save_file
 
-from .validation import sha256_of_directory
+from .validation import is_valid_repo_name, sha256_of_directory
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,12 @@ class Miner:
         dataset_path: str = "",
         blocks_until_reveal: int = 360,
     ):
+        if not is_valid_repo_name(miner_repo):
+            raise ValueError(
+                f"Invalid miner repo name '{miner_repo}'. "
+                "Must match <user>/Teutonic-I-<name> (e.g. myuser/Teutonic-I-7B-v1)"
+            )
+
         self.king_repo = king_repo
         self.miner_repo = miner_repo
         self.hf_token = hf_token or None
@@ -118,14 +124,33 @@ class Miner:
 
         optimizer = torch.optim.AdamW(model.parameters(), lr=self.lr, weight_decay=0.1)
 
-        # Load dataset
+        # Load dataset — accepts a single .npy file or a directory of .npy shards
+        # (e.g. from `teutonic dataset download --shards 5 --output ./data`)
         if self.dataset_path:
-            tokens = np.load(self.dataset_path, mmap_mode="r", allow_pickle=False)
-            if tokens.dtype != np.uint32:
-                tokens = tokens.astype(np.uint32, copy=False)
-            if tokens.ndim != 1:
-                tokens = tokens.reshape(-1)
-            tokens_t = torch.from_numpy(tokens)
+            dataset_path = Path(self.dataset_path)
+            if dataset_path.is_dir():
+                shard_files = sorted(dataset_path.glob("*.npy"))
+                if not shard_files:
+                    raise FileNotFoundError(f"No .npy files in {dataset_path}")
+                logger.info("Loading %d shard(s) from %s", len(shard_files), dataset_path)
+                arrays = []
+                for sf in shard_files:
+                    arr = np.load(str(sf), mmap_mode="r", allow_pickle=False)
+                    if arr.ndim != 1:
+                        arr = arr.reshape(-1)
+                    arrays.append(arr)
+                combined = np.concatenate(arrays)
+                if combined.dtype != np.uint32:
+                    combined = combined.astype(np.uint32, copy=False)
+                tokens_t = torch.from_numpy(combined)
+                logger.info("Loaded %d tokens from %d shards", len(tokens_t), len(shard_files))
+            else:
+                tokens = np.load(str(dataset_path), mmap_mode="r", allow_pickle=False)
+                if tokens.dtype != np.uint32:
+                    tokens = tokens.astype(np.uint32, copy=False)
+                if tokens.ndim != 1:
+                    tokens = tokens.reshape(-1)
+                tokens_t = torch.from_numpy(tokens)
         else:
             logger.warning("No dataset path provided, using random data for training")
             tokens_t = torch.randint(0, 32000, (self.seq_len * self.train_steps * self.batch_size,))

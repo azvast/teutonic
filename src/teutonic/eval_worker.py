@@ -3,7 +3,7 @@
 
 This script is SCP'd to a clean GPU machine and executed. It:
 1. Downloads king and challenger models from HuggingFace (safetensors only)
-2. Downloads an eval data shard from R2
+2. Fetches eval sequences from R2 via range requests (no full shard download)
 3. Validates the challenger (architecture match, bounding box)
 4. Runs the sequential sign test with early stopping
 5. Streams per-sequence outcomes to R2
@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import logging
 import os
+import struct
 import sys
 import time
 from pathlib import Path
@@ -30,6 +32,9 @@ from botocore.config import Config as BotoConfig
 from huggingface_hub import snapshot_download
 from safetensors.torch import load_file as load_safetensors
 from scipy.stats import binom
+
+BYTES_PER_TOKEN = 4  # uint32
+NPY_HEADER_MAX = 1024
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("eval_worker")
@@ -70,6 +75,104 @@ class R2:
 
     def download_file(self, key: str, local_path: str) -> None:
         self.client.download_file(self.bucket, key, local_path)
+
+    def get_json(self, key: str):
+        try:
+            resp = self.client.get_object(Bucket=self.bucket, Key=key)
+            return json.loads(resp["Body"].read())
+        except Exception:
+            return None
+
+# ---------------------------------------------------------------------------
+# Range-request dataset helpers (inline for self-containment)
+# ---------------------------------------------------------------------------
+
+def _parse_npy_header(header_bytes: bytes) -> tuple[tuple, np.dtype, int]:
+    """Parse a .npy header from raw bytes. Returns (shape, dtype, data_offset)."""
+    buf = io.BytesIO(header_bytes)
+    magic = buf.read(6)
+    if magic != b"\x93NUMPY":
+        raise ValueError("Not a valid .npy file header")
+
+    version = struct.unpack("BB", buf.read(2))
+    if version[0] == 1:
+        header_len = struct.unpack("<H", buf.read(2))[0]
+    else:
+        header_len = struct.unpack("<I", buf.read(4))[0]
+
+    header_str = buf.read(header_len).decode("latin1").strip()
+    data_offset = buf.tell()
+
+    header_dict = eval(header_str)  # noqa: S307 — numpy header format
+    shape = tuple(header_dict["shape"])
+    dtype = np.dtype(header_dict["descr"])
+
+    return shape, dtype, data_offset
+
+
+def _get_shard_n_tokens(r2: R2, shard_key: str) -> tuple[int, int]:
+    """Read a shard's npy header, return (n_tokens, data_offset)."""
+    resp = r2.client.get_object(
+        Bucket=r2.bucket, Key=shard_key, Range=f"bytes=0-{NPY_HEADER_MAX - 1}"
+    )
+    header_bytes = resp["Body"].read()
+    shape, dtype, data_offset = _parse_npy_header(header_bytes)
+
+    n_tokens = 1
+    for s in shape:
+        n_tokens *= s
+    return n_tokens, data_offset
+
+
+def _fetch_sequences_by_range(
+    r2: R2,
+    shard_key: str,
+    seq_indices: list[int],
+    seq_len: int,
+    data_offset: int,
+) -> dict[int, torch.Tensor]:
+    """Fetch specific sequences from a shard via range requests.
+
+    Groups nearby indices into contiguous range requests to minimize HTTP calls.
+    """
+    bytes_per_seq = seq_len * BYTES_PER_TOKEN
+
+    GAP_THRESHOLD = 64
+    sorted_indices = sorted(set(seq_indices))
+
+    groups: list[tuple[int, int]] = []
+    if sorted_indices:
+        g_start = g_end = sorted_indices[0]
+        for idx in sorted_indices[1:]:
+            if idx - g_end <= GAP_THRESHOLD:
+                g_end = idx
+            else:
+                groups.append((g_start, g_end))
+                g_start = g_end = idx
+        groups.append((g_start, g_end))
+
+    results: dict[int, torch.Tensor] = {}
+    needed = set(seq_indices)
+
+    for g_start, g_end in groups:
+        byte_start = data_offset + g_start * bytes_per_seq
+        byte_end = data_offset + (g_end + 1) * bytes_per_seq - 1
+
+        resp = r2.client.get_object(
+            Bucket=r2.bucket, Key=shard_key, Range=f"bytes={byte_start}-{byte_end}"
+        )
+        chunk = resp["Body"].read()
+
+        for idx in range(g_start, g_end + 1):
+            if idx not in needed:
+                continue
+            local_offset = (idx - g_start) * bytes_per_seq
+            token_bytes = chunk[local_offset : local_offset + bytes_per_seq]
+            arr = np.frombuffer(token_bytes, dtype=np.dtype("<u4")).copy()
+            results[idx] = torch.from_numpy(arr).to(torch.long)
+
+    return results
+
 
 # ---------------------------------------------------------------------------
 # Model loading
@@ -351,24 +454,14 @@ def run_eval(cfg: dict) -> None:
     king_model = load_model_for_eval(king_dir)
     challenger_model = load_model_for_eval(challenger_dir)
 
-    # Download dataset shard
+    # Fetch eval sequences via range requests (no full shard download)
     shard_key = cfg["dataset_shard_key"]
-    shard_path = "/tmp/teutonic/eval_shard.npy"
-    logger.info("Downloading eval shard: %s", shard_key)
-    r2.download_file(shard_key, shard_path)
+    logger.info("Reading shard header: %s", shard_key)
+    n_tokens, data_offset = _get_shard_n_tokens(r2, shard_key)
+    n_sequences = n_tokens // seq_len
+    logger.info("Shard has %d tokens, %d sequences (via header)", n_tokens, n_sequences)
 
-    # Load dataset
-    tokens = np.load(shard_path, mmap_mode="r", allow_pickle=False)
-    if tokens.dtype != np.uint32:
-        tokens = tokens.astype(np.uint32, copy=False)
-    if tokens.ndim != 1:
-        tokens = tokens.reshape(-1)
-    tokens_t = torch.from_numpy(tokens)
-
-    n_sequences = len(tokens_t) // seq_len
-    logger.info("Loaded shard: %d tokens, %d sequences", len(tokens_t), n_sequences)
-
-    # Select eval indices
+    # Select eval indices deterministically
     seed_material = f"{cfg.get('commit_block_hash', 'default')}:{cfg.get('hotkey', '')}".encode()
     seed_hash = hashlib.blake2b(seed_material, digest_size=8).digest()
     seed = int.from_bytes(seed_hash, "little")
@@ -376,6 +469,16 @@ def run_eval(cfg: dict) -> None:
 
     actual_N = min(N, n_sequences)
     eval_indices = rng.choice(n_sequences, size=actual_N, replace=False).tolist()
+
+    # Prefetch all needed sequences via batched range requests
+    logger.info("Fetching %d sequences via range requests...", actual_N)
+    t_fetch = time.time()
+    seq_cache = _fetch_sequences_by_range(r2, shard_key, eval_indices, seq_len, data_offset)
+    logger.info(
+        "Fetched %d sequences in %.1fs (%.1f MB)",
+        len(seq_cache), time.time() - t_fetch,
+        len(seq_cache) * seq_len * BYTES_PER_TOKEN / 1e6,
+    )
 
     # Run sign test
     s = 0
@@ -389,8 +492,7 @@ def run_eval(cfg: dict) -> None:
     logger.info("Starting sign test: N=%d, K=%d", actual_N, K)
 
     for i, seq_idx in enumerate(eval_indices):
-        start = seq_idx * seq_len
-        seq_tokens = tokens_t[start : start + seq_len]
+        seq_tokens = seq_cache[seq_idx]
 
         king_loss = king_model.loss_on_tokens(seq_tokens, use_amp=use_amp, amp_dtype=amp_dtype)
         challenger_loss = challenger_model.loss_on_tokens(seq_tokens, use_amp=use_amp, amp_dtype=amp_dtype)

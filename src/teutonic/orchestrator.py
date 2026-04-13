@@ -134,6 +134,8 @@ class PodOrchestrator:
         bbox_cfg: BoundingBoxConfig,
         dataset_shard_key: str,
         hf_token: str = "",
+        commit_block_hash: str = "",
+        hotkey: str = "",
     ) -> None:
         """Deploy eval worker script to pod and start evaluation.
 
@@ -171,6 +173,8 @@ class PodOrchestrator:
             "r2_secret_access_key": self.r2_cfg.secret_access_key,
             "dataset_shard_key": dataset_shard_key,
             "hf_token": hf_token,
+            "commit_block_hash": commit_block_hash,
+            "hotkey": hotkey,
         }
 
         # Write config to temp file and SCP it

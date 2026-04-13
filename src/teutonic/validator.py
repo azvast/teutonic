@@ -23,6 +23,7 @@ import bittensor as bt
 
 from .commit import RevealScanner
 from .config import TeutonicConfig
+from .dataset import load_manifest_cached, DatasetManifest, select_eval_shard
 from .king import KingManager
 from .orchestrator import PodOrchestrator, poll_for_verdict
 from .r2 import R2Client
@@ -45,6 +46,7 @@ class Validator:
         )
         self.orchestrator = PodOrchestrator(config.pod, config.r2)
         self._challenge_counter = 0
+        self._manifest: DatasetManifest | None = None
 
         # Bittensor
         self.wallet = bt.wallet(
@@ -71,6 +73,12 @@ class Validator:
 
         king_dir = self.king_mgr.download_king()
         logger.info("King loaded: hash=%s", self.king_mgr.king_hash[:16])
+
+        self._manifest = load_manifest_cached(self.r2)
+        logger.info(
+            "Dataset manifest: v%s, %d shards, %d tokens",
+            self._manifest.version, self._manifest.total_shards, self._manifest.total_tokens,
+        )
 
         if not self.state.king:
             self.state.set_initial_king(
@@ -150,8 +158,10 @@ class Validator:
             pod = self.orchestrator.start_pod(pod_name)
             self.state.eval_started(challenge_id, hotkey, hf_repo, pod_name)
 
-            # Pick a dataset shard for eval
-            dataset_shard_key = self._select_dataset_shard()
+            # Pick a dataset shard deterministically from block hash
+            commit_block = entry.get("commit_block", 0)
+            commit_block_hash = self._get_block_hash(commit_block)
+            dataset_shard_key = self._select_dataset_shard(commit_block_hash, hotkey)
 
             # Deploy and run eval
             self.orchestrator.deploy_and_run_eval(
@@ -163,6 +173,8 @@ class Validator:
                 bbox_cfg=self.config.bounding_box,
                 dataset_shard_key=dataset_shard_key,
                 hf_token=self.config.king.hf_token,
+                commit_block_hash=commit_block_hash,
+                hotkey=hotkey,
             )
 
             # Poll for verdict
@@ -249,17 +261,31 @@ class Validator:
         except Exception:
             logger.exception("Failed to set weights")
 
-    def _select_dataset_shard(self) -> str:
-        """Select a dataset shard key for evaluation.
+    def _get_block_hash(self, block: int) -> str:
+        """Get the block hash for a given block number."""
+        try:
+            block_hash = self.subtensor.get_block_hash(block)
+            return block_hash or "default"
+        except Exception:
+            logger.warning("Could not fetch block hash for block %d", block)
+            return "default"
 
-        Uses one of the anneal shards on R2.
+    def _select_dataset_shard(self, commit_block_hash: str, hotkey: str) -> str:
+        """Select a dataset shard deterministically from block hash + hotkey.
+
+        Uses the manifest to know how many shards exist. The shard choice is
+        unpredictable until the commit block is finalized on chain.
         """
-        shards = [
-            "anneal/anneal_000000.npy",
-            "anneal/anneal_000002.npy",
-            "anneal/anneal_000004.npy",
-            "anneal/anneal_000005.npy",
-        ]
-        # Round-robin through shards
-        idx = self._challenge_counter % len(shards)
-        return shards[idx]
+        if self._manifest is None:
+            self._manifest = load_manifest_cached(self.r2)
+
+        shard_idx = select_eval_shard(
+            self._manifest.total_shards, commit_block_hash, hotkey,
+        )
+        shard_key = self._manifest.shard_key(shard_idx)
+        logger.info(
+            "Selected shard %d/%d: %s (block_hash=%s, hotkey=%s)",
+            shard_idx, self._manifest.total_shards, shard_key,
+            commit_block_hash[:16], hotkey[:16],
+        )
+        return shard_key

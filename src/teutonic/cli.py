@@ -138,6 +138,80 @@ def show_state():
         print(json.dumps(king, indent=2))
 
 
+def run_dataset():
+    """Dataset management commands for miners."""
+    parser = argparse.ArgumentParser(description="Teutonic Dataset Tools")
+    sub = parser.add_subparsers(dest="action")
+
+    dl = sub.add_parser("download", help="Download dataset shards from R2 for training")
+    dl.add_argument("--shards", type=int, default=1, help="Number of shards to download")
+    dl.add_argument("--output", default="./data", help="Output directory")
+    dl.add_argument("--seed", type=int, default=None, help="RNG seed for shard selection (random if omitted)")
+    dl.add_argument("--indices", type=str, default="", help="Comma-separated shard indices to download (overrides --shards)")
+
+    info = sub.add_parser("info", help="Show dataset manifest info")
+
+    args = parser.parse_args()
+
+    config = _load_config()
+
+    from .r2 import R2Client
+    from .dataset import load_manifest_cached, download_shard_from_r2
+
+    r2 = R2Client(config.r2)
+
+    if args.action == "info":
+        manifest = load_manifest_cached(r2)
+        print(f"Dataset v{manifest.version}")
+        print(f"  Tokenizer: {manifest.tokenizer}")
+        print(f"  Dtype: {manifest.dtype}")
+        print(f"  Total tokens: {manifest.total_tokens:,}")
+        print(f"  Total shards: {manifest.total_shards}")
+        total_bytes = sum(s.get("size_bytes", 0) for s in manifest.shards)
+        print(f"  Total size: {total_bytes / 1e9:.1f} GB")
+        print(f"\nShards:")
+        for i, s in enumerate(manifest.shards):
+            size_gb = s.get("size_bytes", 0) / 1e9
+            print(f"  [{i:4d}] {s['key']}  {s['n_tokens']:>12,} tokens  {size_gb:.2f} GB")
+        return
+
+    if args.action == "download":
+        import numpy as np
+        from pathlib import Path
+
+        manifest = load_manifest_cached(r2)
+        output_dir = Path(args.output)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        if args.indices:
+            selected = [int(x.strip()) for x in args.indices.split(",")]
+            for idx in selected:
+                if idx < 0 or idx >= manifest.total_shards:
+                    print(f"Error: shard index {idx} out of range [0, {manifest.total_shards})")
+                    sys.exit(1)
+        else:
+            n = min(args.shards, manifest.total_shards)
+            seed = args.seed if args.seed is not None else int.from_bytes(os.urandom(8), "little")
+            rng = np.random.Generator(np.random.PCG64(seed))
+            selected = rng.choice(manifest.total_shards, size=n, replace=False).tolist()
+            print(f"Selected {n} shard(s) (seed={seed}): {selected}")
+
+        for idx in selected:
+            shard = manifest.shards[idx]
+            shard_key = shard["key"]
+            filename = shard_key.split("/")[-1]
+            local_path = output_dir / filename
+
+            print(f"Downloading shard {idx}: {shard_key} -> {local_path}")
+            download_shard_from_r2(r2, shard_key, local_path)
+            print(f"  Done: {local_path.stat().st_size / 1e9:.2f} GB")
+
+        print(f"\n{len(selected)} shard(s) downloaded to {output_dir}/")
+        return
+
+    parser.print_help()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Teutonic")
     sub = parser.add_subparsers(dest="command")
@@ -146,6 +220,7 @@ def main():
     sub.add_parser("miner", help="Run the reference miner")
     sub.add_parser("seed", help="Upload initial seed king model")
     sub.add_parser("state", help="Show current validator state from R2")
+    sub.add_parser("dataset", help="Dataset management (download, info)")
 
     args, remaining = parser.parse_known_args()
 
@@ -161,6 +236,9 @@ def main():
     elif args.command == "state":
         sys.argv = [sys.argv[0]] + remaining
         show_state()
+    elif args.command == "dataset":
+        sys.argv = [sys.argv[0]] + remaining
+        run_dataset()
     else:
         parser.print_help()
 

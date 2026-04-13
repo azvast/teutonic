@@ -64,7 +64,7 @@ class CheatingMiner:
         device: str = DEVICE,
     ):
         self.uid = uid
-        self.model = model
+        self.model = model.to(device)
         self.dataset = dataset
         self.storage = storage
         self.cheat_mode = cheat_mode

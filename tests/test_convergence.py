@@ -91,10 +91,11 @@ def make_model(seed: int = 0) -> TinyLlama:
 
 def eval_loss(model: TinyLlama, dataset: SyntheticDataset, n_samples: int = 64) -> float:
     model.eval()
+    dev = next(model.parameters()).device
     total = 0.0
     with torch.no_grad():
         for i in range(min(n_samples, len(dataset))):
-            tokens = dataset[i].unsqueeze(0)
+            tokens = dataset[i].unsqueeze(0).to(dev)
             logits = model(tokens[:, :-1])
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), tokens[:, 1:].reshape(-1))
             total += loss.item()

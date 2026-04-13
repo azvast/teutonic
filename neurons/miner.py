@@ -46,7 +46,7 @@ class Miner:
         reporter: MetricsReporter | None = None,
     ):
         self.uid = uid
-        self.model = model
+        self.model = model.to(device)
         self.dataset = dataset
         self.storage = storage
         self.hp = hparams

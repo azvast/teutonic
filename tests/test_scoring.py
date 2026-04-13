@@ -110,10 +110,11 @@ def make_validator(env: Env, uid: int = 0) -> Validator:
 
 def eval_loss(model: nn.Module, dataset, n_samples: int = 64) -> float:
     model.eval()
+    dev = next(model.parameters()).device
     total = 0.0
     with torch.no_grad():
         for i in range(min(n_samples, len(dataset))):
-            tokens = dataset[i].unsqueeze(0)
+            tokens = dataset[i].unsqueeze(0).to(dev)
             logits = model(tokens[:, :-1])
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), tokens[:, 1:].reshape(-1))
             total += loss.item()
@@ -131,7 +132,7 @@ class _ThrottledMiner:
 
     def __init__(self, uid: int, model: nn.Module, env: Env, n_batches: int):
         self.uid = uid
-        self.model = model
+        self.model = model.to(DEVICE)
         self.env = env
         self.n_batches = n_batches
         self.compressor = TopKCompressor(topk=env.hp.topk)
@@ -161,7 +162,7 @@ class _ThrottledMiner:
 class _CheatingMiner:
     def __init__(self, uid, model, dataset, storage, cheat_mode, hparams, device=DEVICE):
         self.uid = uid
-        self.model = model
+        self.model = model.to(device)
         self.dataset = dataset
         self.storage = storage
         self.cheat_mode = cheat_mode

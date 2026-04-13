@@ -78,6 +78,7 @@ class MinerEvalResult:
     slash_fraction: float = 0.0
     final_score: float = 0.0
     reason: str = ""
+    submission: MinerSubmission | None = None
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -172,13 +173,16 @@ class Validator:
     # Evaluate a single miner
     # ------------------------------------------------------------------ #
     async def evaluate_miner(
-        self, miner_uid: int, window: int, block_hash: str
+        self, miner_uid: int, window: int, block_hash: str,
+        prefetched_raw: dict[str, Any] | None = None,
     ) -> MinerEvalResult:
         t0 = time.monotonic()
         result = MinerEvalResult(uid=miner_uid)
 
-        key = MinerSubmission.make_storage_key(window, miner_uid)
-        raw = await self.storage.get(key)
+        raw = prefetched_raw
+        if raw is None:
+            key = MinerSubmission.make_storage_key(window, miner_uid)
+            raw = await self.storage.get(key)
         if raw is None:
             result.slash_fraction = self.slash_cfg.missing_submission_slash
             result.reason = "missing submission"
@@ -211,6 +215,7 @@ class Validator:
 
         n_trained = submission.n_batches_trained
         result.n_batches_trained = n_trained
+        result.submission = submission
 
         sampler = MinerSampler(
             self.dataset,
@@ -324,11 +329,16 @@ class Validator:
         )
         t0 = time.monotonic()
 
+        keys = [MinerSubmission.make_storage_key(window, uid) for uid in miner_uids]
+        raw_data = await asyncio.gather(*[self.storage.get(k) for k in keys])
+        prefetched = dict(zip(miner_uids, raw_data))
+
         results = []
         for uid in miner_uids:
             try:
                 r = await asyncio.wait_for(
-                    self.evaluate_miner(uid, window, block_hash),
+                    self.evaluate_miner(uid, window, block_hash,
+                                        prefetched_raw=prefetched.get(uid)),
                     timeout=self.hp.eval_timeout,
                 )
             except asyncio.TimeoutError:
@@ -380,24 +390,18 @@ class Validator:
     async def apply_best_gradients(
         self, window: int, results: list[MinerEvalResult]
     ) -> None:
-        passing = [r for r in results if r.final_score > 0.0]
+        passing = [r for r in results if r.final_score > 0.0 and r.submission is not None]
         if not passing:
             logger.info("validator.gradients.skip", window=window, reason="no passing miners")
             return
 
-        aggregated: dict[str, dict[str, Any]] = {}
+        all_params: dict[str, list[dict[str, Any]]] = {}
+        shapes: dict[str, tuple] = {}
         count = 0
         skipped_params = 0
 
         for r in passing:
-            key = MinerSubmission.make_storage_key(window, r.uid)
-            raw = await self.storage.get(key)
-            if raw is None:
-                continue
-            try:
-                sub = MinerSubmission.from_dict(raw)
-            except (KeyError, TypeError):
-                continue
+            sub = r.submission
             for pname, comp in sub.compressed_gradients.items():
                 vals = comp.get("vals")
                 if vals is None or (isinstance(vals, torch.Tensor) and not torch.isfinite(vals).all()):
@@ -407,23 +411,25 @@ class Validator:
                     )
                     skipped_params += 1
                     continue
-                if pname not in aggregated:
-                    aggregated[pname] = {
-                        "idxs": comp["idxs"],
-                        "vals": comp["vals"].float().clone(),
-                        "shape": comp["shape"],
-                    }
-                else:
-                    dense_new = self.compressor.decompress(comp, device="cpu")
-                    dense_old = self.compressor.decompress(aggregated[pname], device="cpu")
-                    merged = dense_old + dense_new
-                    aggregated[pname] = self.compressor.compress(merged)
-                    aggregated[pname]["vals"] = aggregated[pname]["vals"].float()
+                if pname not in all_params:
+                    all_params[pname] = []
+                    shapes[pname] = comp["shape"]
+                all_params[pname].append(comp)
             count += 1
 
-        if count > 1:
-            for pname in aggregated:
-                aggregated[pname]["vals"] /= count
+        aggregated: dict[str, dict[str, Any]] = {}
+        for pname, comps in all_params.items():
+            numel = 1
+            for s in shapes[pname]:
+                numel *= s
+            cat_idxs = torch.cat([c["idxs"].long() for c in comps])
+            cat_vals = torch.cat([c["vals"].float() for c in comps])
+            dense = torch.zeros(numel)
+            dense.scatter_add_(0, cat_idxs, cat_vals)
+            if count > 1:
+                dense /= count
+            aggregated[pname] = self.compressor.compress(dense.reshape(shapes[pname]))
+            aggregated[pname]["vals"] = aggregated[pname]["vals"].float()
 
         decompress_and_apply(self.model, aggregated, self.compressor, self.hp.outer_lr)
         self.global_step += 1

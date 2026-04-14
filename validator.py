@@ -237,11 +237,31 @@ class State:
         self.queue = []
         self.seen = set()
         self.failed_repos: set[str] = set()
+        self.evaluated_repos: set[str] = set()
         self.stats = {"queued": 0, "accepted": 0, "rejected": 0, "failed": 0}
         self.counter = 0
         self.current_eval = None
         self.history = []
         self.last_weight_block = 0
+        self._metagraph = None
+        self._metagraph_block = 0
+
+    def refresh_metagraph(self, subtensor, netuid, *, max_age=120):
+        try:
+            block = subtensor.block
+            if self._metagraph is None or block - self._metagraph_block >= max_age:
+                self._metagraph = subtensor.metagraph(netuid)
+                self._metagraph_block = block
+        except Exception:
+            log.exception("failed to refresh metagraph")
+
+    def hotkey_to_uid(self, hotkey: str) -> int | None:
+        if self._metagraph is None:
+            return None
+        try:
+            return self._metagraph.hotkeys.index(hotkey)
+        except ValueError:
+            return None
 
     def load(self):
         k = self.r2.get("king/current.json")
@@ -288,11 +308,14 @@ class State:
         return f"eval-{self.counter:04d}"
 
     def enqueue(self, reveal):
+        repo = reveal.get("hf_repo", "")
         for existing in self.queue:
-            if existing.get("hotkey") == reveal["hotkey"] and existing.get("block") == reveal["block"]:
-                log.info("skipping duplicate: hotkey=%s block=%s already queued",
-                         reveal["hotkey"][:16], reveal["block"])
+            if existing.get("hf_repo") == repo:
+                log.info("skipping duplicate repo: %s already queued", repo)
                 return None
+        if repo in self.evaluated_repos:
+            log.info("skipping %s: already evaluated this cycle", repo)
+            return None
         cid = self.next_id()
         entry = {"challenge_id": cid, **reveal, "queued_at": _now()}
         self.queue.append(entry)
@@ -306,6 +329,7 @@ class State:
         global _king_config
         _king_config = None
         self.failed_repos.clear()
+        self.evaluated_repos.clear()
         reign = self.king.get("reign_number", 0) + (0 if challenge_id == "seed" else 1)
         self.king = {
             "hotkey": hotkey, "hf_repo": hf_repo, "king_hash": king_hash,
@@ -318,15 +342,19 @@ class State:
                      "challenge_id": challenge_id})
 
     def record_verdict(self, verdict, challenger_repo, hotkey):
+        king_loss = verdict["avg_king_loss"]
+        chall_loss = verdict["avg_challenger_loss"]
         self.history.insert(0, {
             "challenge_id": verdict["challenge_id"],
             "hotkey": hotkey,
+            "uid": self.hotkey_to_uid(hotkey),
             "challenger_repo": challenger_repo,
             "accepted": verdict["accepted"],
             "verdict": verdict["verdict"],
             "win_rate": verdict["win_rate"],
-            "avg_king_loss": verdict["avg_king_loss"],
-            "avg_challenger_loss": verdict["avg_challenger_loss"],
+            "avg_king_loss": king_loss,
+            "avg_challenger_loss": chall_loss,
+            "best_loss": min(king_loss, chall_loss),
             "wall_time_s": verdict["wall_time_s"],
             "timestamp": verdict["timestamp"],
         })
@@ -340,6 +368,7 @@ class State:
             "stats": self.stats,
             "current_eval": self.current_eval,
             "queue": [{"challenge_id": e.get("challenge_id"), "hotkey": e.get("hotkey"),
+                        "uid": self.hotkey_to_uid(e.get("hotkey", "")),
                         "hf_repo": e.get("hf_repo"), "queued_at": e.get("queued_at"),
                         "block": e.get("block")}
                        for e in self.queue],
@@ -385,7 +414,7 @@ def fork_winner(challenger_repo, king_hash, hotkey, challenge_id):
 # Main
 # ---------------------------------------------------------------------------
 
-async def process_challenge(state, r2, entry, subtensor, wallet):
+async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=True):
     cid = entry["challenge_id"]
     hotkey = entry["hotkey"]
     hf_repo = entry["hf_repo"]
@@ -393,6 +422,10 @@ async def process_challenge(state, r2, entry, subtensor, wallet):
 
     if hf_repo in state.failed_repos:
         log.info("skipping %s: repo %s previously failed", cid, hf_repo)
+        return
+
+    if hf_repo in state.evaluated_repos:
+        log.info("skipping %s: repo %s already evaluated this cycle", cid, hf_repo)
         return
 
     rejection = validate_challenger_config(hf_repo)
@@ -403,11 +436,12 @@ async def process_challenge(state, r2, entry, subtensor, wallet):
                      "hf_repo": hf_repo, "reason": rejection})
         return
 
-    current_hash = state.king.get("king_hash", "")
-    if not current_hash.startswith(entry["king_hash"][:len(entry["king_hash"])]):
-        log.info("stale %s: king changed", cid)
-        state.event({"event": "stale", "challenge_id": cid, "hotkey": hotkey})
-        return
+    if check_stale:
+        current_hash = state.king.get("king_hash", "")
+        if not current_hash.startswith(entry["king_hash"][:len(entry["king_hash"])]):
+            log.info("stale %s: king changed", cid)
+            state.event({"event": "stale", "challenge_id": cid, "hotkey": hotkey})
+            return
 
     block_hash = "default"
     try:
@@ -491,6 +525,7 @@ async def process_challenge(state, r2, entry, subtensor, wallet):
              verdict["win_rate"], verdict["wall_time_s"])
 
     state.current_eval = None
+    state.evaluated_repos.add(hf_repo)
     state.record_verdict(verdict, hf_repo, hotkey)
 
     accepted = verdict.get("accepted", False)
@@ -575,6 +610,7 @@ async def main():
 
     while True:
         try:
+            state.refresh_metagraph(subtensor, NETUID)
             reveals = scan_reveals(subtensor, NETUID, state.seen)
             if reveals:
                 state.flush()
@@ -587,7 +623,8 @@ async def main():
                 entry = state.queue.pop(0)
                 state.flush()
                 try:
-                    await process_challenge(state, r2, entry, subtensor, wallet)
+                    await process_challenge(state, r2, entry, subtensor, wallet,
+                                            check_stale=args.seen)
                 except Exception:
                     log.exception("eval failed: %s", entry.get("challenge_id"))
                     state.stats["failed"] += 1
@@ -596,6 +633,7 @@ async def main():
 
             if not args.seen:
                 state.seen.clear()
+                state.evaluated_repos.clear()
                 state.flush()
 
             try:

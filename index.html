@@ -74,6 +74,7 @@ body {
 
 .chart-wrap {
     width: 100%;
+    min-height: 180px;
     position: relative;
 }
 .chart-wrap svg {
@@ -105,12 +106,24 @@ body {
     justify-content: space-between;
     margin-top: 4px;
 }
-.duel-hidden { display: none; }
+.duel-info span { min-width: 120px; }
+.duel-info span:last-child { text-align: right; }
+.duel-idle .duel-bar-wrap { opacity: 0.3; }
+
+.scroll-box {
+    overflow-y: auto;
+    scrollbar-width: thin;
+}
+.scroll-box::-webkit-scrollbar { width: 4px; }
+.scroll-box::-webkit-scrollbar-thumb { background: var(--ink); }
+.scroll-queue { height: 120px; }
+.scroll-hist { height: 300px; }
 
 table {
     width: 100%;
     border-collapse: collapse;
     font-size: 12px;
+    table-layout: fixed;
 }
 th {
     text-transform: uppercase;
@@ -119,9 +132,16 @@ th {
     text-align: left;
     padding: 4px 0;
     border-bottom: var(--border);
+    background: var(--paper);
+    position: sticky;
+    top: 0;
+    z-index: 1;
 }
 td {
     padding: 3px 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 tr { border-bottom: 1px dotted rgba(0,0,0,0.15); }
 tr:hover td {
@@ -136,12 +156,12 @@ th:last-child, td:last-child { text-align: right; }
 <div class="page">
 
     <div style="text-align:center;margin-bottom:8px;">
-        <div style="font-size:20px;font-weight:bold;letter-spacing:0.1em;text-transform:uppercase;">Teutonic</div>
+        <div style="font-size:20px;font-weight:bold;letter-spacing:0.1em;text-transform:uppercase;">Teutonic-I</div>
         <a href="https://huggingface.co/unconst/Teutonic-I" target="_blank" style="font-size:11px;color:var(--ink);text-transform:uppercase;">huggingface.co/unconst/Teutonic-I</a>
     </div>
 
     <div>
-        <div class="section-label">King Loss</div>
+        <div class="section-label">Best Loss</div>
         <div class="chart-wrap">
             <svg id="chart"></svg>
         </div>
@@ -150,42 +170,49 @@ th:last-child, td:last-child { text-align: right; }
         </div>
     </div>
 
-    <div id="duel-section" class="duel-hidden">
-        <div class="section-label" id="duel-label">Evaluating</div>
+    <div id="duel-section" class="duel-idle">
+        <div class="section-label" id="duel-label">Idle</div>
         <div class="duel-bar-wrap"><div class="duel-bar" id="duel-bar" style="width:0%"></div></div>
         <div class="duel-info"><span id="duel-progress">--</span><span id="duel-wr">--</span></div>
     </div>
 
     <div>
         <div class="section-label">Last Winner</div>
-        <div id="last-winner" style="font-size:12px;line-height:1.8;">--</div>
+        <div id="last-winner" style="font-size:12px;line-height:1.8;min-height:48px;">--</div>
     </div>
 
     <div>
         <div class="section-label">Queue</div>
-        <table>
-            <thead><tr>
-                <th>Hotkey</th>
-                <th>Block</th>
-                <th>Repo</th>
-            </tr></thead>
-            <tbody id="queue"></tbody>
-        </table>
+        <div class="scroll-box scroll-queue">
+            <table>
+                <thead><tr>
+                    <th>UID</th>
+                    <th>Hotkey</th>
+                    <th>Block</th>
+                    <th>Repo</th>
+                </tr></thead>
+                <tbody id="queue"></tbody>
+            </table>
+        </div>
     </div>
 
     <div>
         <div class="section-label">Duel History</div>
-        <table>
-            <thead><tr>
-                <th>Challenger</th>
-                <th>Verdict</th>
-                <th>Win Rate</th>
-                <th>King Loss</th>
-                <th>Chall Loss</th>
-                <th>Time</th>
-            </tr></thead>
-            <tbody id="hist"></tbody>
-        </table>
+        <div class="scroll-box scroll-hist">
+            <table>
+                <thead><tr>
+                    <th>UID</th>
+                    <th>Challenger</th>
+                    <th>Verdict</th>
+                    <th>Win Rate</th>
+                    <th>Best Loss</th>
+                    <th>King Loss</th>
+                    <th>Chall Loss</th>
+                    <th>Time</th>
+                </tr></thead>
+                <tbody id="hist"></tbody>
+            </table>
+        </div>
     </div>
 
 </div>
@@ -200,12 +227,19 @@ function render(d) {
     var hist = (d.history || []).slice().reverse();
     var ev = d.current_eval;
 
-    // --- 1. King Loss Chart with axes ---
+    // --- 1. Best Loss Chart with axes ---
     var losses = [];
     for (var i = 0; i < hist.length; i++) {
-        losses.push(hist[i].avg_king_loss || 0);
+        var kl = hist[i].avg_king_loss || 0;
+        var cl = hist[i].avg_challenger_loss || 0;
+        var best = hist[i].best_loss || (kl && cl ? Math.min(kl, cl) : kl || cl);
+        if (best) losses.push(best);
     }
-    if (ev && ev.avg_king_loss) losses.push(ev.avg_king_loss);
+    if (ev && ev.avg_king_loss) {
+        var ekl = ev.avg_king_loss;
+        var ecl = ev.avg_challenger_loss || ekl;
+        losses.push(Math.min(ekl, ecl));
+    }
 
     var SVG = document.getElementById("chart");
     var W = 736, H = 160, ML = 60, MR = 12, MT = 12, MB = 28;
@@ -245,11 +279,11 @@ function render(d) {
         }
     }
 
-    // X-axis ticks (eval numbers)
+    // X-axis ticks
     for (var i = 0; i < losses.length; i++) {
         var xx = toX(i);
         svg += '<line x1="' + xx + '" y1="' + (MT + ph) + '" x2="' + xx + '" y2="' + (MT + ph + 4) + '" stroke="#000" stroke-width="1"/>';
-        var label = (ev && i === losses.length - 1) ? "NOW" : (hist.length > 0 && i < hist.length ? (i + 1) : "");
+        var label = (ev && i === losses.length - 1) ? "NOW" : "";
         svg += '<text x="' + xx + '" y="' + (MT + ph + 16) + '" text-anchor="middle" ' + font + '>' + label + '</text>';
     }
 
@@ -314,12 +348,14 @@ function render(d) {
     var qEl = document.getElementById("queue");
     var q = d.queue || [];
     if (q.length === 0) {
-        qEl.innerHTML = '<tr><td colspan="3" style="text-align:center;padding:16px">Queue empty</td></tr>';
+        qEl.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:16px">Queue empty</td></tr>';
     } else {
         qEl.innerHTML = q.map(function(e) {
             var repo = e.hf_repo || "--";
             var repoLink = e.hf_repo ? '<a href="https://huggingface.co/' + e.hf_repo + '" target="_blank" style="color:var(--ink)">' + repo + '</a>' : repo;
+            var uid = e.uid != null ? e.uid : "--";
             return '<tr>' +
+                '<td>' + uid + '</td>' +
                 '<td>' + short(e.hotkey, 16) + '</td>' +
                 '<td>' + (e.block ? '#' + e.block : '--') + '</td>' +
                 '<td>' + repoLink + '</td>' +
@@ -331,15 +367,19 @@ function render(d) {
     var hb = document.getElementById("hist");
     var history = d.history || [];
     if (history.length === 0) {
-        hb.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:16px">No duels yet</td></tr>';
+        hb.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:16px">No duels yet</td></tr>';
     } else {
         hb.innerHTML = history.map(function(h) {
+            var kl = h.avg_king_loss || 0;
+            var cl = h.avg_challenger_loss || 0;
+            var best = h.best_loss || (kl && cl ? Math.min(kl, cl) : kl || cl);
             return '<tr>' +
                 '<td>' + (h.challenger_repo || short(h.hotkey, 12)) + '</td>' +
                 '<td>' + (h.accepted ? "CHALLENGER" : "KING") + '</td>' +
                 '<td>' + ((h.win_rate || 0) * 100).toFixed(1) + '%</td>' +
-                '<td>' + (h.avg_king_loss || 0).toFixed(4) + '</td>' +
-                '<td>' + (h.avg_challenger_loss || 0).toFixed(4) + '</td>' +
+                '<td>' + best.toFixed(4) + '</td>' +
+                '<td>' + kl.toFixed(4) + '</td>' +
+                '<td>' + cl.toFixed(4) + '</td>' +
                 '<td>' + (h.wall_time_s || 0).toFixed(0) + 's</td>' +
                 '</tr>';
         }).join("");

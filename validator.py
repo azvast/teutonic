@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """Teutonic validator — single-file king-of-the-hill evaluator.
 
-Polls Bittensor chain for challenger submissions, runs N=10000 alpha=0.001
-sign-test evaluations using two remote H200 boxes as vLLM inference servers,
-manages king lifecycle on HuggingFace, persists all state to R2.
+Polls Bittensor chain for challenger submissions, dispatches evaluations
+to a remote eval server (eval_server.py on a GPU box), manages king
+lifecycle on HuggingFace, persists all state to R2.
 """
 import asyncio
 import hashlib
-import io
 import json
 import logging
 import os
-import struct
-import subprocess
+import signal
 import sys
 import time
 from datetime import datetime, timezone
@@ -20,10 +18,8 @@ from datetime import datetime, timezone
 import bittensor as bt
 import boto3
 import httpx
-import numpy as np
 from botocore.config import Config as BotoConfig
 from huggingface_hub import HfApi, snapshot_download
-from scipy.stats import binom
 
 # ---------------------------------------------------------------------------
 # Config
@@ -32,22 +28,15 @@ from scipy.stats import binom
 EVAL_N = 10_000
 EVAL_ALPHA = 0.001
 SEQ_LEN = 2048
-CONCURRENCY = 8
-BATCH_SIZE = 32
 POLL_INTERVAL = 30
 WEIGHT_INTERVAL = 360
 NETUID = int(os.environ.get("TEUTONIC_NETUID", "3"))
 NETWORK = os.environ.get("TEUTONIC_NETWORK", "finney")
 KING_REPO = os.environ.get("TEUTONIC_KING_REPO", "unconst/Teutonic-I")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-SSH_KING = os.environ.get("TEUTONIC_SSH_KING", "")
-SSH_CHALLENGER = os.environ.get("TEUTONIC_SSH_CHALLENGER", "")
+EVAL_SERVER_URL = os.environ.get("TEUTONIC_EVAL_SERVER", "http://localhost:9000")
 WALLET_NAME = os.environ.get("BT_WALLET_NAME", "teutonic")
 WALLET_HOTKEY = os.environ.get("BT_WALLET_HOTKEY", "default")
-KING_PORT = 9001
-CHALLENGER_PORT = 9002
-MODEL_PATH = "/models/model"
-VLLM_PORT = 8000
 
 R2_ENDPOINT = os.environ.get("TEUTONIC_R2_ENDPOINT", "")
 R2_BUCKET = os.environ.get("TEUTONIC_R2_BUCKET", "")
@@ -124,137 +113,8 @@ class R2:
 
 
 # ---------------------------------------------------------------------------
-# SSH
+# Challenger validation
 # ---------------------------------------------------------------------------
-
-SSH_OPTS = ["-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no",
-            "-o", "LogLevel=ERROR"]
-
-def ssh(host, cmd, timeout=600):
-    r = subprocess.run(
-        ["ssh"] + SSH_OPTS + [host, cmd],
-        capture_output=True, text=True, timeout=timeout,
-    )
-    if r.returncode != 0 and r.returncode != 143:
-        log.warning("ssh %s exit=%d stderr=%s", host, r.returncode, r.stderr[:200])
-    return r.stdout.strip()
-
-
-_tunnels = {}
-
-def ensure_tunnel(host, local_port):
-    key = (host, local_port)
-    proc = _tunnels.get(key)
-    if proc and proc.poll() is None:
-        return
-    if proc:
-        proc.kill()
-    p = subprocess.Popen(
-        ["ssh"] + SSH_OPTS + ["-f", "-N", "-L", f"{local_port}:localhost:{VLLM_PORT}", host],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    p.wait(timeout=15)
-    _tunnels[key] = p
-    time.sleep(1)
-    log.info("tunnel %s -> localhost:%d", host, local_port)
-
-
-def gpu_clean(host):
-    """Kill everything holding GPU memory on a remote host. Retries until free."""
-    for attempt in range(5):
-        pids = ssh(host,
-            "nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null",
-            timeout=10)
-        if not pids.strip():
-            log.info("gpu clean on %s (no GPU processes, attempt %d)", host, attempt + 1)
-            return
-        for pid in pids.strip().split("\n"):
-            pid = pid.strip()
-            if pid.isdigit():
-                ssh(host, f"kill -9 {pid} 2>/dev/null", timeout=5)
-        time.sleep(3)
-        used = ssh(host, "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits", timeout=10)
-        try:
-            used_mb = int(used.strip().split()[0])
-            if used_mb < 500:
-                log.info("gpu clean on %s (%dMB used, attempt %d)", host, used_mb, attempt + 1)
-                return
-        except (ValueError, IndexError):
-            pass
-    log.warning("gpu_clean: could not free GPU on %s after 5 attempts", host)
-
-
-def deploy_model(host, hf_repo, local_port):
-    """Kill vLLM, download model, patch config, restart vLLM on remote host."""
-    log.info("deploying %s on %s", hf_repo, host)
-    gpu_clean(host)
-
-    dl_cmd = (
-        f"HF_TOKEN={HF_TOKEN} python3 -c \""
-        f"from huggingface_hub import snapshot_download; "
-        f"snapshot_download('{hf_repo}', local_dir='{MODEL_PATH}')"
-        f"\""
-    )
-    ssh(host, dl_cmd, timeout=300)
-
-    patch_cmd = (
-        "python3 -c \""
-        "import json, os; "
-        f"cfg=json.load(open('{MODEL_PATH}/config.json')); "
-        "rp=cfg.get('rope_parameters',{}); "
-        "rp.setdefault('rope_type','default') if isinstance(rp,dict) else None; "
-        f"json.dump(cfg,open('{MODEL_PATH}/config.json','w'),indent=2); "
-        f"tc_path='{MODEL_PATH}/tokenizer_config.json'; "
-        "tc=json.load(open(tc_path)) if os.path.exists(tc_path) else None; "
-        "exec('tc[\\\"extra_special_tokens\\\"]={}') if tc and isinstance(tc.get('extra_special_tokens'),list) else None; "
-        "json.dump(tc,open(tc_path,'w'),indent=2) if tc else None"
-        "\""
-    )
-    ssh(host, patch_cmd, timeout=30)
-
-    serve_cmd = (
-        f"TRITON_CACHE_DIR=/root/.triton_cache "
-        f"nohup vllm serve {MODEL_PATH} --host 0.0.0.0 --port {VLLM_PORT} "
-        f"--enforce-eager > /tmp/vllm.log 2>&1 &"
-    )
-    ssh(host, serve_cmd, timeout=15)
-
-    ensure_tunnel(host, local_port)
-    wait_for_server(f"http://localhost:{local_port}")
-    _model_name_cache.pop(f"http://localhost:{local_port}", None)
-    log.info("vLLM ready on %s (localhost:%d)", host, local_port)
-
-
-# ---------------------------------------------------------------------------
-# vLLM inference
-# ---------------------------------------------------------------------------
-
-async def wait_for_server_async(url, timeout=600):
-    async with httpx.AsyncClient() as c:
-        t0 = time.time()
-        while time.time() - t0 < timeout:
-            try:
-                r = await c.get(f"{url}/health", timeout=5)
-                if r.status_code == 200:
-                    return True
-            except Exception:
-                pass
-            await asyncio.sleep(3)
-    raise TimeoutError(f"{url} not ready after {timeout}s")
-
-
-def wait_for_server(url, timeout=120):
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        try:
-            r = httpx.get(f"{url}/health", timeout=5)
-            if r.status_code == 200:
-                return True
-        except Exception:
-            pass
-        time.sleep(3)
-    raise TimeoutError(f"{url} not ready after {timeout}s")
-
 
 _king_config: dict | None = None
 
@@ -310,241 +170,6 @@ def validate_challenger_config(hf_repo: str) -> str | None:
         return "no .safetensors files in repo"
 
     return None
-
-
-_model_name_cache = {}
-
-async def get_model_name(client, url):
-    if url in _model_name_cache:
-        return _model_name_cache[url]
-    r = await client.get(f"{url}/v1/models", timeout=10)
-    r.raise_for_status()
-    name = r.json()["data"][0]["id"]
-    _model_name_cache[url] = name
-    return name
-
-
-async def compute_loss(client, url, tokens):
-    model = await get_model_name(client, url)
-    r = await client.post(
-        f"{url}/v1/completions",
-        json={
-            "model": model, "prompt": tokens, "max_tokens": 1,
-            "temperature": 0.0, "logprobs": 1, "echo": True,
-        },
-        timeout=120.0,
-    )
-    r.raise_for_status()
-    lps = r.json()["choices"][0]["logprobs"]["token_logprobs"]
-    valid = [lp for lp in lps[1:] if lp is not None]
-    return -sum(valid) / len(valid) if valid else float("nan")
-
-
-async def compute_losses_batch(client, url, token_batches):
-    """Send multiple prompts in one /v1/completions request.
-
-    vLLM accepts ``prompt`` as a list of token-id lists and returns one
-    ``choices`` entry per prompt.  This lets the engine batch prefill
-    across all prompts in a single forward pass.
-    """
-    model = await get_model_name(client, url)
-    r = await client.post(
-        f"{url}/v1/completions",
-        json={
-            "model": model, "prompt": token_batches, "max_tokens": 1,
-            "temperature": 0.0, "logprobs": 1, "echo": True,
-        },
-        timeout=300.0,
-    )
-    r.raise_for_status()
-    choices = sorted(r.json()["choices"], key=lambda c: c["index"])
-    losses = []
-    for choice in choices:
-        lps = choice["logprobs"]["token_logprobs"]
-        valid = [lp for lp in lps[1:] if lp is not None]
-        losses.append(-sum(valid) / len(valid) if valid else float("nan"))
-    return losses
-
-
-# ---------------------------------------------------------------------------
-# Dataset (range-request from R2)
-# ---------------------------------------------------------------------------
-
-def fetch_sequences(r2, shard_key, indices, seq_len):
-    header = r2.range_get(shard_key, 0, 1023)
-    buf = io.BytesIO(header)
-    buf.read(6)  # magic
-    ver = struct.unpack("BB", buf.read(2))
-    hl = struct.unpack("<H" if ver[0] == 1 else "<I", buf.read(2 if ver[0] == 1 else 4))[0]
-    buf.read(hl)
-    data_offset = buf.tell()
-
-    bps = seq_len * 4
-    sorted_idx = sorted(set(indices))
-    groups, gs, ge = [], sorted_idx[0], sorted_idx[0]
-    for i in sorted_idx[1:]:
-        if i - ge <= 64:
-            ge = i
-        else:
-            groups.append((gs, ge)); gs = ge = i
-    groups.append((gs, ge))
-
-    result = {}
-    for gs, ge in groups:
-        chunk = r2.range_get(shard_key, data_offset + gs * bps, data_offset + (ge + 1) * bps - 1)
-        for idx in range(gs, ge + 1):
-            if idx in set(indices):
-                off = (idx - gs) * bps
-                result[idx] = np.frombuffer(chunk[off:off + bps], dtype="<u4").tolist()
-    return result
-
-
-def get_shard_info(r2, shard_key):
-    header = r2.range_get(shard_key, 0, 1023)
-    buf = io.BytesIO(header)
-    buf.read(6)
-    ver = struct.unpack("BB", buf.read(2))
-    hl = struct.unpack("<H" if ver[0] == 1 else "<I", buf.read(2 if ver[0] == 1 else 4))[0]
-    hdr = eval(buf.read(hl).decode("latin1").strip())
-    n = 1
-    for s in hdr["shape"]:
-        n *= s
-    return n
-
-
-# ---------------------------------------------------------------------------
-# Sign test
-# ---------------------------------------------------------------------------
-
-async def run_sign_test(r2, king_url, challenger_url, shard_key, challenge_id,
-                        block_hash, hotkey, on_progress=None):
-    n_tokens = get_shard_info(r2, shard_key)
-    n_sequences = n_tokens // SEQ_LEN
-    actual_N = min(EVAL_N, n_sequences)
-    K = int(binom.isf(EVAL_ALPHA, actual_N, 0.5))
-    log.info("sign test: N=%d actual_N=%d K=%d alpha=%s", EVAL_N, actual_N, K, EVAL_ALPHA)
-
-    seed_material = f"{block_hash}:{hotkey}".encode()
-    seed = int.from_bytes(hashlib.blake2b(seed_material, digest_size=8).digest(), "little")
-    rng = np.random.Generator(np.random.PCG64(seed))
-    eval_indices = rng.choice(n_sequences, size=actual_N, replace=False).tolist()
-
-    if on_progress:
-        on_progress(0, actual_N, 0, 0, 0.0, 0.0, 0)
-
-    log.info("fetching %d sequences from %s", actual_N, shard_key)
-    seq_cache = fetch_sequences(r2, shard_key, eval_indices, SEQ_LEN)
-
-    s, n, n_ties = 0, 0, 0
-    king_sum, chall_sum = 0.0, 0.0
-    t0 = time.time()
-    outcomes_key = f"eval/{challenge_id}/outcomes.jsonl"
-    outcome_buf = []
-
-    client = httpx.AsyncClient(
-        timeout=300.0,
-        limits=httpx.Limits(
-            max_connections=CONCURRENCY * 2,
-            max_keepalive_connections=CONCURRENCY * 2,
-        ),
-    )
-    sem = asyncio.Semaphore(CONCURRENCY)
-
-    batches = [
-        eval_indices[i : i + BATCH_SIZE]
-        for i in range(0, len(eval_indices), BATCH_SIZE)
-    ]
-
-    async def _eval_batch(batch_indices):
-        token_batches = [seq_cache[idx] for idx in batch_indices]
-        async with sem:
-            king_losses, chall_losses = await asyncio.gather(
-                compute_losses_batch(client, king_url, token_batches),
-                compute_losses_batch(client, challenger_url, token_batches),
-            )
-        return list(zip(batch_indices, king_losses, chall_losses))
-
-    tasks = [asyncio.create_task(_eval_batch(batch)) for batch in batches]
-
-    total_done = 0
-    early_stopped = False
-    for bi, task in enumerate(tasks):
-        try:
-            results = await task
-        except asyncio.CancelledError:
-            break
-
-        for idx, kl, cl in results:
-            total_done += 1
-            king_sum += kl
-            chall_sum += cl
-            outcome = {"seq_idx": idx, "king_loss": round(kl, 6),
-                        "challenger_loss": round(cl, 6)}
-
-            if kl == cl:
-                n_ties += 1
-                outcome["win"] = None
-            else:
-                n += 1
-                win = cl < kl
-                if win:
-                    s += 1
-                outcome["win"] = 1 if win else 0
-
-            outcome.update({"s": s, "n": n, "N": actual_N})
-            outcome_buf.append(outcome)
-
-        if on_progress:
-            on_progress(total_done, actual_N, s, n, king_sum, chall_sum, n_ties)
-
-        if len(outcome_buf) >= 100:
-            r2.append_jsonl_batch(outcomes_key, outcome_buf)
-            outcome_buf = []
-
-        if n > 0:
-            if s >= K:
-                log.info("EARLY STOP challenger wins s=%d >= K=%d", s, K)
-                early_stopped = True
-            else:
-                remaining = actual_N - (n + n_ties)
-                if s + remaining < K:
-                    log.info("EARLY STOP king holds s=%d remaining=%d", s, remaining)
-                    early_stopped = True
-
-        if early_stopped:
-            for t in tasks[bi + 1 :]:
-                t.cancel()
-            break
-
-        if total_done % 500 < BATCH_SIZE:
-            log.info("progress %d/%d s=%d n=%d wr=%.3f",
-                     total_done, actual_N, s, n, s / n if n else 0)
-
-    if outcome_buf:
-        r2.append_jsonl_batch(outcomes_key, outcome_buf)
-
-    await client.aclose()
-    elapsed = time.time() - t0
-    total = n + n_ties
-    accepted = s >= K
-
-    verdict = {
-        "accepted": accepted,
-        "verdict": "challenger" if accepted else "king",
-        "S_N": s, "K": K, "N": actual_N,
-        "n_evaluated": n, "n_ties": n_ties,
-        "win_rate": round(s / n, 6) if n else 0,
-        "alpha": EVAL_ALPHA,
-        "early_stopped": total < actual_N,
-        "avg_king_loss": round(king_sum / total, 6) if total else 0,
-        "avg_challenger_loss": round(chall_sum / total, 6) if total else 0,
-        "wall_time_s": round(elapsed, 1),
-        "challenge_id": challenge_id,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-    r2.put(f"eval/{challenge_id}/verdict.json", verdict)
-    log.info("verdict: %s (s=%d K=%d wr=%.4f %.1fs)", verdict["verdict"], s, K, verdict["win_rate"], elapsed)
-    return verdict
 
 
 # ---------------------------------------------------------------------------
@@ -784,15 +409,6 @@ async def process_challenge(state, r2, entry, subtensor, wallet):
         state.event({"event": "stale", "challenge_id": cid, "hotkey": hotkey})
         return
 
-    try:
-        deploy_model(SSH_CHALLENGER, hf_repo, CHALLENGER_PORT)
-    except Exception:
-        log.exception("deploy failed for %s — adding to failed_repos", hf_repo)
-        state.failed_repos.add(hf_repo)
-        state.event({"event": "deploy_failed", "challenge_id": cid, "hf_repo": hf_repo})
-        return
-
-    # Deterministic shard selection
     block_hash = "default"
     try:
         block_hash = subtensor.get_block_hash(entry["block"]) or "default"
@@ -808,9 +424,6 @@ async def process_challenge(state, r2, entry, subtensor, wallet):
     shard_idx = int.from_bytes(hashlib.blake2b(seed_mat, digest_size=8).digest(), "little") % n_shards
     shard_key = manifest["shards"][shard_idx]["key"]
 
-    king_url = f"http://localhost:{KING_PORT}"
-    chall_url = f"http://localhost:{CHALLENGER_PORT}"
-
     r2.put(f"eval/{cid}/meta.json", {
         "challenge_id": cid, "king_repo": KING_REPO,
         "challenger_repo": hf_repo, "hotkey": hotkey,
@@ -825,18 +438,57 @@ async def process_challenge(state, r2, entry, subtensor, wallet):
     }
     state.flush_dashboard()
 
-    def _on_progress(done, total, s, n, king_sum, chall_sum, n_ties):
-        evaluated = n + n_ties
-        state.current_eval.update({
-            "progress": done, "total": total, "s": s, "n": n,
-            "win_rate": round(s / n, 6) if n else 0,
-            "avg_king_loss": round(king_sum / evaluated, 6) if evaluated else 0,
-            "avg_challenger_loss": round(chall_sum / evaluated, 6) if evaluated else 0,
+    verdict = None
+    async with httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=30.0)) as client:
+        resp = await client.post(f"{EVAL_SERVER_URL}/eval", json={
+            "king_repo": KING_REPO,
+            "challenger_repo": hf_repo,
+            "block_hash": block_hash,
+            "hotkey": hotkey,
+            "shard_key": shard_key,
+            "eval_n": EVAL_N,
+            "alpha": EVAL_ALPHA,
+            "seq_len": SEQ_LEN,
         })
-        state.flush_dashboard()
+        resp.raise_for_status()
+        eval_id = resp.json()["eval_id"]
+        log.info("eval %s dispatched to eval server as %s", cid, eval_id)
 
-    verdict = await run_sign_test(r2, king_url, chall_url, shard_key, cid,
-                                  block_hash, hotkey, on_progress=_on_progress)
+        async with client.stream("GET", f"{EVAL_SERVER_URL}/eval/{eval_id}/stream",
+                                  timeout=httpx.Timeout(1800.0)) as stream:
+            async for line in stream.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                event = json.loads(line[6:])
+
+                if event["type"] == "progress":
+                    d = event["data"]
+                    state.current_eval.update({
+                        "progress": d.get("done", 0),
+                        "total": d.get("total", EVAL_N),
+                        "s": d.get("s", 0),
+                        "n": d.get("n", 0),
+                        "win_rate": d.get("win_rate", 0),
+                        "avg_king_loss": d.get("avg_king_loss", 0),
+                        "avg_challenger_loss": d.get("avg_challenger_loss", 0),
+                    })
+                    state.flush_dashboard()
+
+                elif event["type"] == "verdict":
+                    verdict = event["data"]
+                    verdict["challenge_id"] = cid
+                    break
+
+                elif event["type"] == "error":
+                    raise RuntimeError(f"eval server error: {event['data']}")
+
+    if not verdict:
+        raise RuntimeError("eval stream ended without verdict")
+
+    r2.put(f"eval/{cid}/verdict.json", verdict)
+    log.info("verdict: %s (s=%d K=%d wr=%.4f %.1fs)",
+             verdict["verdict"], verdict["S_N"], verdict["K"],
+             verdict["win_rate"], verdict["wall_time_s"])
 
     state.current_eval = None
     state.record_verdict(verdict, hf_repo, hotkey)
@@ -855,7 +507,6 @@ async def process_challenge(state, r2, entry, subtensor, wallet):
         log.info("DETHRONE! %s wins via %s", hotkey[:16], cid)
         old_hash = state.king.get("king_hash", "")
         new_hash = fork_winner(hf_repo, old_hash, hotkey, cid)
-        deploy_model(SSH_KING, KING_REPO, KING_PORT)
         state.set_king(hotkey, KING_REPO, new_hash, entry.get("block", 0), cid)
         set_weights(subtensor, wallet, NETUID, hotkey)
         state.last_weight_block = subtensor.block
@@ -872,8 +523,8 @@ async def main():
         datefmt="%H:%M:%S",
     )
 
-    if not SSH_KING or not SSH_CHALLENGER:
-        log.error("set TEUTONIC_SSH_KING and TEUTONIC_SSH_CHALLENGER")
+    if not EVAL_SERVER_URL:
+        log.error("set TEUTONIC_EVAL_SERVER")
         sys.exit(1)
 
     r2 = R2()
@@ -884,7 +535,6 @@ async def main():
         log.info("--no-seen: will continuously re-evaluate all challengers")
     state.flush_dashboard()
 
-    # Upload dashboard HTML to R2
     html_path = os.path.join(os.path.dirname(__file__) or ".", "index.html")
     if os.path.exists(html_path):
         with open(html_path, "rb") as f:
@@ -894,7 +544,6 @@ async def main():
     wallet = bt.wallet(name=WALLET_NAME, hotkey=WALLET_HOTKEY)
     subtensor = bt.subtensor(network=NETWORK)
 
-    # Ensure king is running
     if not state.king:
         king_hash = "seed"
         try:
@@ -906,74 +555,66 @@ async def main():
             pass
         state.set_king(wallet.hotkey.ss58_address, KING_REPO, king_hash, subtensor.block)
 
-    def cleanup():
-        log.info("cleaning up GPU on both boxes")
-        gpu_clean(SSH_KING)
-        gpu_clean(SSH_CHALLENGER)
-        for proc in _tunnels.values():
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        log.info("cleanup done")
+    # Verify eval server is reachable
+    try:
+        r = httpx.get(f"{EVAL_SERVER_URL}/health", timeout=10)
+        r.raise_for_status()
+        health = r.json()
+        log.info("eval server healthy: %s", health)
+    except Exception:
+        log.warning("eval server at %s not reachable at startup (will retry on eval)", EVAL_SERVER_URL)
 
-    import signal
     def _on_signal(sig, frame):
-        log.info("received signal %d", sig)
-        cleanup()
+        log.info("received signal %d, shutting down", sig)
         sys.exit(0)
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
-    deploy_model(SSH_KING, KING_REPO, KING_PORT)
+    log.info("validator running | king=%s | eval_server=%s | poll=%ds",
+             state.king.get("king_hash", "")[:16], EVAL_SERVER_URL, POLL_INTERVAL)
 
-    log.info("validator running | king=%s | poll=%ds", state.king.get("king_hash", "")[:16], POLL_INTERVAL)
+    while True:
+        try:
+            reveals = scan_reveals(subtensor, NETUID, state.seen)
+            if reveals:
+                state.flush()
+                for rev in reveals:
+                    cid = state.enqueue(rev)
+                    if cid:
+                        log.info("queued %s from %s", cid, rev["hotkey"][:16])
 
-    try:
-        while True:
-            try:
-                reveals = scan_reveals(subtensor, NETUID, state.seen)
-                if reveals:
-                    state.flush()
-                    for rev in reveals:
-                        cid = state.enqueue(rev)
-                        if cid:
-                            log.info("queued %s from %s", cid, rev["hotkey"][:16])
-
-                while state.queue:
-                    entry = state.queue.pop(0)
-                    state.flush()
-                    try:
-                        await process_challenge(state, r2, entry, subtensor, wallet)
-                    except Exception:
-                        log.exception("eval failed: %s", entry.get("challenge_id"))
-                        state.stats["failed"] += 1
-                        state.current_eval = None
-                        state.flush_dashboard()
-
-                if not args.seen:
-                    state.seen.clear()
-                    state.flush()
-
+            while state.queue:
+                entry = state.queue.pop(0)
+                state.flush()
                 try:
-                    current_block = subtensor.block
-                    if current_block - state.last_weight_block >= WEIGHT_INTERVAL:
-                        king_hotkey = state.king.get("hotkey")
-                        if king_hotkey:
-                            log.info("periodic weight set at block %d (last=%d)", current_block, state.last_weight_block)
-                            set_weights(subtensor, wallet, NETUID, king_hotkey)
-                            state.last_weight_block = current_block
+                    await process_challenge(state, r2, entry, subtensor, wallet)
                 except Exception:
-                    log.exception("periodic weight-set failed")
+                    log.exception("eval failed: %s", entry.get("challenge_id"))
+                    state.stats["failed"] += 1
+                    state.current_eval = None
+                    state.flush_dashboard()
 
-            except KeyboardInterrupt:
-                break
+            if not args.seen:
+                state.seen.clear()
+                state.flush()
+
+            try:
+                current_block = subtensor.block
+                if current_block - state.last_weight_block >= WEIGHT_INTERVAL:
+                    king_hotkey = state.king.get("hotkey")
+                    if king_hotkey:
+                        log.info("periodic weight set at block %d (last=%d)", current_block, state.last_weight_block)
+                        set_weights(subtensor, wallet, NETUID, king_hotkey)
+                        state.last_weight_block = current_block
             except Exception:
-                log.exception("tick error")
+                log.exception("periodic weight-set failed")
 
-            await asyncio.sleep(POLL_INTERVAL)
-    finally:
-        cleanup()
+        except KeyboardInterrupt:
+            break
+        except Exception:
+            log.exception("tick error")
+
+        await asyncio.sleep(POLL_INTERVAL)
 
 
 def parse_args():

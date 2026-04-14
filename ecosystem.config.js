@@ -16,8 +16,7 @@ module.exports = {
     interpreter: "/home/const/workspace/.venv/bin/python",
     cwd: "/home/const/workspace/teutonic",
     env: {
-      TEUTONIC_SSH_KING: "wrk-yqpodo8jalfv@ssh.deployments.targon.com",
-      TEUTONIC_SSH_CHALLENGER: "wrk-a7mqgff2bg3z@ssh.deployments.targon.com",
+      TEUTONIC_EVAL_SERVER: "http://localhost:9000",
       TEUTONIC_KING_REPO: "unconst/Teutonic-I",
       HF_TOKEN: dopplerPrd("HF_TOKEN"),
       TEUTONIC_NETUID: "3",

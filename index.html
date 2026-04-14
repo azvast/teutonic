@@ -14,9 +14,20 @@
     --paper: #fff;
     --ink: #000;
     --ink-inv: #fff;
+    --ink-muted: #999;
     --border: 1px dashed #000;
+    --border-faint: 1px dotted rgba(0,0,0,0.15);
     --font: 'Space Mono', monospace;
     --saw: 8px;
+}
+
+[data-theme="dark"] {
+    --paper: #111;
+    --ink: #ddd;
+    --ink-inv: #111;
+    --ink-muted: #777;
+    --border: 1px dashed #ddd;
+    --border-faint: 1px dotted rgba(255,255,255,0.15);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -126,28 +137,46 @@ td {
     text-overflow: ellipsis;
     white-space: nowrap;
 }
-tr { border-bottom: 1px dotted rgba(0,0,0,0.15); }
+tr { border-bottom: var(--border-faint); }
 tr:hover td {
     background: var(--ink);
     color: var(--ink-inv);
     cursor: crosshair;
 }
 th:last-child, td:last-child { text-align: right; }
+
+[data-theme="dark"] .logo-img { filter: invert(1); }
+
+#theme-toggle {
+    background: none;
+    border: var(--border);
+    color: var(--ink);
+    font: 11px/1 var(--font);
+    text-transform: uppercase;
+    padding: 3px 8px;
+    cursor: pointer;
+    letter-spacing: 0.05em;
+}
+#theme-toggle:hover {
+    background: var(--ink);
+    color: var(--ink-inv);
+}
 </style>
 </head>
 <body>
 <div class="page">
 
-    <div id="top-bar" style="display:flex;justify-content:space-between;align-items:center;border-bottom:1px dashed #000;padding:6px 0;font-size:12px;text-transform:uppercase;">
+    <div id="top-bar" style="display:flex;justify-content:space-between;align-items:center;border-bottom:var(--border);padding:6px 0;font-size:12px;text-transform:uppercase;">
         <span>TAO <b id="tao-price">--</b> <span id="tao-change" style="font-size:10px"></span></span>
         <span>SN3 ALPHA <b id="alpha-price">--</b></span>
         <span>SN3 REG <b id="reg-cost">--</b></span>
+        <button id="theme-toggle">DARK</button>
     </div>
 
     <div style="text-align:center;margin-bottom:8px;">
-        <img src="favicon.png" alt="Teuton" style="width:80px;height:80px;margin-bottom:8px;">
+        <img src="favicon.png" alt="Teuton" class="logo-img" style="width:80px;height:80px;margin-bottom:8px;">
         <div style="font-size:20px;font-weight:bold;letter-spacing:0.1em;text-transform:uppercase;">Teutonic-I</div>
-        <div style="font-size:11px;margin-top:4px;"><a href="https://github.com/unarbos/teutonic" target="_blank" style="color:var(--ink);text-decoration:none;text-transform:uppercase;border-bottom:1px dashed #000;">GitHub</a></div>
+        <div style="font-size:11px;margin-top:4px;"><a href="https://github.com/unarbos/teutonic" target="_blank" style="color:var(--ink);text-decoration:none;text-transform:uppercase;border-bottom:var(--border);">GitHub</a></div>
         <div id="king-info" style="font-size:11px;text-transform:uppercase;">
             <span id="king-health" title="King repo status"></span>
             <a id="king-link" href="#" target="_blank" style="color:var(--ink);"></a>
@@ -217,6 +246,13 @@ th:last-child, td:last-child { text-align: right; }
 <script>
 var DATA_URL = "https://pub-0821b4e0d60149b79bad17376722bc75.r2.dev/dashboard.json";
 var POLL_MS = 5000;
+var _lastData = null;
+
+(function initTheme() {
+    var saved = localStorage.getItem("theme");
+    var dark = saved ? saved === "dark" : window.matchMedia("(prefers-color-scheme: dark)").matches;
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+})();
 
 function short(s, n) { return s ? s.slice(0, n || 12) + "\u2026" : "--"; }
 
@@ -296,8 +332,12 @@ function render(d) {
 
     SVG.setAttribute("viewBox", "0 0 " + W + " " + H);
 
+    var cs = getComputedStyle(document.documentElement);
+    var inkC = cs.getPropertyValue('--ink').trim();
+    var mutedC = cs.getPropertyValue('--ink-muted').trim();
+
     if (nPts < 1) {
-        SVG.innerHTML = '<text x="' + (W/2) + '" y="' + (H/2) + '" text-anchor="middle" font-family="Space Mono,monospace" font-size="' + (13*dpr) + '" fill="#000">NO DATA</text>';
+        SVG.innerHTML = '<text x="' + (W/2) + '" y="' + (H/2) + '" text-anchor="middle" font-family="Space Mono,monospace" font-size="' + (13*dpr) + '" fill="' + inkC + '">NO DATA</text>';
         document.getElementById("chart-meta").innerHTML = "<span>--</span>";
     } else {
 
@@ -312,24 +352,24 @@ function render(d) {
 
     var svg = '';
     var fs = Math.round(11 * dpr);
-    var font = 'font-family="Space Mono,monospace" font-size="' + fs + '" fill="#000"';
+    var font = 'font-family="Space Mono,monospace" font-size="' + fs + '" fill="' + inkC + '"';
 
-    svg += '<line x1="' + ML + '" y1="' + MT + '" x2="' + ML + '" y2="' + (MT + ph) + '" stroke="#000" stroke-width="' + lw + '"/>';
-    svg += '<line x1="' + ML + '" y1="' + (MT + ph) + '" x2="' + (ML + pw) + '" y2="' + (MT + ph) + '" stroke="#000" stroke-width="' + lw + '"/>';
+    svg += '<line x1="' + ML + '" y1="' + MT + '" x2="' + ML + '" y2="' + (MT + ph) + '" stroke="' + inkC + '" stroke-width="' + lw + '"/>';
+    svg += '<line x1="' + ML + '" y1="' + (MT + ph) + '" x2="' + (ML + pw) + '" y2="' + (MT + ph) + '" stroke="' + inkC + '" stroke-width="' + lw + '"/>';
 
     for (var t = 0; t <= 4; t++) {
         var val = minL + (maxL - minL) * (t / 4);
         var yy = toY(val);
-        svg += '<line x1="' + (ML - 5*dpr) + '" y1="' + yy + '" x2="' + ML + '" y2="' + yy + '" stroke="#000" stroke-width="' + lw + '"/>';
+        svg += '<line x1="' + (ML - 5*dpr) + '" y1="' + yy + '" x2="' + ML + '" y2="' + yy + '" stroke="' + inkC + '" stroke-width="' + lw + '"/>';
         svg += '<text x="' + (ML - 8*dpr) + '" y="' + (yy + fs*0.35) + '" text-anchor="end" ' + font + '>' + val.toFixed(2) + '</text>';
         if (t > 0 && t < 4) {
-            svg += '<line x1="' + ML + '" y1="' + yy + '" x2="' + (ML + pw) + '" y2="' + yy + '" stroke="#000" stroke-width="' + (0.5*dpr) + '" stroke-dasharray="' + (3*dpr) + ' ' + (6*dpr) + '"/>';
+            svg += '<line x1="' + ML + '" y1="' + yy + '" x2="' + (ML + pw) + '" y2="' + yy + '" stroke="' + inkC + '" stroke-width="' + (0.5*dpr) + '" stroke-dasharray="' + (3*dpr) + ' ' + (6*dpr) + '"/>';
         }
     }
 
     for (var i = 0; i < nPts; i++) {
         var xx = toX(i);
-        svg += '<line x1="' + xx + '" y1="' + (MT + ph) + '" x2="' + xx + '" y2="' + (MT + ph + 5*dpr) + '" stroke="#000" stroke-width="' + lw + '"/>';
+        svg += '<line x1="' + xx + '" y1="' + (MT + ph) + '" x2="' + xx + '" y2="' + (MT + ph + 5*dpr) + '" stroke="' + inkC + '" stroke-width="' + lw + '"/>';
         var label = (ev && i === nPts - 1) ? "NOW" : "";
         svg += '<text x="' + xx + '" y="' + (MT + ph + 20*dpr) + '" text-anchor="middle" ' + font + '>' + label + '</text>';
     }
@@ -339,9 +379,9 @@ function render(d) {
     for (var i = 0; i < nPts; i++) {
         cpts.push(toX(i).toFixed(1) + "," + toY(challLosses[i]).toFixed(1));
     }
-    svg += '<polyline points="' + cpts.join(" ") + '" fill="none" stroke="#999" stroke-width="' + (1*dpr) + '" stroke-dasharray="' + (4*dpr) + ' ' + (3*dpr) + '" stroke-linejoin="round"/>';
+    svg += '<polyline points="' + cpts.join(" ") + '" fill="none" stroke="' + mutedC + '" stroke-width="' + (1*dpr) + '" stroke-dasharray="' + (4*dpr) + ' ' + (3*dpr) + '" stroke-linejoin="round"/>';
     for (var i = 0; i < nPts; i++) {
-        svg += '<circle cx="' + toX(i).toFixed(1) + '" cy="' + toY(challLosses[i]).toFixed(1) + '" r="' + (2*dpr) + '" fill="#999"/>';
+        svg += '<circle cx="' + toX(i).toFixed(1) + '" cy="' + toY(challLosses[i]).toFixed(1) + '" r="' + (2*dpr) + '" fill="' + mutedC + '"/>';
     }
 
     // King loss line (solid black)
@@ -349,18 +389,18 @@ function render(d) {
     for (var i = 0; i < nPts; i++) {
         kpts.push(toX(i).toFixed(1) + "," + toY(kingLosses[i]).toFixed(1));
     }
-    svg += '<polyline points="' + kpts.join(" ") + '" fill="none" stroke="#000" stroke-width="' + (1.5*dpr) + '" stroke-linejoin="round"/>';
+    svg += '<polyline points="' + kpts.join(" ") + '" fill="none" stroke="' + inkC + '" stroke-width="' + (1.5*dpr) + '" stroke-linejoin="round"/>';
     for (var i = 0; i < nPts; i++) {
-        svg += '<circle cx="' + toX(i).toFixed(1) + '" cy="' + toY(kingLosses[i]).toFixed(1) + '" r="' + (3*dpr) + '" fill="#000"/>';
+        svg += '<circle cx="' + toX(i).toFixed(1) + '" cy="' + toY(kingLosses[i]).toFixed(1) + '" r="' + (3*dpr) + '" fill="' + inkC + '"/>';
     }
 
     // Legend
     var legX = ML + 12*dpr, legY = MT + 14*dpr;
-    svg += '<line x1="' + legX + '" y1="' + legY + '" x2="' + (legX + 20*dpr) + '" y2="' + legY + '" stroke="#000" stroke-width="' + (1.5*dpr) + '"/>';
+    svg += '<line x1="' + legX + '" y1="' + legY + '" x2="' + (legX + 20*dpr) + '" y2="' + legY + '" stroke="' + inkC + '" stroke-width="' + (1.5*dpr) + '"/>';
     svg += '<text x="' + (legX + 24*dpr) + '" y="' + (legY + fs*0.35) + '" ' + font + '>KING</text>';
     var leg2X = legX + 80*dpr;
-    svg += '<line x1="' + leg2X + '" y1="' + legY + '" x2="' + (leg2X + 20*dpr) + '" y2="' + legY + '" stroke="#999" stroke-width="' + (1*dpr) + '" stroke-dasharray="' + (4*dpr) + ' ' + (3*dpr) + '"/>';
-    svg += '<text x="' + (leg2X + 24*dpr) + '" y="' + (legY + fs*0.35) + '" ' + font + ' fill="#999">CHALLENGER</text>';
+    svg += '<line x1="' + leg2X + '" y1="' + legY + '" x2="' + (leg2X + 20*dpr) + '" y2="' + legY + '" stroke="' + mutedC + '" stroke-width="' + (1*dpr) + '" stroke-dasharray="' + (4*dpr) + ' ' + (3*dpr) + '"/>';
+    svg += '<text x="' + (leg2X + 24*dpr) + '" y="' + (legY + fs*0.35) + '" ' + font + ' fill="' + mutedC + '">CHALLENGER</text>';
 
     SVG.innerHTML = svg;
 
@@ -491,9 +531,24 @@ function render(d) {
 async function poll() {
     try {
         var r = await fetch(DATA_URL + "?t=" + Date.now());
-        if (r.ok) render(await r.json());
+        if (r.ok) { _lastData = await r.json(); render(_lastData); }
     } catch (e) {}
 }
+
+(function initToggle() {
+    var btn = document.getElementById("theme-toggle");
+    function updateLabel() {
+        btn.textContent = document.documentElement.dataset.theme === "dark" ? "LIGHT" : "DARK";
+    }
+    updateLabel();
+    btn.addEventListener("click", function() {
+        var isDark = document.documentElement.dataset.theme === "dark";
+        document.documentElement.dataset.theme = isDark ? "light" : "dark";
+        localStorage.setItem("theme", document.documentElement.dataset.theme);
+        updateLabel();
+        if (_lastData) render(_lastData);
+    });
+})();
 
 poll();
 setInterval(poll, POLL_MS);

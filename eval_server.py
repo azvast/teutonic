@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -139,6 +140,106 @@ def _load_challenger(repo: str, revision: str = ""):
 
 
 # ---------------------------------------------------------------------------
+# Housekeeping
+# ---------------------------------------------------------------------------
+
+MAX_EVALS_KEPT = 50
+EVAL_MAX_AGE_S = 3600
+
+def _cleanup_hf_cache():
+    """Delete HF cached models that aren't the current king."""
+    try:
+        from huggingface_hub import scan_cache_dir
+        cache_info = scan_cache_dir()
+
+        keep_repo = _king_repo
+        keep_rev = _king_revision
+        hashes_to_delete = []
+
+        for repo_info in cache_info.repos:
+            repo_id = repo_info.repo_id
+            if repo_id == keep_repo:
+                for rev_info in repo_info.revisions:
+                    if keep_rev and rev_info.commit_hash == keep_rev:
+                        continue
+                    hashes_to_delete.append(rev_info.commit_hash)
+                    log.info("marking for deletion: %s rev %s (%.1f MB)",
+                             repo_id, rev_info.commit_hash[:12],
+                             rev_info.size_on_disk / 1e6)
+            else:
+                for rev_info in repo_info.revisions:
+                    hashes_to_delete.append(rev_info.commit_hash)
+                    log.info("marking for deletion: %s rev %s (%.1f MB)",
+                             repo_id, rev_info.commit_hash[:12],
+                             rev_info.size_on_disk / 1e6)
+
+        if not hashes_to_delete:
+            log.info("hf cache cleanup: nothing to delete")
+            return
+
+        strategy = cache_info.delete_revisions(*hashes_to_delete)
+        log.info("hf cache cleanup: deleting %d revisions, freeing %.1f MB",
+                 len(hashes_to_delete), strategy.expected_freed_size / 1e6)
+        strategy.execute()
+        log.info("hf cache cleanup: done")
+
+    except Exception:
+        log.warning("hf cache cleanup failed", exc_info=True)
+
+
+def _prune_evals():
+    """Remove old completed/failed eval records to bound memory usage."""
+    try:
+        now = time.time()
+        to_remove = []
+        for eid, rec in _evals.items():
+            if rec["state"] not in ("completed", "failed"):
+                continue
+            age = now - rec.get("created_at", now)
+            if age > EVAL_MAX_AGE_S:
+                to_remove.append(eid)
+
+        if len(_evals) - len(to_remove) > MAX_EVALS_KEPT:
+            finished = sorted(
+                ((eid, rec) for eid, rec in _evals.items()
+                 if rec["state"] in ("completed", "failed") and eid not in to_remove),
+                key=lambda x: x[1].get("created_at", 0),
+            )
+            excess = len(_evals) - len(to_remove) - MAX_EVALS_KEPT
+            for eid, _ in finished[:excess]:
+                to_remove.append(eid)
+
+        for eid in to_remove:
+            del _evals[eid]
+
+        if to_remove:
+            log.info("pruned %d old eval records, %d remaining", len(to_remove), len(_evals))
+    except Exception:
+        log.warning("eval pruning failed", exc_info=True)
+
+
+def _get_disk_stats():
+    """Return disk usage stats for the health endpoint."""
+    stats = {}
+    try:
+        usage = shutil.disk_usage("/")
+        stats["disk_total_gb"] = round(usage.total / 1e9, 1)
+        stats["disk_used_gb"] = round(usage.used / 1e9, 1)
+        stats["disk_free_gb"] = round(usage.free / 1e9, 1)
+    except Exception:
+        pass
+    try:
+        from huggingface_hub import scan_cache_dir
+        cache_info = scan_cache_dir()
+        stats["hf_cache_size_gb"] = round(cache_info.size_on_disk / 1e9, 2)
+        stats["hf_cache_repos"] = len(cache_info.repos)
+        stats["hf_cache_revisions"] = sum(len(r.revisions) for r in cache_info.repos)
+    except Exception:
+        pass
+    return stats
+
+
+# ---------------------------------------------------------------------------
 # Eval runner (runs in a thread)
 # ---------------------------------------------------------------------------
 
@@ -180,6 +281,8 @@ def _run_eval(eval_id: str, req: EvalRequest):
         record["verdict"] = verdict
         event_q.put({"type": "verdict", "data": verdict})
 
+        _cleanup_hf_cache()
+
     except Exception as e:
         log.exception("eval %s failed", eval_id)
         record["state"] = "failed"
@@ -187,6 +290,7 @@ def _run_eval(eval_id: str, req: EvalRequest):
         event_q.put({"type": "error", "data": {"error": str(e)}})
 
     finally:
+        _prune_evals()
         _eval_lock.release()
 
 
@@ -201,6 +305,8 @@ async def health():
         "gpus": len(_gpu_ids),
         "gpu_ids": _gpu_ids,
         "king_loaded": _king_repo,
+        "active_evals": len(_evals),
+        **_get_disk_stats(),
     }
 
 

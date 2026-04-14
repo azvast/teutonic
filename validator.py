@@ -45,6 +45,9 @@ R2_ACCESS_KEY = os.environ.get("TEUTONIC_R2_ACCESS_KEY", "")
 R2_SECRET_KEY = os.environ.get("TEUTONIC_R2_SECRET_KEY", "")
 TMC_API_KEY = os.environ.get("TMC_API_KEY", "")
 
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
+DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")
+
 REPO_PATTERN = r"^[^/]+/Teutonic-I-.+$"
 
 TMC_BASE = "https://api.taomarketcap.com/public/v1"
@@ -84,6 +87,57 @@ async def fetch_tmc_data() -> dict | None:
     except Exception:
         log.warning("TMC fetch failed", exc_info=True)
         return None
+
+# ---------------------------------------------------------------------------
+# Discord notifications
+# ---------------------------------------------------------------------------
+
+async def notify_new_king(king_info: dict, verdict: dict | None = None):
+    """Post a message to Discord when a new king is crowned."""
+    if not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID:
+        return
+    repo = king_info.get("hf_repo", "?")
+    hotkey = king_info.get("hotkey", "?")
+    reign = king_info.get("reign_number", 0)
+    revision = king_info.get("king_revision", "")[:12]
+
+    lines = [
+        f"**New King of Subnet 3!**",
+        f"**Repo:** `{repo}`" + (f" (`{revision}`)" if revision else ""),
+        f"**Hotkey:** `{hotkey[:16]}...`",
+        f"**Reign:** #{reign}",
+    ]
+    if verdict:
+        mu = verdict.get("mu_hat", 0)
+        king_loss = verdict.get("avg_king_loss", 0)
+        chall_loss = verdict.get("avg_challenger_loss", 0)
+        wall = verdict.get("wall_time_s", 0)
+        lines.append(f"**Eval:** challenger loss {chall_loss:.4f} vs king loss {king_loss:.4f} (μ̂={mu:.6f}, {wall:.0f}s)")
+    prev = king_info.get("previous_king")
+    if prev and prev.get("hf_repo"):
+        lines.append(f"**Dethroned:** `{prev['hf_repo']}`")
+
+    embed = {
+        "title": "👑 New King Crowned",
+        "description": "\n".join(lines),
+        "color": 0xFFD700,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            resp = await client.post(
+                f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages",
+                headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+                         "Content-Type": "application/json"},
+                json={"embeds": [embed]},
+            )
+            if resp.status_code < 300:
+                log.info("discord notification sent for reign #%d", reign)
+            else:
+                log.warning("discord notification failed: %d %s", resp.status_code, resp.text[:200])
+    except Exception:
+        log.warning("discord notification error", exc_info=True)
+
 
 # ---------------------------------------------------------------------------
 # R2
@@ -420,6 +474,26 @@ class State:
         except Exception:
             log.warning("failed to refresh uid_map", exc_info=True)
 
+    def replenish_reeval(self, subtensor, netuid):
+        """Fill queue with re-eval candidates so the dashboard never shows empty."""
+        self.evaluated_repos.clear()
+        throwaway_seen = set()
+        reeval_reveals = scan_reveals(subtensor, netuid, throwaway_seen)
+        king_hk = self.king.get("hotkey", "")
+        reeval_reveals = [r for r in reeval_reveals
+                          if r["hotkey"] != king_hk
+                          and r["hf_repo"] not in self.failed_repos]
+        count = 0
+        for rev in reeval_reveals:
+            rev["reeval"] = True
+            cid = self.enqueue(rev)
+            if cid:
+                count += 1
+                log.info("queued %s from %s (re-eval)", cid, rev["hotkey"][:16])
+        if count:
+            log.info("replenished queue with %d re-eval candidates", count)
+        return count
+
     def flush_dashboard(self):
         payload = {
             "updated_at": _now(),
@@ -429,7 +503,7 @@ class State:
             "queue": [{"challenge_id": e.get("challenge_id"), "hotkey": e.get("hotkey"),
                         "uid": self.uid_map.get(e.get("hotkey", ""), "?"),
                         "hf_repo": e.get("hf_repo"), "queued_at": e.get("queued_at"),
-                        "block": e.get("block")}
+                        "block": e.get("block"), "reeval": e.get("reeval", False)}
                        for e in self.queue],
             "history": self.history,
         }
@@ -630,6 +704,7 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
                        entry.get("block", 0), cid,
                        king_revision=challenger_revision)
         state.last_winner_hotkey = hotkey
+        await notify_new_king(state.king, verdict)
         if set_weights(subtensor, wallet, NETUID, hotkey):
             state.last_weight_block = subtensor.block
 
@@ -710,7 +785,6 @@ async def main():
             if tmc:
                 state.market = tmc
 
-            # Phase 1: process new (unseen) challengers first
             reveals = scan_reveals(subtensor, NETUID, state.seen)
             if reveals:
                 state.flush()
@@ -719,8 +793,13 @@ async def main():
                     if cid:
                         log.info("queued %s from %s (new)", cid, rev["hotkey"][:16])
 
+            if args.seen and not state.queue:
+                log.info("all miners seen — replenishing with re-eval candidates")
+                state.replenish_reeval(subtensor, NETUID)
+
             while state.queue:
                 entry = state.queue.pop(0)
+                is_reeval = entry.get("reeval", False)
                 state.current_eval = {
                     "challenge_id": entry.get("challenge_id", "?"),
                     "challenger_repo": entry.get("hf_repo", ""),
@@ -734,7 +813,7 @@ async def main():
                 state.flush()
                 try:
                     await process_challenge(state, r2, entry, subtensor, wallet,
-                                            check_stale=args.seen)
+                                            check_stale=not is_reeval and args.seen)
                 except Exception:
                     log.exception("eval failed: %s", entry.get("challenge_id"))
                     state.stats["failed"] += 1
@@ -748,58 +827,16 @@ async def main():
                         cid = state.enqueue(rev)
                         if cid:
                             log.info("queued %s from %s (new, mid-cycle)", cid, rev["hotkey"][:16])
+                    new_items = [e for e in state.queue if not e.get("reeval")]
+                    reeval_items = [e for e in state.queue if e.get("reeval")]
+                    state.queue = new_items + reeval_items
 
             state.current_eval = None
-            state.flush_dashboard()
 
-            # Phase 2: re-evaluate already-seen challengers when none are unseen
             if args.seen and not state.queue:
-                log.info("all miners seen — starting re-evaluation cycle")
-                state.evaluated_repos.clear()
-                throwaway_seen = set()
-                reeval_reveals = scan_reveals(subtensor, NETUID, throwaway_seen)
-                king_hk = state.king.get("hotkey", "")
-                reeval_reveals = [r for r in reeval_reveals
-                                  if r["hotkey"] != king_hk
-                                  and r["hf_repo"] not in state.failed_repos]
-                for rev in reeval_reveals:
-                    cid = state.enqueue(rev)
-                    if cid:
-                        log.info("queued %s from %s (re-eval)", cid, rev["hotkey"][:16])
+                state.replenish_reeval(subtensor, NETUID)
 
-                while state.queue:
-                    entry = state.queue.pop(0)
-                    state.current_eval = {
-                        "challenge_id": entry.get("challenge_id", "?"),
-                        "challenger_repo": entry.get("hf_repo", ""),
-                        "hotkey": entry.get("hotkey", ""),
-                        "progress": 0, "total": EVAL_N, "mu_hat": 0,
-                        "avg_king_loss": 0, "avg_challenger_loss": 0,
-                        "loading": True,
-                        "started_at": _now(),
-                    }
-                    state.flush_dashboard()
-                    state.flush()
-                    try:
-                        await process_challenge(state, r2, entry, subtensor, wallet,
-                                                check_stale=False)
-                    except Exception:
-                        log.exception("eval failed: %s", entry.get("challenge_id"))
-                        state.stats["failed"] += 1
-                        state.current_eval = None
-                        state.flush_dashboard()
-
-                    fresh = scan_reveals(subtensor, NETUID, state.seen)
-                    if fresh:
-                        log.info("new miners appeared during re-eval, prioritizing them")
-                        for rev in fresh:
-                            cid = state.enqueue(rev)
-                            if cid:
-                                log.info("queued %s from %s (new, interrupt)", cid, rev["hotkey"][:16])
-                        break
-
-                state.current_eval = None
-                state.flush_dashboard()
+            state.flush_dashboard()
 
             if not args.seen:
                 state.seen.clear()

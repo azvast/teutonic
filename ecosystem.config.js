@@ -1,3 +1,13 @@
+const { execSync } = require("child_process");
+
+function doppler(key) {
+  return execSync(`doppler secrets get ${key} --plain -p arbos -c dev`, { encoding: "utf8" }).trim();
+}
+
+function dopplerPrd(key) {
+  return execSync(`doppler secrets get ${key} --plain -p arbos -c prd`, { encoding: "utf8" }).trim();
+}
+
 module.exports = {
   apps: [{
     name: "teutonic-validator",
@@ -5,18 +15,18 @@ module.exports = {
     interpreter: "/home/const/workspace/.venv/bin/python",
     cwd: "/home/const/workspace/teutonic",
     env: {
-      TEUTONIC_SSH_KING: process.env.TEUTONIC_SSH_KING || "",
-      TEUTONIC_SSH_CHALLENGER: process.env.TEUTONIC_SSH_CHALLENGER || "",
+      TEUTONIC_SSH_KING: "wrk-yqpodo8jalfv@ssh.deployments.targon.com",
+      TEUTONIC_SSH_CHALLENGER: "wrk-a7mqgff2bg3z@ssh.deployments.targon.com",
       TEUTONIC_KING_REPO: "unconst/Teutonic-I",
-      HF_TOKEN: process.env.HF_TOKEN || "",
+      HF_TOKEN: dopplerPrd("HF_TOKEN"),
       TEUTONIC_NETUID: "3",
       TEUTONIC_NETWORK: "finney",
       BT_WALLET_NAME: "teutonic",
       BT_WALLET_HOTKEY: "default",
-      TEUTONIC_R2_ENDPOINT: process.env.TEUTONIC_R2_ENDPOINT || "",
-      TEUTONIC_R2_BUCKET: process.env.TEUTONIC_R2_BUCKET || "",
-      TEUTONIC_R2_ACCESS_KEY: process.env.TEUTONIC_R2_ACCESS_KEY || "",
-      TEUTONIC_R2_SECRET_KEY: process.env.TEUTONIC_R2_SECRET_KEY || "",
+      TEUTONIC_R2_ENDPOINT: doppler("R2_URL"),
+      TEUTONIC_R2_BUCKET: doppler("R2_BUCKET_NAME"),
+      TEUTONIC_R2_ACCESS_KEY: doppler("R2_ACCESS_KEY_ID"),
+      TEUTONIC_R2_SECRET_KEY: doppler("R2_SECRET_ACCESS_KEY"),
     },
     max_restarts: 10,
     restart_delay: 5000,

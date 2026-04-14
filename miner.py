@@ -109,11 +109,12 @@ def main():
         wallet=wallet,
         netuid=NETUID,
         data=payload,
+        blocks_until_reveal=3,
     )
 
     if success:
         log.info("reveal committed at block %d", block)
-        log.info("the validator will pick this up once revealed (~1 hour)")
+        log.info("the validator will pick this up once revealed (~30 seconds)")
     else:
         log.error("reveal commitment failed")
         sys.exit(1)

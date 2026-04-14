@@ -198,8 +198,9 @@ def compute_batch_losses(model, token_batches, device, chunk_size=LM_HEAD_CHUNK)
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_model(repo, device, label="model"):
-    log.info("loading %s from %s onto %s", label, repo, device)
+def load_model(repo, device, label="model", force_download=False, revision=None):
+    log.info("loading %s from %s onto %s (force_download=%s, revision=%s)",
+             label, repo, device, force_download, revision[:12] if revision else None)
     t0 = time.time()
     for attn_impl in ("flash_attention_2", "sdpa", "eager"):
         try:
@@ -209,6 +210,8 @@ def load_model(repo, device, label="model"):
                 device_map={"": device},
                 attn_implementation=attn_impl,
                 token=os.environ.get("HF_TOKEN") or None,
+                force_download=force_download,
+                revision=revision or None,
             )
             log.info("using attn_implementation=%s", attn_impl)
             break
@@ -230,7 +233,7 @@ def load_model(repo, device, label="model"):
 class MultiGPUEvaluator:
     """Manages model replicas across GPUs and dispatches batches in parallel."""
 
-    def __init__(self, repo, gpu_ids, label="model"):
+    def __init__(self, repo, gpu_ids, label="model", force_download=False, revision=None):
         self.gpu_ids = gpu_ids
         self.models = {}
         self.devices = {}
@@ -238,12 +241,14 @@ class MultiGPUEvaluator:
         if len(gpu_ids) == 0:
             raise ValueError("need at least one GPU")
 
-        first_model = load_model(repo, f"cuda:{gpu_ids[0]}", f"{label}-gpu{gpu_ids[0]}")
+        first_model = load_model(repo, f"cuda:{gpu_ids[0]}", f"{label}-gpu{gpu_ids[0]}",
+                                 force_download=force_download, revision=revision)
         self.models[gpu_ids[0]] = first_model
         self.devices[gpu_ids[0]] = f"cuda:{gpu_ids[0]}"
 
         for gid in gpu_ids[1:]:
-            self.models[gid] = load_model(repo, f"cuda:{gid}", f"{label}-gpu{gid}")
+            self.models[gid] = load_model(repo, f"cuda:{gid}", f"{label}-gpu{gid}",
+                                          force_download=force_download, revision=revision)
             self.devices[gid] = f"cuda:{gid}"
 
         self.pool = ThreadPoolExecutor(max_workers=len(gpu_ids))

@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 import bittensor as bt
+import httpx
 import numpy as np
 import torch
 from huggingface_hub import HfApi, snapshot_download
@@ -26,7 +27,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("miner")
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-KING_REPO = os.environ.get("TEUTONIC_KING_REPO", "unconst/Teutonic-I")
+DASHBOARD_URL = os.environ.get("TEUTONIC_DASHBOARD_URL",
+    "https://pub-0821b4e0d60149b79bad17376722bc75.r2.dev/dashboard.json")
+SEED_REPO = os.environ.get("TEUTONIC_SEED_REPO", "unconst/Teutonic-I")
 NETUID = int(os.environ.get("TEUTONIC_NETUID", "3"))
 NETWORK = os.environ.get("TEUTONIC_NETWORK", "finney")
 WALLET_NAME = os.environ.get("BT_WALLET_NAME", "teutonic")
@@ -58,10 +61,27 @@ def main():
     subtensor = bt.subtensor(network=NETWORK)
     log.info("wallet: %s", wallet.hotkey.ss58_address)
 
-    # Download king model
+    # Discover current king from dashboard
+    king_repo = SEED_REPO
+    king_revision = None
+    try:
+        resp = httpx.get(DASHBOARD_URL, timeout=15)
+        resp.raise_for_status()
+        dashboard = resp.json()
+        king_repo = dashboard["king"]["hf_repo"]
+        king_revision = dashboard["king"].get("king_revision") or None
+        log.info("discovered king from dashboard: %s@%s",
+                 king_repo, king_revision[:12] if king_revision else "HEAD")
+    except Exception:
+        log.warning("could not fetch dashboard, falling back to seed repo %s", SEED_REPO)
+
+    # Download king model at pinned revision
     king_dir = "/tmp/teutonic/miner/king"
-    log.info("downloading king from %s", KING_REPO)
-    snapshot_download(KING_REPO, local_dir=king_dir, token=HF_TOKEN or None)
+    if os.path.exists(king_dir):
+        shutil.rmtree(king_dir)
+    log.info("downloading king from %s@%s", king_repo, (king_revision or "HEAD")[:12])
+    snapshot_download(king_repo, local_dir=king_dir, token=HF_TOKEN or None,
+                      revision=king_revision)
     king_hash = sha256_dir(king_dir)
     log.info("king hash: %s", king_hash[:16])
 

@@ -27,6 +27,7 @@ module.exports = {
       TEUTONIC_R2_BUCKET: doppler("R2_BUCKET_NAME"),
       TEUTONIC_R2_ACCESS_KEY: doppler("R2_ACCESS_KEY_ID"),
       TEUTONIC_R2_SECRET_KEY: doppler("R2_SECRET_ACCESS_KEY"),
+      TMC_API_KEY: doppler("TMC_API_KEY"),
     },
     max_restarts: 10,
     restart_delay: 5000,

@@ -19,7 +19,7 @@ import bittensor as bt
 import boto3
 import httpx
 from botocore.config import Config as BotoConfig
-from huggingface_hub import HfApi, snapshot_download
+from huggingface_hub import HfApi
 
 # ---------------------------------------------------------------------------
 # Config
@@ -29,10 +29,10 @@ EVAL_N = 10_000
 EVAL_ALPHA = 0.001
 SEQ_LEN = 2048
 POLL_INTERVAL = 30
-WEIGHT_INTERVAL = 360
+WEIGHT_INTERVAL = 300
 NETUID = int(os.environ.get("TEUTONIC_NETUID", "3"))
 NETWORK = os.environ.get("TEUTONIC_NETWORK", "finney")
-KING_REPO = os.environ.get("TEUTONIC_KING_REPO", "unconst/Teutonic-I")
+SEED_REPO = os.environ.get("TEUTONIC_SEED_REPO", "unconst/Teutonic-I")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 EVAL_SERVER_URL = os.environ.get("TEUTONIC_EVAL_SERVER", "http://localhost:9000")
 WALLET_NAME = os.environ.get("BT_WALLET_NAME", "teutonic")
@@ -42,10 +42,47 @@ R2_ENDPOINT = os.environ.get("TEUTONIC_R2_ENDPOINT", "")
 R2_BUCKET = os.environ.get("TEUTONIC_R2_BUCKET", "")
 R2_ACCESS_KEY = os.environ.get("TEUTONIC_R2_ACCESS_KEY", "")
 R2_SECRET_KEY = os.environ.get("TEUTONIC_R2_SECRET_KEY", "")
+TMC_API_KEY = os.environ.get("TMC_API_KEY", "")
 
 REPO_PATTERN = r"^[^/]+/Teutonic-I-.+$"
 
+TMC_BASE = "https://api.taomarketcap.com/public/v1"
+
 log = logging.getLogger("teutonic")
+
+
+# ---------------------------------------------------------------------------
+# TaoMarketCap
+# ---------------------------------------------------------------------------
+
+async def fetch_tmc_data() -> dict | None:
+    """Fetch TAO price, SN3 alpha price, and registration burn from TMC API."""
+    if not TMC_API_KEY:
+        return None
+    headers = {"Authorization": TMC_API_KEY}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+            market_resp, subnet_resp, burn_resp = await asyncio.gather(
+                client.get(f"{TMC_BASE}/market/market-data/", headers=headers),
+                client.get(f"{TMC_BASE}/subnets/{NETUID}/", headers=headers),
+                client.get(f"{TMC_BASE}/subnets/burn/{NETUID}/", headers=headers),
+            )
+        m = market_resp.json()
+        s = subnet_resp.json()
+        b = burn_resp.json()
+        asp = float(s["latest_snapshot"]["alpha_sqrt_price"])
+        tao_price = m["current_price"]
+        alpha_tao = asp ** 2
+        return {
+            "tao_price_usd": tao_price,
+            "tao_change_24h": m["usd_quote"]["percent_change_24h"],
+            "sn3_alpha_price_tao": alpha_tao,
+            "sn3_alpha_price_usd": alpha_tao * tao_price,
+            "sn3_reg_burn_tao": b[0]["burn"] / 1e9,
+        }
+    except Exception:
+        log.warning("TMC fetch failed", exc_info=True)
+        return None
 
 # ---------------------------------------------------------------------------
 # R2
@@ -117,29 +154,37 @@ class R2:
 # ---------------------------------------------------------------------------
 
 _king_config: dict | None = None
+_king_config_key: str | None = None
 
-def get_king_config():
+def get_king_config(king_repo: str, king_revision: str = ""):
     """Fetch and cache the king model's config.json from HuggingFace."""
-    global _king_config
-    if _king_config is not None:
+    global _king_config, _king_config_key
+    cache_key = f"{king_repo}@{king_revision}"
+    if _king_config is not None and _king_config_key == cache_key:
         return _king_config
     try:
         api = HfApi(token=HF_TOKEN or None)
-        cfg_path = api.hf_hub_download(KING_REPO, "config.json", token=HF_TOKEN or None)
+        cfg_path = api.hf_hub_download(king_repo, "config.json",
+                                        token=HF_TOKEN or None,
+                                        revision=king_revision or None)
         with open(cfg_path) as f:
             _king_config = json.load(f)
+            _king_config_key = cache_key
     except Exception:
-        log.warning("could not fetch king config.json")
+        log.warning("could not fetch king config.json from %s@%s",
+                    king_repo, (king_revision or "HEAD")[:12])
         _king_config = {}
+        _king_config_key = cache_key
     return _king_config
 
 
-def validate_challenger_config(hf_repo: str) -> str | None:
+def validate_challenger_config(hf_repo: str, king_repo: str = "",
+                                king_revision: str = "") -> str | None:
     """Check challenger config.json matches king architecture before deploying.
 
     Returns None if OK, or a human-readable rejection reason.
     """
-    king_cfg = get_king_config()
+    king_cfg = get_king_config(king_repo or SEED_REPO, king_revision)
     if not king_cfg:
         return None
 
@@ -209,17 +254,21 @@ def scan_reveals(subtensor, netuid, seen):
     return new
 
 
-def set_weights(subtensor, wallet, netuid, king_hotkey):
+def set_weights(subtensor, wallet, netuid, king_hotkey) -> bool:
+    """Set 100% weight to *king_hotkey*. Returns True on success."""
     try:
         meta = subtensor.metagraph(netuid)
         if king_hotkey in meta.hotkeys:
             uid = meta.hotkeys.index(king_hotkey)
             subtensor.set_weights(wallet=wallet, netuid=netuid, uids=[uid], weights=[1.0])
             log.info("weights set 100%% to uid=%d (%s)", uid, king_hotkey[:16])
+            return True
         else:
             log.warning("king hotkey %s not in metagraph", king_hotkey[:16])
+            return False
     except Exception:
         log.exception("failed to set weights")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -243,25 +292,8 @@ class State:
         self.current_eval = None
         self.history = []
         self.last_weight_block = 0
-        self._metagraph = None
-        self._metagraph_block = 0
-
-    def refresh_metagraph(self, subtensor, netuid, *, max_age=120):
-        try:
-            block = subtensor.block
-            if self._metagraph is None or block - self._metagraph_block >= max_age:
-                self._metagraph = subtensor.metagraph(netuid)
-                self._metagraph_block = block
-        except Exception:
-            log.exception("failed to refresh metagraph")
-
-    def hotkey_to_uid(self, hotkey: str) -> int | None:
-        if self._metagraph is None:
-            return None
-        try:
-            return self._metagraph.hotkeys.index(hotkey)
-        except ValueError:
-            return None
+        self.last_winner_hotkey: str | None = None
+        self.market: dict | None = None
 
     def load(self):
         k = self.r2.get("king/current.json")
@@ -282,6 +314,8 @@ class State:
             loaded.setdefault("queued", 0)
             self.stats = loaded
             self.counter = st.get("counter", 0)
+            self.last_weight_block = st.get("last_weight_block", 0)
+            self.last_winner_hotkey = st.get("last_winner_hotkey")
         h = self.r2.get("state/dashboard_history.json")
         if h:
             self.history = h.get("history", [])
@@ -291,7 +325,10 @@ class State:
     def flush(self):
         self.r2.put("state/validator_state.json", {
             "king": self.king, "queue": self.queue,
-            "stats": self.stats, "counter": self.counter, "updated_at": _now(),
+            "stats": self.stats, "counter": self.counter,
+            "last_weight_block": self.last_weight_block,
+            "last_winner_hotkey": self.last_winner_hotkey,
+            "updated_at": _now(),
         })
         self.r2.put("state/queue.json", {"pending": self.queue, "updated_at": _now()})
         self.r2.put("king/current.json", self.king)
@@ -309,6 +346,11 @@ class State:
 
     def enqueue(self, reveal):
         repo = reveal.get("hf_repo", "")
+        hotkey = reveal.get("hotkey", "")
+        king_hotkey = self.king.get("hotkey", "")
+        if king_hotkey and hotkey == king_hotkey:
+            log.info("skipping enqueue: hotkey %s is the current king", hotkey[:16])
+            return None
         for existing in self.queue:
             if existing.get("hf_repo") == repo:
                 log.info("skipping duplicate repo: %s already queued", repo)
@@ -325,16 +367,23 @@ class State:
         self.event({"event": "queued", **entry})
         return cid
 
-    def set_king(self, hotkey, hf_repo, king_hash, block, challenge_id="seed"):
-        global _king_config
+    def set_king(self, hotkey, hf_repo, king_hash, block, challenge_id="seed",
+                  king_revision=""):
+        global _king_config, _king_config_key
         _king_config = None
+        _king_config_key = None
         self.failed_repos.clear()
         self.evaluated_repos.clear()
         reign = self.king.get("reign_number", 0) + (0 if challenge_id == "seed" else 1)
+        prev = self.king.copy() if self.king else None
+        if prev:
+            prev.pop("previous_king", None)
         self.king = {
             "hotkey": hotkey, "hf_repo": hf_repo, "king_hash": king_hash,
+            "king_revision": king_revision,
             "reign_number": reign, "crowned_at": _now(),
             "crowned_block": block, "challenge_id": challenge_id,
+            "previous_king": prev,
         }
         self.flush()
         self.flush_dashboard()
@@ -347,7 +396,6 @@ class State:
         self.history.insert(0, {
             "challenge_id": verdict["challenge_id"],
             "hotkey": hotkey,
-            "uid": self.hotkey_to_uid(hotkey),
             "challenger_repo": challenger_repo,
             "accepted": verdict["accepted"],
             "verdict": verdict["verdict"],
@@ -362,52 +410,51 @@ class State:
         self.r2.put("state/dashboard_history.json", {"history": self.history})
 
     def flush_dashboard(self):
-        self.r2.put("dashboard.json", {
+        payload = {
             "updated_at": _now(),
             "king": self.king,
             "stats": self.stats,
             "current_eval": self.current_eval,
             "queue": [{"challenge_id": e.get("challenge_id"), "hotkey": e.get("hotkey"),
-                        "uid": self.hotkey_to_uid(e.get("hotkey", "")),
                         "hf_repo": e.get("hf_repo"), "queued_at": e.get("queued_at"),
                         "block": e.get("block")}
                        for e in self.queue],
             "history": self.history,
-        })
+        }
+        if self.market:
+            payload["market"] = self.market
+        self.r2.put("dashboard.json", payload)
+
 
 
 # ---------------------------------------------------------------------------
-# King management
+# King liveness
 # ---------------------------------------------------------------------------
 
-def sha256_dir(path):
-    """SHA256 over sorted safetensors files (matches validation.py)."""
-    import hashlib as hl
-    h = hl.sha256()
-    from pathlib import Path
-    for p in sorted(Path(path).glob("*.safetensors")):
-        with open(p, "rb") as f:
-            while chunk := f.read(1 << 20):
-                h.update(chunk)
-    return h.hexdigest()
-
-
-def fork_winner(challenger_repo, king_hash, hotkey, challenge_id):
-    """Upload challenger weights to king repo (creates git history)."""
-    api = HfApi(token=HF_TOKEN)
-    api.create_repo(KING_REPO, exist_ok=True, private=False)
-    tmp = "/tmp/teutonic/fork"
-    snapshot_download(challenger_repo, local_dir=tmp, token=HF_TOKEN or None,
-                      allow_patterns=["*.safetensors"],
-                      ignore_patterns=["*.bin", "*.pt", "__pycache__/*"])
-    api.upload_folder(
-        folder_path=tmp, repo_id=KING_REPO,
-        commit_message=f"King #{king_hash[:8]} dethroned by {hotkey[:16]} ({challenge_id})",
-        allow_patterns=["*.safetensors"],
-    )
-    new_hash = sha256_dir(tmp)
-    log.info("forked %s -> %s hash=%s", challenger_repo, KING_REPO, new_hash[:16])
-    return new_hash
+def check_king_alive(state):
+    """Verify king repo is still accessible at pinned revision. Auto-dethrone if not."""
+    repo = state.king.get("hf_repo", "")
+    rev = state.king.get("king_revision", "")
+    if not repo or not rev:
+        return True
+    try:
+        HfApi(token=HF_TOKEN or None).model_info(repo, revision=rev)
+        return True
+    except Exception:
+        log.warning("KING REPO UNAVAILABLE: %s@%s — auto-dethroning", repo, rev[:12])
+        prev = state.king.get("previous_king")
+        if prev and prev.get("hf_repo"):
+            log.info("reverting to previous king: %s@%s",
+                     prev["hf_repo"], prev.get("king_revision", "?")[:12])
+            state.king = prev
+            state.flush()
+            state.flush_dashboard()
+            state.event({"event": "king_dethroned_absent",
+                         "lost_repo": repo, "lost_revision": rev[:12],
+                         "reverted_to": prev.get("hf_repo")})
+        else:
+            log.error("no previous king to revert to — king repo is gone")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +467,11 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
     hf_repo = entry["hf_repo"]
     log.info("processing %s from %s repo=%s", cid, hotkey[:16], hf_repo)
 
+    king_hotkey = state.king.get("hotkey", "")
+    if king_hotkey and hotkey == king_hotkey:
+        log.info("skipping %s: challenger hotkey %s is the current king", cid, hotkey[:16])
+        return
+
     if hf_repo in state.failed_repos:
         log.info("skipping %s: repo %s previously failed", cid, hf_repo)
         return
@@ -428,7 +480,11 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
         log.info("skipping %s: repo %s already evaluated this cycle", cid, hf_repo)
         return
 
-    rejection = validate_challenger_config(hf_repo)
+    rejection = validate_challenger_config(
+        hf_repo,
+        king_repo=state.king.get("hf_repo", ""),
+        king_revision=state.king.get("king_revision", ""),
+    )
     if rejection:
         log.warning("rejecting %s (%s): %s", cid, hf_repo, rejection)
         state.failed_repos.add(hf_repo)
@@ -438,10 +494,20 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
 
     if check_stale:
         current_hash = state.king.get("king_hash", "")
-        if not current_hash.startswith(entry["king_hash"][:len(entry["king_hash"])]):
-            log.info("stale %s: king changed", cid)
+        entry_king_hash = entry.get("king_hash", "")
+        if current_hash and entry_king_hash and not current_hash.startswith(entry_king_hash[:len(entry_king_hash)]):
+            log.info("stale %s: king changed (entry=%s current=%s)", cid, entry_king_hash[:16], current_hash[:16])
             state.event({"event": "stale", "challenge_id": cid, "hotkey": hotkey})
             return
+
+    try:
+        challenger_info = HfApi(token=HF_TOKEN or None).model_info(hf_repo, revision="main")
+        challenger_revision = challenger_info.sha
+        log.info("challenger %s pinned at revision %s", hf_repo, challenger_revision[:12])
+    except Exception:
+        log.warning("cannot get commit SHA for %s, skipping", hf_repo)
+        state.failed_repos.add(hf_repo)
+        return
 
     block_hash = "default"
     try:
@@ -458,9 +524,14 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
     shard_idx = int.from_bytes(hashlib.blake2b(seed_mat, digest_size=8).digest(), "little") % n_shards
     shard_key = manifest["shards"][shard_idx]["key"]
 
+    king_repo = state.king.get("hf_repo", SEED_REPO)
+    king_revision = state.king.get("king_revision", "")
+
     r2.put(f"eval/{cid}/meta.json", {
-        "challenge_id": cid, "king_repo": KING_REPO,
-        "challenger_repo": hf_repo, "hotkey": hotkey,
+        "challenge_id": cid, "king_repo": king_repo,
+        "king_revision": king_revision,
+        "challenger_repo": hf_repo, "challenger_revision": challenger_revision,
+        "hotkey": hotkey,
         "N": EVAL_N, "alpha": EVAL_ALPHA, "shard": shard_key,
     })
 
@@ -475,11 +546,14 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
     verdict = None
     async with httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=30.0)) as client:
         resp = await client.post(f"{EVAL_SERVER_URL}/eval", json={
-            "king_repo": KING_REPO,
+            "king_repo": king_repo,
             "challenger_repo": hf_repo,
             "block_hash": block_hash,
             "hotkey": hotkey,
             "shard_key": shard_key,
+            "king_hash": state.king.get("king_hash", ""),
+            "king_revision": king_revision,
+            "challenger_revision": challenger_revision,
             "eval_n": EVAL_N,
             "alpha": EVAL_ALPHA,
             "seq_len": SEQ_LEN,
@@ -539,12 +613,14 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
                  "hotkey": hotkey, "accepted": accepted, **verdict})
 
     if accepted:
-        log.info("DETHRONE! %s wins via %s", hotkey[:16], cid)
-        old_hash = state.king.get("king_hash", "")
-        new_hash = fork_winner(hf_repo, old_hash, hotkey, cid)
-        state.set_king(hotkey, KING_REPO, new_hash, entry.get("block", 0), cid)
-        set_weights(subtensor, wallet, NETUID, hotkey)
-        state.last_weight_block = subtensor.block
+        log.info("DETHRONE! %s wins via %s (repo=%s rev=%s)",
+                 hotkey[:16], cid, hf_repo, challenger_revision[:12])
+        state.set_king(hotkey, hf_repo, entry.get("model_hash", ""),
+                       entry.get("block", 0), cid,
+                       king_revision=challenger_revision)
+        state.last_winner_hotkey = hotkey
+        if set_weights(subtensor, wallet, NETUID, hotkey):
+            state.last_weight_block = subtensor.block
 
     state.flush()
 
@@ -580,15 +656,15 @@ async def main():
     subtensor = bt.subtensor(network=NETWORK)
 
     if not state.king:
-        king_hash = "seed"
+        seed_revision = ""
         try:
-            tmp = "/tmp/teutonic/king_seed"
-            snapshot_download(KING_REPO, local_dir=tmp, token=HF_TOKEN or None,
-                              allow_patterns=["*.safetensors"])
-            king_hash = sha256_dir(tmp)
+            seed_info = HfApi(token=HF_TOKEN or None).model_info(SEED_REPO)
+            seed_revision = seed_info.sha
+            log.info("seed king %s at revision %s", SEED_REPO, seed_revision[:12])
         except Exception:
-            pass
-        state.set_king(wallet.hotkey.ss58_address, KING_REPO, king_hash, subtensor.block)
+            log.warning("could not get seed king revision from %s", SEED_REPO)
+        state.set_king(wallet.hotkey.ss58_address, SEED_REPO, "seed",
+                       subtensor.block, king_revision=seed_revision)
 
     # Verify eval server is reachable
     try:
@@ -605,12 +681,22 @@ async def main():
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
-    log.info("validator running | king=%s | eval_server=%s | poll=%ds",
-             state.king.get("king_hash", "")[:16], EVAL_SERVER_URL, POLL_INTERVAL)
+    log.info("validator running | king=%s@%s | eval_server=%s | poll=%ds",
+             state.king.get("hf_repo", "?"),
+             state.king.get("king_revision", "?")[:12],
+             EVAL_SERVER_URL, POLL_INTERVAL)
 
     while True:
         try:
-            state.refresh_metagraph(subtensor, NETUID)
+            if not check_king_alive(state):
+                log.warning("king repo check failed, skipping this tick")
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            tmc = await fetch_tmc_data()
+            if tmc:
+                state.market = tmc
+
             reveals = scan_reveals(subtensor, NETUID, state.seen)
             if reveals:
                 state.flush()
@@ -639,11 +725,15 @@ async def main():
             try:
                 current_block = subtensor.block
                 if current_block - state.last_weight_block >= WEIGHT_INTERVAL:
-                    king_hotkey = state.king.get("hotkey")
-                    if king_hotkey:
-                        log.info("periodic weight set at block %d (last=%d)", current_block, state.last_weight_block)
-                        set_weights(subtensor, wallet, NETUID, king_hotkey)
-                        state.last_weight_block = current_block
+                    winner = state.last_winner_hotkey
+                    if winner:
+                        log.info("periodic weight set at block %d (last=%d) to winner %s",
+                                 current_block, state.last_weight_block, winner[:16])
+                        if set_weights(subtensor, wallet, NETUID, winner):
+                            state.last_weight_block = current_block
+                            state.flush()
+                    else:
+                        log.info("skipping periodic weight set: no duel winner yet")
             except Exception:
                 log.exception("periodic weight-set failed")
 

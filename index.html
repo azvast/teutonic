@@ -3,7 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Teutonic Validator</title>
+<title>Teuton</title>
+<link rel="icon" type="image/x-icon" href="favicon.ico">
+<link rel="icon" type="image/png" href="favicon.png">
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&display=swap');
 
@@ -20,48 +22,28 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 body {
-    background: var(--bg);
+    background: var(--paper);
     color: var(--ink);
     font: 13px/1.5 var(--font);
     display: flex;
     justify-content: center;
     min-height: 100vh;
-    padding: 64px 16px;
+    padding: 0;
     -webkit-font-smoothing: none;
 }
 
 .page {
     width: 100%;
-    max-width: 800px;
+    max-width: 1400px;
     background: var(--paper);
     position: relative;
-    padding: 32px;
+    padding: 32px 48px;
     display: flex;
     flex-direction: column;
     gap: 24px;
 }
 
-.page::before, .page::after {
-    content: "";
-    position: absolute;
-    left: 0; right: 0;
-    height: var(--saw);
-    z-index: 1;
-}
-.page::before {
-    top: calc(var(--saw) * -1);
-    background: linear-gradient(-45deg, var(--paper) 5px, transparent 0) 0 5px,
-                linear-gradient(45deg, var(--paper) 5px, transparent 0) 0 5px;
-    background-size: var(--saw) var(--saw);
-    background-repeat: repeat-x;
-}
-.page::after {
-    bottom: calc(var(--saw) * -1);
-    background: linear-gradient(-135deg, var(--paper) 5px, transparent 0) 0 5px,
-                linear-gradient(135deg, var(--paper) 5px, transparent 0) 0 5px;
-    background-size: var(--saw) var(--saw);
-    background-repeat: repeat-x;
-}
+.page::before, .page::after { display: none; }
 
 .section-label {
     text-transform: uppercase;
@@ -74,11 +56,12 @@ body {
 
 .chart-wrap {
     width: 100%;
-    min-height: 180px;
+    aspect-ratio: 5 / 2;
     position: relative;
 }
 .chart-wrap svg {
     width: 100%;
+    height: 100%;
     display: block;
 }
 .chart-meta {
@@ -116,8 +99,8 @@ body {
 }
 .scroll-box::-webkit-scrollbar { width: 4px; }
 .scroll-box::-webkit-scrollbar-thumb { background: var(--ink); }
-.scroll-queue { height: 120px; }
-.scroll-hist { height: 300px; }
+.scroll-queue { max-height: 200px; }
+.scroll-hist { max-height: 60vh; }
 
 table {
     width: 100%;
@@ -155,9 +138,21 @@ th:last-child, td:last-child { text-align: right; }
 <body>
 <div class="page">
 
+    <div id="top-bar" style="display:flex;justify-content:space-between;align-items:center;border-bottom:1px dashed #000;padding:6px 0;font-size:12px;text-transform:uppercase;">
+        <span>TAO <b id="tao-price">--</b> <span id="tao-change" style="font-size:10px"></span></span>
+        <span>SN3 ALPHA <b id="alpha-price">--</b></span>
+        <span>SN3 REG <b id="reg-cost">--</b></span>
+    </div>
+
     <div style="text-align:center;margin-bottom:8px;">
+        <img src="favicon.png" alt="Teuton" style="width:80px;height:80px;margin-bottom:8px;">
         <div style="font-size:20px;font-weight:bold;letter-spacing:0.1em;text-transform:uppercase;">Teutonic-I</div>
-        <a href="https://huggingface.co/unconst/Teutonic-I" target="_blank" style="font-size:11px;color:var(--ink);text-transform:uppercase;">huggingface.co/unconst/Teutonic-I</a>
+        <div id="king-info" style="font-size:11px;text-transform:uppercase;">
+            <span id="king-health" title="King repo status"></span>
+            <a id="king-link" href="#" target="_blank" style="color:var(--ink);"></a>
+            <span id="king-rev" style="opacity:0.6;"></span>
+        </div>
+        <div id="king-reign" style="font-size:10px;opacity:0.5;margin-top:2px;"></div>
     </div>
 
     <div>
@@ -186,10 +181,9 @@ th:last-child, td:last-child { text-align: right; }
         <div class="scroll-box scroll-queue">
             <table>
                 <thead><tr>
-                    <th>UID</th>
+                    <th>Repo</th>
                     <th>Hotkey</th>
                     <th>Block</th>
-                    <th>Repo</th>
                 </tr></thead>
                 <tbody id="queue"></tbody>
             </table>
@@ -201,8 +195,8 @@ th:last-child, td:last-child { text-align: right; }
         <div class="scroll-box scroll-hist">
             <table>
                 <thead><tr>
-                    <th>UID</th>
-                    <th>Challenger</th>
+                    <th>Repo</th>
+                    <th>Hotkey</th>
                     <th>Verdict</th>
                     <th>Win Rate</th>
                     <th>Best Loss</th>
@@ -224,6 +218,48 @@ var POLL_MS = 5000;
 function short(s, n) { return s ? s.slice(0, n || 12) + "\u2026" : "--"; }
 
 function render(d) {
+    var mkt = d.market || {};
+    if (mkt.tao_price_usd) {
+        document.getElementById("tao-price").textContent = "$" + mkt.tao_price_usd.toFixed(2);
+        var ch = mkt.tao_change_24h;
+        var chEl = document.getElementById("tao-change");
+        chEl.textContent = (ch >= 0 ? "+" : "") + ch.toFixed(1) + "%";
+        chEl.style.color = ch >= 0 ? "#2a2" : "#c22";
+    }
+    if (mkt.sn3_alpha_price_tao != null) {
+        document.getElementById("alpha-price").textContent = mkt.sn3_alpha_price_tao.toFixed(4) + " \u03C4";
+    }
+    if (mkt.sn3_reg_burn_tao != null) {
+        document.getElementById("reg-cost").textContent = mkt.sn3_reg_burn_tao.toFixed(6) + " \u03C4";
+    }
+
+    var king = d.king || {};
+    var hist_all = d.history || [];
+    var topModel = null;
+    for (var ti = 0; ti < hist_all.length; ti++) {
+        if (hist_all[ti].accepted && hist_all[ti].challenger_repo) {
+            topModel = hist_all[ti]; break;
+        }
+    }
+    var kingRepo = topModel ? topModel.challenger_repo : (king.hf_repo || "--");
+    var kingRev = king.king_revision || "";
+    var kingLink = document.getElementById("king-link");
+    kingLink.href = "https://huggingface.co/" + kingRepo;
+    kingLink.textContent = kingRepo;
+    var kingRevEl = document.getElementById("king-rev");
+    if (kingRev) {
+        var commitUrl = "https://huggingface.co/" + kingRepo + "/commit/" + kingRev;
+        kingRevEl.innerHTML = '@ <a href="' + commitUrl + '" target="_blank" style="color:var(--ink);opacity:0.6">' + kingRev.slice(0, 8) + '</a>';
+    } else {
+        kingRevEl.textContent = "";
+    }
+    var healthEl = document.getElementById("king-health");
+    healthEl.textContent = "\u25CF ";
+    healthEl.style.color = "#2a2";
+    healthEl.title = "King repo live";
+    var reignEl = document.getElementById("king-reign");
+    reignEl.textContent = king.reign_number != null ? "REIGN #" + king.reign_number + (king.crowned_at ? " \u2014 " + king.crowned_at.slice(0, 16) + "Z" : "") : "";
+
     var hist = (d.history || []).slice().reverse();
     var ev = d.current_eval;
 
@@ -242,13 +278,21 @@ function render(d) {
     }
 
     var SVG = document.getElementById("chart");
-    var W = 736, H = 160, ML = 60, MR = 12, MT = 12, MB = 28;
+    var rect = SVG.parentElement.getBoundingClientRect();
+    var dpr = window.devicePixelRatio || 1;
+    var W = Math.round(rect.width * dpr);
+    var H = Math.round(rect.height * dpr);
+    if (W < 100) W = 1400;
+    if (H < 40) H = 560;
+    var ML = Math.round(70 * dpr), MR = Math.round(16 * dpr);
+    var MT = Math.round(16 * dpr), MB = Math.round(36 * dpr);
     var pw = W - ML - MR, ph = H - MT - MB;
+    var lw = dpr;
 
     SVG.setAttribute("viewBox", "0 0 " + W + " " + H);
 
     if (losses.length < 1) {
-        SVG.innerHTML = '<text x="' + (W/2) + '" y="' + (H/2) + '" text-anchor="middle" font-family="Space Mono,monospace" font-size="11" fill="#000">NO DATA</text>';
+        SVG.innerHTML = '<text x="' + (W/2) + '" y="' + (H/2) + '" text-anchor="middle" font-family="Space Mono,monospace" font-size="' + (13*dpr) + '" fill="#000">NO DATA</text>';
         document.getElementById("chart-meta").innerHTML = "<span>--</span>";
     } else {
 
@@ -261,42 +305,37 @@ function render(d) {
     function toY(v) { return MT + ph - ((v - minL) / (maxL - minL)) * ph; }
 
     var svg = '';
-    var font = 'font-family="Space Mono,monospace" font-size="10" fill="#000"';
+    var fs = Math.round(11 * dpr);
+    var font = 'font-family="Space Mono,monospace" font-size="' + fs + '" fill="#000"';
 
-    // Y-axis line
-    svg += '<line x1="' + ML + '" y1="' + MT + '" x2="' + ML + '" y2="' + (MT + ph) + '" stroke="#000" stroke-width="1"/>';
-    // X-axis line
-    svg += '<line x1="' + ML + '" y1="' + (MT + ph) + '" x2="' + (ML + pw) + '" y2="' + (MT + ph) + '" stroke="#000" stroke-width="1"/>';
+    svg += '<line x1="' + ML + '" y1="' + MT + '" x2="' + ML + '" y2="' + (MT + ph) + '" stroke="#000" stroke-width="' + lw + '"/>';
+    svg += '<line x1="' + ML + '" y1="' + (MT + ph) + '" x2="' + (ML + pw) + '" y2="' + (MT + ph) + '" stroke="#000" stroke-width="' + lw + '"/>';
 
-    // Y-axis ticks (5 ticks)
     for (var t = 0; t <= 4; t++) {
         var val = minL + (maxL - minL) * (t / 4);
         var yy = toY(val);
-        svg += '<line x1="' + (ML - 4) + '" y1="' + yy + '" x2="' + ML + '" y2="' + yy + '" stroke="#000" stroke-width="1"/>';
-        svg += '<text x="' + (ML - 8) + '" y="' + (yy + 3) + '" text-anchor="end" ' + font + '>' + val.toFixed(2) + '</text>';
+        svg += '<line x1="' + (ML - 5*dpr) + '" y1="' + yy + '" x2="' + ML + '" y2="' + yy + '" stroke="#000" stroke-width="' + lw + '"/>';
+        svg += '<text x="' + (ML - 8*dpr) + '" y="' + (yy + fs*0.35) + '" text-anchor="end" ' + font + '>' + val.toFixed(2) + '</text>';
         if (t > 0 && t < 4) {
-            svg += '<line x1="' + ML + '" y1="' + yy + '" x2="' + (ML + pw) + '" y2="' + yy + '" stroke="#000" stroke-width="0.3" stroke-dasharray="2 4"/>';
+            svg += '<line x1="' + ML + '" y1="' + yy + '" x2="' + (ML + pw) + '" y2="' + yy + '" stroke="#000" stroke-width="' + (0.5*dpr) + '" stroke-dasharray="' + (3*dpr) + ' ' + (6*dpr) + '"/>';
         }
     }
 
-    // X-axis ticks
     for (var i = 0; i < losses.length; i++) {
         var xx = toX(i);
-        svg += '<line x1="' + xx + '" y1="' + (MT + ph) + '" x2="' + xx + '" y2="' + (MT + ph + 4) + '" stroke="#000" stroke-width="1"/>';
+        svg += '<line x1="' + xx + '" y1="' + (MT + ph) + '" x2="' + xx + '" y2="' + (MT + ph + 5*dpr) + '" stroke="#000" stroke-width="' + lw + '"/>';
         var label = (ev && i === losses.length - 1) ? "NOW" : "";
-        svg += '<text x="' + xx + '" y="' + (MT + ph + 16) + '" text-anchor="middle" ' + font + '>' + label + '</text>';
+        svg += '<text x="' + xx + '" y="' + (MT + ph + 20*dpr) + '" text-anchor="middle" ' + font + '>' + label + '</text>';
     }
 
-    // Data line
     var pts = [];
     for (var i = 0; i < losses.length; i++) {
         pts.push(toX(i).toFixed(1) + "," + toY(losses[i]).toFixed(1));
     }
-    svg += '<polyline points="' + pts.join(" ") + '" fill="none" stroke="#000" stroke-width="1.5" stroke-linejoin="bevel"/>';
+    svg += '<polyline points="' + pts.join(" ") + '" fill="none" stroke="#000" stroke-width="' + (1.5*dpr) + '" stroke-linejoin="round"/>';
 
-    // Data points
     for (var i = 0; i < losses.length; i++) {
-        svg += '<circle cx="' + toX(i).toFixed(1) + '" cy="' + toY(losses[i]).toFixed(1) + '" r="3" fill="#000"/>';
+        svg += '<circle cx="' + toX(i).toFixed(1) + '" cy="' + toY(losses[i]).toFixed(1) + '" r="' + (3*dpr) + '" fill="#000"/>';
     }
 
     SVG.innerHTML = svg;
@@ -310,7 +349,7 @@ function render(d) {
     // --- Current Duel ---
     var duelSec = document.getElementById("duel-section");
     if (ev) {
-        duelSec.classList.remove("duel-hidden");
+        duelSec.classList.remove("duel-idle");
         var pct = ev.total > 0 ? Math.round((ev.progress / ev.total) * 100) : 0;
         var duelName = ev.challenger_repo || short(ev.hotkey, 12);
         var duelLabel = document.getElementById("duel-label");
@@ -323,7 +362,11 @@ function render(d) {
         document.getElementById("duel-progress").textContent = ev.progress + " / " + ev.total + "  (" + pct + "%)";
         document.getElementById("duel-wr").textContent = ev.n > 0 ? "WR: " + (ev.win_rate * 100).toFixed(1) + "%" : "";
     } else {
-        duelSec.classList.add("duel-hidden");
+        duelSec.classList.add("duel-idle");
+        document.getElementById("duel-label").textContent = "Idle";
+        document.getElementById("duel-bar").style.width = "0%";
+        document.getElementById("duel-progress").textContent = "--";
+        document.getElementById("duel-wr").textContent = "--";
     }
 
     // --- Last Winner ---
@@ -348,17 +391,15 @@ function render(d) {
     var qEl = document.getElementById("queue");
     var q = d.queue || [];
     if (q.length === 0) {
-        qEl.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:16px">Queue empty</td></tr>';
+        qEl.innerHTML = '<tr><td colspan="3" style="text-align:center;padding:16px">Queue empty</td></tr>';
     } else {
         qEl.innerHTML = q.map(function(e) {
             var repo = e.hf_repo || "--";
             var repoLink = e.hf_repo ? '<a href="https://huggingface.co/' + e.hf_repo + '" target="_blank" style="color:var(--ink)">' + repo + '</a>' : repo;
-            var uid = e.uid != null ? e.uid : "--";
             return '<tr>' +
-                '<td>' + uid + '</td>' +
-                '<td>' + short(e.hotkey, 16) + '</td>' +
-                '<td>' + (e.block ? '#' + e.block : '--') + '</td>' +
                 '<td>' + repoLink + '</td>' +
+                '<td>' + (e.hotkey ? '<a href="https://taomarketcap.com/hotkey/' + e.hotkey + '/mining_hotkeys" target="_blank" style="color:var(--ink)">' + short(e.hotkey, 16) + '</a>' : '--') + '</td>' +
+                '<td>' + (e.block ? '#' + e.block : '--') + '</td>' +
                 '</tr>';
         }).join("");
     }
@@ -367,14 +408,17 @@ function render(d) {
     var hb = document.getElementById("hist");
     var history = d.history || [];
     if (history.length === 0) {
-        hb.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:16px">No duels yet</td></tr>';
+        hb.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:16px">No duels yet</td></tr>';
     } else {
         hb.innerHTML = history.map(function(h) {
             var kl = h.avg_king_loss || 0;
             var cl = h.avg_challenger_loss || 0;
             var best = h.best_loss || (kl && cl ? Math.min(kl, cl) : kl || cl);
+            var repo = h.challenger_repo || "--";
+            var repoLink = h.challenger_repo ? '<a href="https://huggingface.co/' + h.challenger_repo + '" target="_blank" style="color:var(--ink)">' + repo + '</a>' : repo;
             return '<tr>' +
-                '<td>' + (h.challenger_repo || short(h.hotkey, 12)) + '</td>' +
+                '<td>' + repoLink + '</td>' +
+                '<td>' + (h.hotkey ? '<a href="https://taomarketcap.com/hotkey/' + h.hotkey + '/mining_hotkeys" target="_blank" style="color:var(--ink)">' + short(h.hotkey, 16) + '</a>' : '--') + '</td>' +
                 '<td>' + (h.accepted ? "CHALLENGER" : "KING") + '</td>' +
                 '<td>' + ((h.win_rate || 0) * 100).toFixed(1) + '%</td>' +
                 '<td>' + best.toFixed(4) + '</td>' +

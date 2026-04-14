@@ -17,6 +17,7 @@ import argparse
 import hashlib
 import io
 import json
+import os
 import struct
 import sys
 import time
@@ -31,10 +32,10 @@ DTYPE = np.dtype("<u4")
 BYTES_PER_TOKEN = DTYPE.itemsize  # 4
 
 R2_CFG = {
-    "endpoint": "https://00523074f51300584834607253cae0fa.r2.cloudflarestorage.com",
-    "access_key": "f0e13641fae0ecedc476f81a4aca6903",
-    "secret_key": "df530458cb884d3365a59abb5aa5d72b02576132c44fac51a6e4dddf7548742e",
-    "bucket": "constantinople",
+    "endpoint": os.environ["TEUTONIC_R2_ENDPOINT"],
+    "access_key": os.environ["TEUTONIC_R2_ACCESS_KEY"],
+    "secret_key": os.environ["TEUTONIC_R2_SECRET_KEY"],
+    "bucket": os.environ.get("TEUTONIC_R2_BUCKET", "constantinople"),
 }
 
 LEGACY_SHARDS = [

@@ -38,6 +38,8 @@ _gpu_ids: list[int] = []
 _r2: R2 | None = None
 _king_evaluator: MultiGPUEvaluator | None = None
 _king_repo: str | None = None
+_king_hash: str | None = None
+_king_revision: str | None = None
 _eval_lock = threading.Lock()
 _evals: dict[str, dict] = {}
 
@@ -81,6 +83,9 @@ class EvalRequest(BaseModel):
     block_hash: str
     hotkey: str
     shard_key: str
+    king_hash: str = ""
+    king_revision: str = ""
+    challenger_revision: str = ""
     eval_n: int = DEFAULT_EVAL_N
     alpha: float = DEFAULT_ALPHA
     seq_len: int = DEFAULT_SEQ_LEN
@@ -91,31 +96,42 @@ class EvalRequest(BaseModel):
 # Model management
 # ---------------------------------------------------------------------------
 
-def _ensure_king(repo: str):
-    """Load or reuse king evaluator. Only reloads if repo changed."""
-    global _king_evaluator, _king_repo
-    if _king_evaluator and _king_repo == repo:
-        log.info("reusing cached king evaluator for %s", repo)
+def _ensure_king(repo: str, king_hash: str = "", revision: str = ""):
+    """Load or reuse king evaluator. Reloads if repo, revision, or king_hash changed."""
+    global _king_evaluator, _king_repo, _king_hash, _king_revision
+    if (_king_evaluator and _king_repo == repo
+            and (not revision or _king_revision == revision)
+            and (not king_hash or _king_hash == king_hash)):
+        log.info("reusing cached king evaluator for %s (rev=%s)",
+                 repo, (_king_revision or "?")[:12])
         return _king_evaluator
 
-    if _king_evaluator:
-        log.info("king repo changed %s -> %s, reloading", _king_repo, repo)
+    needs_reload = _king_evaluator is not None
+    if needs_reload:
+        log.info("king changed (%s rev=%s -> %s rev=%s), reloading",
+                 _king_repo, (_king_revision or "?")[:12],
+                 repo, revision[:12] if revision else "?")
         _king_evaluator.shutdown()
         _king_evaluator = None
         torch.cuda.empty_cache()
 
     mid = len(_gpu_ids) // 2
     king_gpus = _gpu_ids[:mid] or _gpu_ids[:1]
-    _king_evaluator = MultiGPUEvaluator(repo, king_gpus, label="king")
+    _king_evaluator = MultiGPUEvaluator(repo, king_gpus, label="king",
+                                         force_download=needs_reload,
+                                         revision=revision or None)
     _king_repo = repo
+    _king_hash = king_hash or None
+    _king_revision = revision or None
     return _king_evaluator
 
 
-def _load_challenger(repo: str):
+def _load_challenger(repo: str, revision: str = ""):
     """Load challenger on the second half of GPUs."""
     mid = len(_gpu_ids) // 2
     chall_gpus = _gpu_ids[mid:] or _gpu_ids[:1]
-    return MultiGPUEvaluator(repo, chall_gpus, label="challenger")
+    return MultiGPUEvaluator(repo, chall_gpus, label="challenger",
+                              revision=revision or None)
 
 
 # ---------------------------------------------------------------------------
@@ -128,13 +144,14 @@ def _run_eval(eval_id: str, req: EvalRequest):
     event_q: Queue = record["events"]
 
     try:
-        king_eval = _ensure_king(req.king_repo)
+        king_eval = _ensure_king(req.king_repo, req.king_hash, req.king_revision)
 
-        same_model = req.king_repo == req.challenger_repo
+        same_model = (req.king_repo == req.challenger_repo
+                      and req.king_revision == req.challenger_revision)
         if same_model:
             challenger_eval = king_eval
         else:
-            challenger_eval = _load_challenger(req.challenger_repo)
+            challenger_eval = _load_challenger(req.challenger_repo, req.challenger_revision)
 
         seed_str = f"{req.block_hash}:{req.hotkey}"
 

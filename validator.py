@@ -33,7 +33,9 @@ EVAL_N = 10_000
 EVAL_ALPHA = 0.001
 SEQ_LEN = 2048
 CONCURRENCY = 8
+BATCH_SIZE = 32
 POLL_INTERVAL = 30
+WEIGHT_INTERVAL = 360
 NETUID = int(os.environ.get("TEUTONIC_NETUID", "3"))
 NETWORK = os.environ.get("TEUTONIC_NETWORK", "finney")
 KING_REPO = os.environ.get("TEUTONIC_KING_REPO", "unconst/Teutonic-I")
@@ -94,6 +96,19 @@ class R2:
         self.client.put_object(
             Bucket=R2_BUCKET, Key=key,
             Body=existing + line.encode(),
+            ContentType="application/x-ndjson",
+        )
+
+    def append_jsonl_batch(self, key, records):
+        lines = "".join(json.dumps(r, default=str) + "\n" for r in records)
+        existing = b""
+        try:
+            existing = self.client.get_object(Bucket=R2_BUCKET, Key=key)["Body"].read()
+        except Exception:
+            pass
+        self.client.put_object(
+            Bucket=R2_BUCKET, Key=key,
+            Body=existing + lines.encode(),
             ContentType="application/x-ndjson",
         )
 
@@ -228,7 +243,7 @@ async def wait_for_server_async(url, timeout=600):
     raise TimeoutError(f"{url} not ready after {timeout}s")
 
 
-def wait_for_server(url, timeout=600):
+def wait_for_server(url, timeout=120):
     t0 = time.time()
     while time.time() - t0 < timeout:
         try:
@@ -239,6 +254,62 @@ def wait_for_server(url, timeout=600):
             pass
         time.sleep(3)
     raise TimeoutError(f"{url} not ready after {timeout}s")
+
+
+_king_config: dict | None = None
+
+def get_king_config():
+    """Fetch and cache the king model's config.json from HuggingFace."""
+    global _king_config
+    if _king_config is not None:
+        return _king_config
+    try:
+        api = HfApi(token=HF_TOKEN or None)
+        cfg_path = api.hf_hub_download(KING_REPO, "config.json", token=HF_TOKEN or None)
+        with open(cfg_path) as f:
+            _king_config = json.load(f)
+    except Exception:
+        log.warning("could not fetch king config.json")
+        _king_config = {}
+    return _king_config
+
+
+def validate_challenger_config(hf_repo: str) -> str | None:
+    """Check challenger config.json matches king architecture before deploying.
+
+    Returns None if OK, or a human-readable rejection reason.
+    """
+    king_cfg = get_king_config()
+    if not king_cfg:
+        return None
+
+    try:
+        api = HfApi(token=HF_TOKEN or None)
+        cfg_path = api.hf_hub_download(hf_repo, "config.json", token=HF_TOKEN or None)
+        with open(cfg_path) as f:
+            challenger_cfg = json.load(f)
+    except Exception as e:
+        return f"cannot fetch config.json: {e}"
+
+    king_arch = king_cfg.get("architectures", [])
+    chall_arch = challenger_cfg.get("architectures", [])
+    if king_arch and chall_arch and king_arch != chall_arch:
+        return f"architecture mismatch: king={king_arch} challenger={chall_arch}"
+
+    for key in ("vocab_size", "hidden_size", "num_hidden_layers",
+                "num_attention_heads", "num_key_value_heads", "head_dim",
+                "intermediate_size", "model_type"):
+        king_val = king_cfg.get(key)
+        chall_val = challenger_cfg.get(key)
+        if king_val is not None and chall_val is not None and king_val != chall_val:
+            return f"{key} mismatch: king={king_val} challenger={chall_val}"
+
+    st_files = [s for s in api.list_repo_files(hf_repo, token=HF_TOKEN or None)
+                if s.endswith(".safetensors")]
+    if not st_files:
+        return "no .safetensors files in repo"
+
+    return None
 
 
 _model_name_cache = {}
@@ -267,6 +338,32 @@ async def compute_loss(client, url, tokens):
     lps = r.json()["choices"][0]["logprobs"]["token_logprobs"]
     valid = [lp for lp in lps[1:] if lp is not None]
     return -sum(valid) / len(valid) if valid else float("nan")
+
+
+async def compute_losses_batch(client, url, token_batches):
+    """Send multiple prompts in one /v1/completions request.
+
+    vLLM accepts ``prompt`` as a list of token-id lists and returns one
+    ``choices`` entry per prompt.  This lets the engine batch prefill
+    across all prompts in a single forward pass.
+    """
+    model = await get_model_name(client, url)
+    r = await client.post(
+        f"{url}/v1/completions",
+        json={
+            "model": model, "prompt": token_batches, "max_tokens": 1,
+            "temperature": 0.0, "logprobs": 1, "echo": True,
+        },
+        timeout=300.0,
+    )
+    r.raise_for_status()
+    choices = sorted(r.json()["choices"], key=lambda c: c["index"])
+    losses = []
+    for choice in choices:
+        lps = choice["logprobs"]["token_logprobs"]
+        valid = [lp for lp in lps[1:] if lp is not None]
+        losses.append(-sum(valid) / len(valid) if valid else float("nan"))
+    return losses
 
 
 # ---------------------------------------------------------------------------
@@ -321,18 +418,19 @@ def get_shard_info(r2, shard_key):
 
 async def run_sign_test(r2, king_url, challenger_url, shard_key, challenge_id,
                         block_hash, hotkey, on_progress=None):
-    N = EVAL_N
-    K = int(binom.isf(EVAL_ALPHA, N, 0.5))
-    log.info("sign test: N=%d K=%d alpha=%s", N, K, EVAL_ALPHA)
-
     n_tokens = get_shard_info(r2, shard_key)
     n_sequences = n_tokens // SEQ_LEN
-    actual_N = min(N, n_sequences)
+    actual_N = min(EVAL_N, n_sequences)
+    K = int(binom.isf(EVAL_ALPHA, actual_N, 0.5))
+    log.info("sign test: N=%d actual_N=%d K=%d alpha=%s", EVAL_N, actual_N, K, EVAL_ALPHA)
 
     seed_material = f"{block_hash}:{hotkey}".encode()
     seed = int.from_bytes(hashlib.blake2b(seed_material, digest_size=8).digest(), "little")
     rng = np.random.Generator(np.random.PCG64(seed))
     eval_indices = rng.choice(n_sequences, size=actual_N, replace=False).tolist()
+
+    if on_progress:
+        on_progress(0, actual_N, 0, 0, 0.0, 0.0, 0)
 
     log.info("fetching %d sequences from %s", actual_N, shard_key)
     seq_cache = fetch_sequences(r2, shard_key, eval_indices, SEQ_LEN)
@@ -341,59 +439,89 @@ async def run_sign_test(r2, king_url, challenger_url, shard_key, challenge_id,
     king_sum, chall_sum = 0.0, 0.0
     t0 = time.time()
     outcomes_key = f"eval/{challenge_id}/outcomes.jsonl"
-    batch_buf = []
+    outcome_buf = []
 
-    client = httpx.AsyncClient(timeout=120.0)
+    client = httpx.AsyncClient(
+        timeout=300.0,
+        limits=httpx.Limits(
+            max_connections=CONCURRENCY * 2,
+            max_keepalive_connections=CONCURRENCY * 2,
+        ),
+    )
     sem = asyncio.Semaphore(CONCURRENCY)
 
-    for i, idx in enumerate(eval_indices):
-        tokens = seq_cache[idx]
+    batches = [
+        eval_indices[i : i + BATCH_SIZE]
+        for i in range(0, len(eval_indices), BATCH_SIZE)
+    ]
 
+    async def _eval_batch(batch_indices):
+        token_batches = [seq_cache[idx] for idx in batch_indices]
         async with sem:
-            kl, cl = await asyncio.gather(
-                compute_loss(client, king_url, tokens),
-                compute_loss(client, challenger_url, tokens),
+            king_losses, chall_losses = await asyncio.gather(
+                compute_losses_batch(client, king_url, token_batches),
+                compute_losses_batch(client, challenger_url, token_batches),
             )
+        return list(zip(batch_indices, king_losses, chall_losses))
 
-        king_sum += kl
-        chall_sum += cl
-        outcome = {"seq_idx": idx, "king_loss": round(kl, 6), "challenger_loss": round(cl, 6)}
+    tasks = [asyncio.create_task(_eval_batch(batch)) for batch in batches]
 
-        if kl == cl:
-            n_ties += 1
-            outcome["win"] = None
-        else:
-            n += 1
-            win = cl < kl
-            if win:
-                s += 1
-            outcome["win"] = 1 if win else 0
+    total_done = 0
+    early_stopped = False
+    for bi, task in enumerate(tasks):
+        try:
+            results = await task
+        except asyncio.CancelledError:
+            break
 
-        outcome.update({"s": s, "n": n, "N": actual_N})
-        batch_buf.append(outcome)
+        for idx, kl, cl in results:
+            total_done += 1
+            king_sum += kl
+            chall_sum += cl
+            outcome = {"seq_idx": idx, "king_loss": round(kl, 6),
+                        "challenger_loss": round(cl, 6)}
 
-        if len(batch_buf) >= 100:
-            for rec in batch_buf:
-                r2.append_jsonl(outcomes_key, rec)
-            batch_buf = []
-            if on_progress:
-                total_done = i + 1
-                on_progress(total_done, actual_N, s, n, king_sum, chall_sum, n_ties)
+            if kl == cl:
+                n_ties += 1
+                outcome["win"] = None
+            else:
+                n += 1
+                win = cl < kl
+                if win:
+                    s += 1
+                outcome["win"] = 1 if win else 0
+
+            outcome.update({"s": s, "n": n, "N": actual_N})
+            outcome_buf.append(outcome)
+
+        if on_progress:
+            on_progress(total_done, actual_N, s, n, king_sum, chall_sum, n_ties)
+
+        if len(outcome_buf) >= 100:
+            r2.append_jsonl_batch(outcomes_key, outcome_buf)
+            outcome_buf = []
 
         if n > 0:
             if s >= K:
                 log.info("EARLY STOP challenger wins s=%d >= K=%d", s, K)
-                break
-            remaining = actual_N - (n + n_ties)
-            if s + remaining < K:
-                log.info("EARLY STOP king holds s=%d remaining=%d", s, remaining)
-                break
+                early_stopped = True
+            else:
+                remaining = actual_N - (n + n_ties)
+                if s + remaining < K:
+                    log.info("EARLY STOP king holds s=%d remaining=%d", s, remaining)
+                    early_stopped = True
 
-        if (i + 1) % 500 == 0:
-            log.info("progress %d/%d s=%d n=%d wr=%.3f", i + 1, actual_N, s, n, s / n if n else 0)
+        if early_stopped:
+            for t in tasks[bi + 1 :]:
+                t.cancel()
+            break
 
-    for rec in batch_buf:
-        r2.append_jsonl(outcomes_key, rec)
+        if total_done % 500 < BATCH_SIZE:
+            log.info("progress %d/%d s=%d n=%d wr=%.3f",
+                     total_done, actual_N, s, n, s / n if n else 0)
+
+    if outcome_buf:
+        r2.append_jsonl_batch(outcomes_key, outcome_buf)
 
     await client.aclose()
     elapsed = time.time() - t0
@@ -483,10 +611,12 @@ class State:
         self.king = {}
         self.queue = []
         self.seen = set()
-        self.stats = {"challenges": 0, "accepted": 0, "rejected": 0}
+        self.failed_repos: set[str] = set()
+        self.stats = {"queued": 0, "accepted": 0, "rejected": 0, "failed": 0}
         self.counter = 0
         self.current_eval = None
         self.history = []
+        self.last_weight_block = 0
 
     def load(self):
         k = self.r2.get("king/current.json")
@@ -500,7 +630,12 @@ class State:
             self.seen = set(s.get("hotkeys", []))
         st = self.r2.get("state/validator_state.json")
         if st:
-            self.stats = st.get("stats", self.stats)
+            loaded = st.get("stats", self.stats)
+            if "challenges" in loaded and "queued" not in loaded:
+                loaded["queued"] = loaded.pop("challenges")
+            loaded.setdefault("failed", 0)
+            loaded.setdefault("queued", 0)
+            self.stats = loaded
             self.counter = st.get("counter", 0)
         h = self.r2.get("state/dashboard_history.json")
         if h:
@@ -528,16 +663,24 @@ class State:
         return f"eval-{self.counter:04d}"
 
     def enqueue(self, reveal):
+        for existing in self.queue:
+            if existing.get("hotkey") == reveal["hotkey"] and existing.get("block") == reveal["block"]:
+                log.info("skipping duplicate: hotkey=%s block=%s already queued",
+                         reveal["hotkey"][:16], reveal["block"])
+                return None
         cid = self.next_id()
         entry = {"challenge_id": cid, **reveal, "queued_at": _now()}
         self.queue.append(entry)
-        self.stats["challenges"] += 1
+        self.stats["queued"] += 1
         self.flush()
         self.flush_dashboard()
         self.event({"event": "queued", **entry})
         return cid
 
     def set_king(self, hotkey, hf_repo, king_hash, block, challenge_id="seed"):
+        global _king_config
+        _king_config = None
+        self.failed_repos.clear()
         reign = self.king.get("reign_number", 0) + (0 if challenge_id == "seed" else 1)
         self.king = {
             "hotkey": hotkey, "hf_repo": hf_repo, "king_hash": king_hash,
@@ -572,7 +715,8 @@ class State:
             "stats": self.stats,
             "current_eval": self.current_eval,
             "queue": [{"challenge_id": e.get("challenge_id"), "hotkey": e.get("hotkey"),
-                        "hf_repo": e.get("hf_repo"), "queued_at": e.get("queued_at")}
+                        "hf_repo": e.get("hf_repo"), "queued_at": e.get("queued_at"),
+                        "block": e.get("block")}
                        for e in self.queue],
             "history": self.history,
         })
@@ -622,13 +766,31 @@ async def process_challenge(state, r2, entry, subtensor, wallet):
     hf_repo = entry["hf_repo"]
     log.info("processing %s from %s repo=%s", cid, hotkey[:16], hf_repo)
 
+    if hf_repo in state.failed_repos:
+        log.info("skipping %s: repo %s previously failed", cid, hf_repo)
+        return
+
+    rejection = validate_challenger_config(hf_repo)
+    if rejection:
+        log.warning("rejecting %s (%s): %s", cid, hf_repo, rejection)
+        state.failed_repos.add(hf_repo)
+        state.event({"event": "config_rejected", "challenge_id": cid,
+                     "hf_repo": hf_repo, "reason": rejection})
+        return
+
     current_hash = state.king.get("king_hash", "")
     if not current_hash.startswith(entry["king_hash"][:len(entry["king_hash"])]):
         log.info("stale %s: king changed", cid)
         state.event({"event": "stale", "challenge_id": cid, "hotkey": hotkey})
         return
 
-    deploy_model(SSH_CHALLENGER, hf_repo, CHALLENGER_PORT)
+    try:
+        deploy_model(SSH_CHALLENGER, hf_repo, CHALLENGER_PORT)
+    except Exception:
+        log.exception("deploy failed for %s — adding to failed_repos", hf_repo)
+        state.failed_repos.add(hf_repo)
+        state.event({"event": "deploy_failed", "challenge_id": cid, "hf_repo": hf_repo})
+        return
 
     # Deterministic shard selection
     block_hash = "default"
@@ -696,11 +858,14 @@ async def process_challenge(state, r2, entry, subtensor, wallet):
         deploy_model(SSH_KING, KING_REPO, KING_PORT)
         state.set_king(hotkey, KING_REPO, new_hash, entry.get("block", 0), cid)
         set_weights(subtensor, wallet, NETUID, hotkey)
+        state.last_weight_block = subtensor.block
 
     state.flush()
 
 
 async def main():
+    args = parse_args()
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -714,6 +879,9 @@ async def main():
     r2 = R2()
     state = State(r2)
     state.load()
+    if not args.seen:
+        state.seen.clear()
+        log.info("--no-seen: will continuously re-evaluate all challengers")
     state.flush_dashboard()
 
     # Upload dashboard HTML to R2
@@ -769,12 +937,34 @@ async def main():
                     state.flush()
                     for rev in reveals:
                         cid = state.enqueue(rev)
-                        log.info("queued %s from %s", cid, rev["hotkey"][:16])
+                        if cid:
+                            log.info("queued %s from %s", cid, rev["hotkey"][:16])
 
                 while state.queue:
                     entry = state.queue.pop(0)
                     state.flush()
-                    await process_challenge(state, r2, entry, subtensor, wallet)
+                    try:
+                        await process_challenge(state, r2, entry, subtensor, wallet)
+                    except Exception:
+                        log.exception("eval failed: %s", entry.get("challenge_id"))
+                        state.stats["failed"] += 1
+                        state.current_eval = None
+                        state.flush_dashboard()
+
+                if not args.seen:
+                    state.seen.clear()
+                    state.flush()
+
+                try:
+                    current_block = subtensor.block
+                    if current_block - state.last_weight_block >= WEIGHT_INTERVAL:
+                        king_hotkey = state.king.get("hotkey")
+                        if king_hotkey:
+                            log.info("periodic weight set at block %d (last=%d)", current_block, state.last_weight_block)
+                            set_weights(subtensor, wallet, NETUID, king_hotkey)
+                            state.last_weight_block = current_block
+                except Exception:
+                    log.exception("periodic weight-set failed")
 
             except KeyboardInterrupt:
                 break
@@ -784,6 +974,15 @@ async def main():
             await asyncio.sleep(POLL_INTERVAL)
     finally:
         cleanup()
+
+
+def parse_args():
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--seen", action=argparse.BooleanOptionalAction, default=True,
+                   help="Track seen hotkeys to avoid re-evaluating (default: True). "
+                        "Use --no-seen to continuously cycle all challengers.")
+    return p.parse_args()
 
 
 def main_sync():

@@ -12,6 +12,7 @@ module.exports = {
   apps: [{
     name: "teutonic-validator",
     script: "validator.py",
+    args: "--no-seen",
     interpreter: "/home/const/workspace/.venv/bin/python",
     cwd: "/home/const/workspace/teutonic",
     env: {

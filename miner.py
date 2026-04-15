@@ -28,7 +28,7 @@ log = logging.getLogger("miner")
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 DASHBOARD_URL = os.environ.get("TEUTONIC_DASHBOARD_URL",
-    "https://pub-0821b4e0d60149b79bad17376722bc75.r2.dev/dashboard.json")
+    "https://s3.hippius.com/teutonic-sn3/dashboard.json")
 SEED_REPO = os.environ.get("TEUTONIC_SEED_REPO", "unconst/Teutonic-I")
 NETUID = int(os.environ.get("TEUTONIC_NETUID", "3"))
 NETWORK = os.environ.get("TEUTONIC_NETWORK", "finney")

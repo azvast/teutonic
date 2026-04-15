@@ -19,6 +19,10 @@ Env vars:
     TEUTONIC_R2_BUCKET    R2 bucket name (default: constantinople)
     TEUTONIC_R2_ACCESS_KEY R2 access key
     TEUTONIC_R2_SECRET_KEY R2 secret key
+    TEUTONIC_DS_ENDPOINT   Dataset store endpoint (default: R2 endpoint)
+    TEUTONIC_DS_BUCKET     Dataset store bucket (default: R2 bucket)
+    TEUTONIC_DS_ACCESS_KEY Dataset store access key (default: R2 key)
+    TEUTONIC_DS_SECRET_KEY Dataset store secret key (default: R2 key)
 """
 import argparse
 import hashlib
@@ -58,6 +62,28 @@ class R2:
         )
         self.bucket = os.environ.get("TEUTONIC_R2_BUCKET", "constantinople")
 
+        ds_endpoint = os.environ.get("TEUTONIC_DS_ENDPOINT")
+        ds_access = os.environ.get("TEUTONIC_DS_ACCESS_KEY")
+        ds_secret = os.environ.get("TEUTONIC_DS_SECRET_KEY")
+        if ds_endpoint and ds_access and ds_secret:
+            self.ds_client = boto3.client(
+                "s3",
+                endpoint_url=ds_endpoint,
+                aws_access_key_id=ds_access,
+                aws_secret_access_key=ds_secret,
+                region_name="decentralized",
+                config=BotoConfig(
+                    signature_version="s3v4",
+                    retries={"max_attempts": 3, "mode": "adaptive"},
+                    s3={"addressing_style": "path"},
+                ),
+            )
+            self.ds_bucket = os.environ.get("TEUTONIC_DS_BUCKET", self.bucket)
+            log.info("dataset store: %s bucket=%s", ds_endpoint, self.ds_bucket)
+        else:
+            self.ds_client = self.client
+            self.ds_bucket = self.bucket
+
     def get(self, key):
         try:
             return json.loads(
@@ -71,13 +97,26 @@ class R2:
             Bucket=self.bucket, Key=key, Range=f"bytes={start}-{end}"
         )["Body"].read()
 
+    def ds_get(self, key):
+        try:
+            return json.loads(
+                self.ds_client.get_object(Bucket=self.ds_bucket, Key=key)["Body"].read()
+            )
+        except Exception:
+            return None
+
+    def ds_range_get(self, key, start, end):
+        return self.ds_client.get_object(
+            Bucket=self.ds_bucket, Key=key, Range=f"bytes={start}-{end}"
+        )["Body"].read()
+
 
 # ---------------------------------------------------------------------------
 # Dataset (identical to validator.py)
 # ---------------------------------------------------------------------------
 
 def get_shard_info(r2, shard_key):
-    header = r2.range_get(shard_key, 0, 1023)
+    header = r2.ds_range_get(shard_key, 0, 1023)
     buf = io.BytesIO(header)
     buf.read(6)  # magic
     ver = struct.unpack("BB", buf.read(2))
@@ -92,7 +131,7 @@ def get_shard_info(r2, shard_key):
 R2_FETCH_WORKERS = 32
 
 def _parse_shard_header(r2, shard_key):
-    header = r2.range_get(shard_key, 0, 1023)
+    header = r2.ds_range_get(shard_key, 0, 1023)
     buf = io.BytesIO(header)
     buf.read(6)  # magic
     ver = struct.unpack("BB", buf.read(2))
@@ -118,7 +157,7 @@ def fetch_sequences(r2, shard_key, indices, seq_len):
 
     def _fetch_group(gs_ge):
         gs, ge = gs_ge
-        chunk = r2.range_get(shard_key, data_offset + gs * bps, data_offset + (ge + 1) * bps - 1)
+        chunk = r2.ds_range_get(shard_key, data_offset + gs * bps, data_offset + (ge + 1) * bps - 1)
         partial = {}
         for idx in range(gs, ge + 1):
             if idx in idx_set:
@@ -136,7 +175,7 @@ def fetch_sequences(r2, shard_key, indices, seq_len):
 def download_shard(r2, shard_key):
     """Download entire shard as a single object and return (data_offset, raw_bytes)."""
     t0 = time.time()
-    raw = r2.client.get_object(Bucket=r2.bucket, Key=shard_key)["Body"].read()
+    raw = r2.ds_client.get_object(Bucket=r2.ds_bucket, Key=shard_key)["Body"].read()
     buf = io.BytesIO(raw)
     buf.read(6)  # magic
     ver = struct.unpack("BB", buf.read(2))
@@ -536,12 +575,15 @@ def main():
     if args.shard:
         shard_key = args.shard
     else:
-        manifest = r2.get("dataset/v1/manifest.json")
+        manifest = r2.ds_get("dataset/v2/manifest.json")
         if not manifest:
-            log.error("could not fetch dataset manifest from R2")
+            manifest = r2.get("dataset/v1/manifest.json")
+        if not manifest:
+            log.error("could not fetch dataset manifest")
             sys.exit(1)
         shard_key = manifest["shards"][0]["key"]
-        log.info("using shard: %s (%d shards available)", shard_key, len(manifest["shards"]))
+        log.info("using shard: %s (%d shards available, version=%s)",
+                 shard_key, len(manifest["shards"]), manifest.get("version", "v1"))
 
     same_model = args.king == args.challenger
 

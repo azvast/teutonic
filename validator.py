@@ -25,7 +25,7 @@ from huggingface_hub import HfApi
 # Config
 # ---------------------------------------------------------------------------
 
-EVAL_N = 10_000
+EVAL_N = 100_000
 EVAL_ALPHA = 0.001
 EVAL_DELTA = float(os.environ.get("TEUTONIC_EVAL_DELTA", "0.01"))
 SEQ_LEN = 2048
@@ -43,6 +43,17 @@ R2_ENDPOINT = os.environ.get("TEUTONIC_R2_ENDPOINT", "")
 R2_BUCKET = os.environ.get("TEUTONIC_R2_BUCKET", "")
 R2_ACCESS_KEY = os.environ.get("TEUTONIC_R2_ACCESS_KEY", "")
 R2_SECRET_KEY = os.environ.get("TEUTONIC_R2_SECRET_KEY", "")
+
+HIPPIUS_ENDPOINT = os.environ.get("TEUTONIC_HIPPIUS_ENDPOINT", "https://s3.hippius.com")
+HIPPIUS_BUCKET = os.environ.get("TEUTONIC_HIPPIUS_BUCKET", "teutonic-sn3")
+HIPPIUS_ACCESS_KEY = os.environ.get("TEUTONIC_HIPPIUS_ACCESS_KEY", "")
+HIPPIUS_SECRET_KEY = os.environ.get("TEUTONIC_HIPPIUS_SECRET_KEY", "")
+
+DS_ENDPOINT = os.environ.get("TEUTONIC_DS_ENDPOINT", "")
+DS_BUCKET = os.environ.get("TEUTONIC_DS_BUCKET", "")
+DS_ACCESS_KEY = os.environ.get("TEUTONIC_DS_ACCESS_KEY", "")
+DS_SECRET_KEY = os.environ.get("TEUTONIC_DS_SECRET_KEY", "")
+
 TMC_API_KEY = os.environ.get("TMC_API_KEY", "")
 
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
@@ -151,13 +162,72 @@ class R2:
             region_name="auto",
             config=BotoConfig(retries={"max_attempts": 3, "mode": "adaptive"}),
         )
+        if HIPPIUS_ACCESS_KEY and HIPPIUS_SECRET_KEY:
+            self._hippius = boto3.client(
+                "s3", endpoint_url=HIPPIUS_ENDPOINT,
+                aws_access_key_id=HIPPIUS_ACCESS_KEY,
+                aws_secret_access_key=HIPPIUS_SECRET_KEY,
+                region_name="decentralized",
+                config=BotoConfig(
+                    signature_version="s3v4",
+                    retries={"max_attempts": 3, "mode": "adaptive"},
+                    s3={"addressing_style": "path"},
+                ),
+            )
+        else:
+            self._hippius = None
+
+        if DS_ACCESS_KEY and DS_SECRET_KEY and DS_ENDPOINT:
+            self._ds_client = boto3.client(
+                "s3", endpoint_url=DS_ENDPOINT,
+                aws_access_key_id=DS_ACCESS_KEY,
+                aws_secret_access_key=DS_SECRET_KEY,
+                region_name="decentralized",
+                config=BotoConfig(
+                    signature_version="s3v4",
+                    retries={"max_attempts": 3, "mode": "adaptive"},
+                    s3={"addressing_style": "path"},
+                ),
+            )
+            self._ds_bucket = DS_BUCKET
+            log.info("dataset store: %s bucket=%s", DS_ENDPOINT, DS_BUCKET)
+        else:
+            self._ds_client = None
+            self._ds_bucket = None
+
+    def put_dashboard(self, key, data):
+        body = json.dumps(data, default=str).encode()
+        ct = "application/json"
+        if self._hippius:
+            self._hippius.put_object(
+                Bucket=HIPPIUS_BUCKET, Key=key, Body=body, ContentType=ct,
+            )
+        else:
+            self.client.put_object(
+                Bucket=R2_BUCKET, Key=key, Body=body, ContentType=ct,
+            )
+
+    def put_dashboard_raw(self, key, body, content_type):
+        if self._hippius:
+            self._hippius.put_object(
+                Bucket=HIPPIUS_BUCKET, Key=key, Body=body,
+                ContentType=content_type,
+            )
+        else:
+            self.client.put_object(
+                Bucket=R2_BUCKET, Key=key, Body=body,
+                ContentType=content_type,
+            )
 
     def put(self, key, data):
-        self.client.put_object(
-            Bucket=R2_BUCKET, Key=key,
-            Body=json.dumps(data, default=str).encode(),
-            ContentType="application/json",
-        )
+        try:
+            self.client.put_object(
+                Bucket=R2_BUCKET, Key=key,
+                Body=json.dumps(data, default=str).encode(),
+                ContentType="application/json",
+            )
+        except Exception:
+            log.warning("R2 put failed for %s (non-fatal)", key)
 
     def get(self, key):
         try:
@@ -167,36 +237,58 @@ class R2:
         except Exception:
             return None
 
+    def ds_get(self, key):
+        """Read JSON from the dataset store (Hippius), falling back to R2."""
+        if self._ds_client:
+            try:
+                return json.loads(
+                    self._ds_client.get_object(
+                        Bucket=self._ds_bucket, Key=key
+                    )["Body"].read()
+                )
+            except Exception:
+                pass
+        return self.get(key)
+
     def append_jsonl(self, key, record):
-        line = json.dumps(record, default=str) + "\n"
-        existing = b""
         try:
-            existing = self.client.get_object(Bucket=R2_BUCKET, Key=key)["Body"].read()
+            line = json.dumps(record, default=str) + "\n"
+            existing = b""
+            try:
+                existing = self.client.get_object(Bucket=R2_BUCKET, Key=key)["Body"].read()
+            except Exception:
+                pass
+            self.client.put_object(
+                Bucket=R2_BUCKET, Key=key,
+                Body=existing + line.encode(),
+                ContentType="application/x-ndjson",
+            )
         except Exception:
-            pass
-        self.client.put_object(
-            Bucket=R2_BUCKET, Key=key,
-            Body=existing + line.encode(),
-            ContentType="application/x-ndjson",
-        )
+            log.warning("R2 append_jsonl failed for %s (non-fatal)", key)
 
     def append_jsonl_batch(self, key, records):
-        lines = "".join(json.dumps(r, default=str) + "\n" for r in records)
-        existing = b""
         try:
-            existing = self.client.get_object(Bucket=R2_BUCKET, Key=key)["Body"].read()
+            lines = "".join(json.dumps(r, default=str) + "\n" for r in records)
+            existing = b""
+            try:
+                existing = self.client.get_object(Bucket=R2_BUCKET, Key=key)["Body"].read()
+            except Exception:
+                pass
+            self.client.put_object(
+                Bucket=R2_BUCKET, Key=key,
+                Body=existing + lines.encode(),
+                ContentType="application/x-ndjson",
+            )
         except Exception:
-            pass
-        self.client.put_object(
-            Bucket=R2_BUCKET, Key=key,
-            Body=existing + lines.encode(),
-            ContentType="application/x-ndjson",
-        )
+            log.warning("R2 append_jsonl_batch failed for %s (non-fatal)", key)
 
     def put_raw(self, key, body, content_type):
-        self.client.put_object(
-            Bucket=R2_BUCKET, Key=key, Body=body, ContentType=content_type,
-        )
+        try:
+            self.client.put_object(
+                Bucket=R2_BUCKET, Key=key, Body=body, ContentType=content_type,
+            )
+        except Exception:
+            log.warning("R2 put_raw failed for %s (non-fatal)", key)
 
     def range_get(self, key, start, end):
         return self.client.get_object(
@@ -509,7 +601,7 @@ class State:
         }
         if self.market:
             payload["market"] = self.market
-        self.r2.put("dashboard.json", payload)
+        self.r2.put_dashboard("dashboard.json", payload)
 
 
 
@@ -601,7 +693,9 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
     except Exception:
         pass
 
-    manifest = r2.get("dataset/v1/manifest.json")
+    manifest = r2.ds_get("dataset/v2/manifest.json")
+    if not manifest:
+        manifest = r2.get("dataset/v1/manifest.json")
     if not manifest:
         log.error("no dataset manifest")
         return
@@ -727,16 +821,18 @@ async def main():
     r2 = R2()
     state = State(r2)
     state.load()
-    if not args.seen:
-        state.seen.clear()
-        log.info("--no-seen: will continuously re-evaluate all challengers")
+    if args.seen:
+        log.info("--seen: will re-evaluate old challengers when queue is empty")
+    else:
+        log.info("new-only mode: will idle when all hotkeys have been seen")
     state.flush_dashboard()
 
     html_path = os.path.join(os.path.dirname(__file__) or ".", "index.html")
     if os.path.exists(html_path):
         with open(html_path, "rb") as f:
-            r2.put_raw("index.html", f.read(), "text/html")
-        log.info("uploaded dashboard to R2")
+            html_bytes = f.read()
+        r2.put_dashboard_raw("index.html", html_bytes, "text/html")
+        log.info("uploaded dashboard to Hippius")
 
     wallet = bt.wallet(name=WALLET_NAME, hotkey=WALLET_HOTKEY)
     subtensor = bt.subtensor(network=NETWORK)
@@ -793,10 +889,6 @@ async def main():
                     if cid:
                         log.info("queued %s from %s (new)", cid, rev["hotkey"][:16])
 
-            if args.seen and not state.queue:
-                log.info("all miners seen — replenishing with re-eval candidates")
-                state.replenish_reeval(subtensor, NETUID)
-
             while state.queue:
                 entry = state.queue.pop(0)
                 is_reeval = entry.get("reeval", False)
@@ -836,12 +928,10 @@ async def main():
             if args.seen and not state.queue:
                 state.replenish_reeval(subtensor, NETUID)
 
-            state.flush_dashboard()
+            if not args.seen and not state.queue:
+                log.info("idle: all hotkeys seen, waiting for new submissions")
 
-            if not args.seen:
-                state.seen.clear()
-                state.evaluated_repos.clear()
-                state.flush()
+            state.flush_dashboard()
 
             try:
                 current_block = subtensor.block
@@ -869,9 +959,10 @@ async def main():
 def parse_args():
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--seen", action=argparse.BooleanOptionalAction, default=True,
-                   help="Track seen hotkeys to avoid re-evaluating (default: True). "
-                        "Use --no-seen to continuously cycle all challengers.")
+    p.add_argument("--seen", action=argparse.BooleanOptionalAction, default=False,
+                   help="When idle, replenish queue with re-eval candidates (default: off). "
+                        "Without --seen, only genuinely new hotkeys are evaluated and the "
+                        "validator idles when the queue is empty.")
     return p.parse_args()
 
 

@@ -157,9 +157,36 @@ th:last-child, td:last-child { text-align: right; }
     cursor: pointer;
     letter-spacing: 0.05em;
 }
-#theme-toggle:hover {
+#theme-toggle:hover, #chart-mode-toggle:hover {
     background: var(--ink);
     color: var(--ink-inv);
+}
+
+#smooth-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 80px;
+    height: 4px;
+    background: var(--ink-muted);
+    outline: none;
+    margin: 0 6px;
+    vertical-align: middle;
+    cursor: pointer;
+}
+#smooth-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 10px;
+    height: 10px;
+    background: var(--ink);
+    border: none;
+    cursor: pointer;
+}
+#smooth-slider::-moz-range-thumb {
+    width: 10px;
+    height: 10px;
+    background: var(--ink);
+    border: none;
+    cursor: pointer;
 }
 </style>
 </head>
@@ -186,7 +213,13 @@ th:last-child, td:last-child { text-align: right; }
     </div>
 
     <div>
-        <div class="section-label">Loss</div>
+        <div class="section-label" style="display:flex;justify-content:space-between;align-items:center;">
+            <span id="chart-label">Perplexity</span>
+            <span style="display:flex;align-items:center;gap:8px;">
+                <label style="font-weight:normal;font-size:11px;display:flex;align-items:center;cursor:default;">SMOOTH<input type="range" id="smooth-slider" min="0" max="1" step="0.05" value="0"><span id="smooth-val" style="min-width:1.8em;text-align:right;">0</span></label>
+                <button id="chart-mode-toggle" style="background:none;border:var(--border);color:var(--ink);font:11px/1 var(--font);text-transform:uppercase;padding:3px 8px;cursor:pointer;letter-spacing:0.05em;">Loss</button>
+            </span>
+        </div>
         <div class="chart-wrap">
             <svg id="chart"></svg>
         </div>
@@ -244,9 +277,10 @@ th:last-child, td:last-child { text-align: right; }
 </div>
 
 <script>
-var DATA_URL = "https://pub-0821b4e0d60149b79bad17376722bc75.r2.dev/dashboard.json";
+var DATA_URL = "https://s3.hippius.com/teutonic-sn3/dashboard.json";
 var POLL_MS = 5000;
 var _lastData = null;
+var _chartMode = localStorage.getItem("chartMode") || "ppl";
 
 (function initTheme() {
     var saved = localStorage.getItem("theme");
@@ -255,6 +289,15 @@ var _lastData = null;
 })();
 
 function short(s, n) { return s ? s.slice(0, n || 12) + "\u2026" : "--"; }
+
+function ema(arr, alpha) {
+    if (alpha >= 1 || arr.length === 0) return arr.slice();
+    var out = [arr[0]];
+    for (var i = 1; i < arr.length; i++) {
+        out.push(alpha * arr[i] + (1 - alpha) * out[i - 1]);
+    }
+    return out;
+}
 
 function render(d) {
     var mkt = d.market || {};
@@ -302,21 +345,37 @@ function render(d) {
     var hist = (d.history || []).slice().reverse();
     var ev = d.current_eval;
 
-    // --- 1. Loss Chart (king + challenger) ---
-    var kingLosses = [], challLosses = [];
+    // --- 1. Chart (king + challenger, perplexity or loss) ---
+    var isPpl = _chartMode === "ppl";
+    document.getElementById("chart-label").textContent = isPpl ? "Perplexity" : "Loss";
+    document.getElementById("chart-mode-toggle").textContent = isPpl ? "Loss" : "Perplexity";
+
+    var kingVals = [], challVals = [];
     for (var i = 0; i < hist.length; i++) {
         var kl = hist[i].avg_king_loss || 0;
         var cl = hist[i].avg_challenger_loss || 0;
         if (kl || cl) {
-            kingLosses.push(kl || cl);
-            challLosses.push(cl || kl);
+            var kv = kl || cl, cv = cl || kl;
+            kingVals.push(isPpl ? Math.exp(kv) : kv);
+            challVals.push(isPpl ? Math.exp(cv) : cv);
         }
     }
     if (ev && ev.avg_king_loss) {
-        kingLosses.push(ev.avg_king_loss);
-        challLosses.push(ev.avg_challenger_loss || ev.avg_king_loss);
+        var ekv = ev.avg_king_loss;
+        var ecv = ev.avg_challenger_loss || ev.avg_king_loss;
+        kingVals.push(isPpl ? Math.exp(ekv) : ekv);
+        challVals.push(isPpl ? Math.exp(ecv) : ecv);
     }
-    var nPts = kingLosses.length;
+    var nPts = kingVals.length;
+
+    var smoothVal = parseFloat(document.getElementById("smooth-slider").value);
+    var alpha = 1 / (1 + smoothVal * 20);
+    var rawKing = kingVals.slice();
+    var rawChall = challVals.slice();
+    if (smoothVal > 0) {
+        kingVals = ema(kingVals, alpha);
+        challVals = ema(challVals, alpha);
+    }
 
     var SVG = document.getElementById("chart");
     var rect = SVG.parentElement.getBoundingClientRect();
@@ -341,11 +400,13 @@ function render(d) {
         document.getElementById("chart-meta").innerHTML = "<span>--</span>";
     } else {
 
-    var allVals = kingLosses.concat(challLosses);
+    var allVals = kingVals.concat(challVals).concat(rawKing).concat(rawChall);
     var minL = Math.min.apply(null, allVals);
     var maxL = Math.max.apply(null, allVals);
+    if (isPpl && maxL > 10) maxL = 10;
     var padV = (maxL - minL) * 0.08 || 0.5;
     minL -= padV; maxL += padV;
+    if (isPpl && maxL > 10) maxL = 10;
 
     function toX(i) { return ML + (nPts > 1 ? (i / (nPts - 1)) * pw : pw / 2); }
     function toY(v) { return MT + ph - ((v - minL) / (maxL - minL)) * ph; }
@@ -357,12 +418,13 @@ function render(d) {
     svg += '<line x1="' + ML + '" y1="' + MT + '" x2="' + ML + '" y2="' + (MT + ph) + '" stroke="' + inkC + '" stroke-width="' + lw + '"/>';
     svg += '<line x1="' + ML + '" y1="' + (MT + ph) + '" x2="' + (ML + pw) + '" y2="' + (MT + ph) + '" stroke="' + inkC + '" stroke-width="' + lw + '"/>';
 
-    for (var t = 0; t <= 4; t++) {
-        var val = minL + (maxL - minL) * (t / 4);
+    var nTicks = 8;
+    for (var t = 0; t <= nTicks; t++) {
+        var val = minL + (maxL - minL) * (t / nTicks);
         var yy = toY(val);
         svg += '<line x1="' + (ML - 5*dpr) + '" y1="' + yy + '" x2="' + ML + '" y2="' + yy + '" stroke="' + inkC + '" stroke-width="' + lw + '"/>';
         svg += '<text x="' + (ML - 8*dpr) + '" y="' + (yy + fs*0.35) + '" text-anchor="end" ' + font + '>' + val.toFixed(2) + '</text>';
-        if (t > 0 && t < 4) {
+        if (t > 0 && t < nTicks) {
             svg += '<line x1="' + ML + '" y1="' + yy + '" x2="' + (ML + pw) + '" y2="' + yy + '" stroke="' + inkC + '" stroke-width="' + (0.5*dpr) + '" stroke-dasharray="' + (3*dpr) + ' ' + (6*dpr) + '"/>';
         }
     }
@@ -374,24 +436,44 @@ function render(d) {
         svg += '<text x="' + xx + '" y="' + (MT + ph + 20*dpr) + '" text-anchor="middle" ' + font + '>' + label + '</text>';
     }
 
-    // Challenger loss line (dashed gray)
+    // Raw ghost lines (faint, only when smoothing active)
+    if (smoothVal > 0) {
+        var rawCpts = [];
+        for (var i = 0; i < nPts; i++) {
+            rawCpts.push(toX(i).toFixed(1) + "," + toY(rawChall[i]).toFixed(1));
+        }
+        svg += '<polyline points="' + rawCpts.join(" ") + '" fill="none" stroke="' + mutedC + '" stroke-width="' + (0.5*dpr) + '" stroke-dasharray="' + (2*dpr) + ' ' + (4*dpr) + '" stroke-linejoin="round" opacity="0.3"/>';
+
+        var rawKpts = [];
+        for (var i = 0; i < nPts; i++) {
+            rawKpts.push(toX(i).toFixed(1) + "," + toY(rawKing[i]).toFixed(1));
+        }
+        svg += '<polyline points="' + rawKpts.join(" ") + '" fill="none" stroke="' + inkC + '" stroke-width="' + (0.5*dpr) + '" stroke-dasharray="' + (2*dpr) + ' ' + (4*dpr) + '" stroke-linejoin="round" opacity="0.25"/>';
+
+        for (var i = 0; i < nPts; i++) {
+            svg += '<circle cx="' + toX(i).toFixed(1) + '" cy="' + toY(rawKing[i]).toFixed(1) + '" r="' + (1.5*dpr) + '" fill="' + inkC + '" opacity="0.2"/>';
+            svg += '<circle cx="' + toX(i).toFixed(1) + '" cy="' + toY(rawChall[i]).toFixed(1) + '" r="' + (1.5*dpr) + '" fill="' + mutedC + '" opacity="0.2"/>';
+        }
+    }
+
+    // Challenger line (dashed gray)
     var cpts = [];
     for (var i = 0; i < nPts; i++) {
-        cpts.push(toX(i).toFixed(1) + "," + toY(challLosses[i]).toFixed(1));
+        cpts.push(toX(i).toFixed(1) + "," + toY(challVals[i]).toFixed(1));
     }
     svg += '<polyline points="' + cpts.join(" ") + '" fill="none" stroke="' + mutedC + '" stroke-width="' + (1*dpr) + '" stroke-dasharray="' + (4*dpr) + ' ' + (3*dpr) + '" stroke-linejoin="round"/>';
     for (var i = 0; i < nPts; i++) {
-        svg += '<circle cx="' + toX(i).toFixed(1) + '" cy="' + toY(challLosses[i]).toFixed(1) + '" r="' + (2*dpr) + '" fill="' + mutedC + '"/>';
+        svg += '<circle cx="' + toX(i).toFixed(1) + '" cy="' + toY(challVals[i]).toFixed(1) + '" r="' + (2*dpr) + '" fill="' + mutedC + '"/>';
     }
 
-    // King loss line (solid black)
+    // King line (solid black)
     var kpts = [];
     for (var i = 0; i < nPts; i++) {
-        kpts.push(toX(i).toFixed(1) + "," + toY(kingLosses[i]).toFixed(1));
+        kpts.push(toX(i).toFixed(1) + "," + toY(kingVals[i]).toFixed(1));
     }
     svg += '<polyline points="' + kpts.join(" ") + '" fill="none" stroke="' + inkC + '" stroke-width="' + (1.5*dpr) + '" stroke-linejoin="round"/>';
     for (var i = 0; i < nPts; i++) {
-        svg += '<circle cx="' + toX(i).toFixed(1) + '" cy="' + toY(kingLosses[i]).toFixed(1) + '" r="' + (3*dpr) + '" fill="' + inkC + '"/>';
+        svg += '<circle cx="' + toX(i).toFixed(1) + '" cy="' + toY(kingVals[i]).toFixed(1) + '" r="' + (3*dpr) + '" fill="' + inkC + '"/>';
     }
 
     // Legend
@@ -404,9 +486,10 @@ function render(d) {
 
     SVG.innerHTML = svg;
 
-    var latestK = kingLosses[nPts - 1];
+    var latestK = kingVals[nPts - 1];
+    var metaLabel = isPpl ? "KING PPL" : "KING LOSS";
     document.getElementById("chart-meta").innerHTML =
-        "<span>KING: " + latestK.toFixed(4) + "</span><span>EVALS: " + nPts + "</span>";
+        "<span>" + metaLabel + ": " + latestK.toFixed(4) + "</span><span>EVALS: " + nPts + "</span>";
 
     } // end chart data block
 
@@ -546,6 +629,27 @@ async function poll() {
         document.documentElement.dataset.theme = isDark ? "light" : "dark";
         localStorage.setItem("theme", document.documentElement.dataset.theme);
         updateLabel();
+        if (_lastData) render(_lastData);
+    });
+})();
+
+(function initChartToggle() {
+    document.getElementById("chart-mode-toggle").addEventListener("click", function() {
+        _chartMode = _chartMode === "ppl" ? "loss" : "ppl";
+        localStorage.setItem("chartMode", _chartMode);
+        if (_lastData) render(_lastData);
+    });
+})();
+
+(function initSmoothSlider() {
+    var slider = document.getElementById("smooth-slider");
+    var label = document.getElementById("smooth-val");
+    var saved = localStorage.getItem("smoothing");
+    if (saved != null) { slider.value = saved; }
+    label.textContent = slider.value;
+    slider.addEventListener("input", function() {
+        label.textContent = slider.value;
+        localStorage.setItem("smoothing", slider.value);
         if (_lastData) render(_lastData);
     });
 })();

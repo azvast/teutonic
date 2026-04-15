@@ -30,6 +30,7 @@ import io
 import json
 import logging
 import os
+import pathlib
 import struct
 import sys
 import time
@@ -172,19 +173,83 @@ def fetch_sequences(r2, shard_key, indices, seq_len):
     return result
 
 
-def download_shard(r2, shard_key):
-    """Download entire shard as a single object and return (data_offset, raw_bytes)."""
-    t0 = time.time()
-    raw = r2.ds_client.get_object(Bucket=r2.ds_bucket, Key=shard_key)["Body"].read()
+SHARD_CACHE_DIR = os.environ.get("TEUTONIC_SHARD_CACHE", "/tmp/shard_cache")
+SHARD_CACHE_MAX = int(os.environ.get("TEUTONIC_SHARD_CACHE_MAX", "10"))
+SHARD_DL_WORKERS = int(os.environ.get("TEUTONIC_SHARD_DL_WORKERS", "16"))
+
+
+def _parse_npy_header(raw: bytes) -> int:
+    """Return the byte offset where data begins in a .npy file."""
     buf = io.BytesIO(raw)
     buf.read(6)  # magic
     ver = struct.unpack("BB", buf.read(2))
     hl = struct.unpack("<H" if ver[0] == 1 else "<I", buf.read(2 if ver[0] == 1 else 4))[0]
     buf.read(hl)
-    data_offset = buf.tell()
+    return buf.tell()
+
+
+def _evict_shard_cache():
+    """Keep only the most recent SHARD_CACHE_MAX files in the cache dir."""
+    cache = pathlib.Path(SHARD_CACHE_DIR)
+    if not cache.exists():
+        return
+    files = sorted(cache.glob("*.npy"), key=lambda f: f.stat().st_mtime)
+    while len(files) > SHARD_CACHE_MAX:
+        victim = files.pop(0)
+        victim.unlink(missing_ok=True)
+        log.info("evicted cached shard %s", victim.name)
+
+
+def download_shard(r2, shard_key):
+    """Download shard with parallel streams and local disk cache."""
+    cache_name = shard_key.replace("/", "_")
+    cache_path = pathlib.Path(SHARD_CACHE_DIR) / cache_name
+
+    if cache_path.exists():
+        t0 = time.time()
+        raw = cache_path.read_bytes()
+        data_offset = _parse_npy_header(raw)
+        elapsed = time.time() - t0
+        log.info("shard cache HIT %s: %.1f MB read in %.2fs",
+                 shard_key, len(raw) / 1e6, elapsed)
+        return data_offset, raw
+
+    t0 = time.time()
+    head = r2.ds_client.head_object(Bucket=r2.ds_bucket, Key=shard_key)
+    total_size = head["ContentLength"]
+
+    n_workers = min(SHARD_DL_WORKERS, max(1, total_size // (64 * 1024 * 1024)))
+    chunk_size = total_size // n_workers
+    chunks = [None] * n_workers
+
+    def _dl_chunk(i):
+        start = i * chunk_size
+        end_byte = total_size - 1 if i == n_workers - 1 else (i + 1) * chunk_size - 1
+        chunks[i] = r2.ds_client.get_object(
+            Bucket=r2.ds_bucket, Key=shard_key,
+            Range=f"bytes={start}-{end_byte}",
+        )["Body"].read()
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        list(pool.map(_dl_chunk, range(n_workers)))
+
+    raw = b"".join(chunks)
+    del chunks
+
+    data_offset = _parse_npy_header(raw)
     elapsed = time.time() - t0
-    log.info("downloaded shard %s: %.1f MB in %.1fs (%.0f MB/s)",
-             shard_key, len(raw) / 1e6, elapsed, len(raw) / 1e6 / elapsed if elapsed > 0 else 0)
+    log.info("downloaded shard %s: %.1f MB in %.1fs (%.0f MB/s, %d streams)",
+             shard_key, len(raw) / 1e6, elapsed,
+             len(raw) / 1e6 / elapsed if elapsed > 0 else 0, n_workers)
+
+    try:
+        pathlib.Path(SHARD_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(raw)
+        _evict_shard_cache()
+        log.info("cached shard to %s", cache_path)
+    except Exception:
+        log.warning("failed to cache shard to disk", exc_info=True)
+
     return data_offset, raw
 
 
@@ -312,6 +377,51 @@ def load_model(repo, device, label="model", force_download=False, revision=None)
     params = sum(p.numel() for p in model.parameters()) / 1e9
     log.info("%s loaded: %.1fB params in %.1fs", label, params, elapsed)
     return model
+
+
+# ---------------------------------------------------------------------------
+# Weight norm guard — reject models with inflated L2 norms
+# ---------------------------------------------------------------------------
+
+NORM_EPSILON = 1e-8
+
+@torch.no_grad()
+def check_weight_norms(king_model, challenger_model, max_ratio=5.0):
+    """Compare per-parameter L2 norms between king and challenger.
+
+    Returns (ok, violations) where violations is a list of dicts describing
+    each parameter that failed the check (non-finite values or norm ratio
+    exceeding max_ratio).
+    """
+    king_params = dict(king_model.named_parameters())
+    violations = []
+
+    for c_name, c_param in challenger_model.named_parameters():
+        if not torch.isfinite(c_param.data).all():
+            violations.append({"param": c_name, "reason": "non-finite values"})
+            continue
+
+        k_param = king_params.get(c_name)
+        if k_param is None:
+            continue
+
+        k_norm = torch.linalg.vector_norm(k_param.data.float()).item()
+        c_norm = torch.linalg.vector_norm(c_param.data.float()).item()
+
+        if k_norm < NORM_EPSILON:
+            continue
+
+        ratio = c_norm / k_norm
+        if ratio > max_ratio:
+            violations.append({
+                "param": c_name,
+                "reason": "norm_ratio",
+                "king_norm": round(k_norm, 6),
+                "challenger_norm": round(c_norm, 6),
+                "ratio": round(ratio, 4),
+            })
+
+    return len(violations) == 0, violations
 
 
 # ---------------------------------------------------------------------------

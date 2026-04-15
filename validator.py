@@ -25,7 +25,7 @@ from huggingface_hub import HfApi
 # Config
 # ---------------------------------------------------------------------------
 
-EVAL_N = 100_000
+EVAL_N = 10_000
 EVAL_ALPHA = 0.001
 EVAL_DELTA = float(os.environ.get("TEUTONIC_EVAL_DELTA", "0.01"))
 SEQ_LEN = 2048

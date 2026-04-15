@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from queue import Queue, Empty
 
 import torch
@@ -27,6 +28,7 @@ from pydantic import BaseModel
 
 from eval_torch import (
     R2, MultiGPUEvaluator, run_bootstrap_test, parse_gpu_ids,
+    check_weight_norms,
 )
 
 log = logging.getLogger("eval_server")
@@ -50,6 +52,9 @@ DEFAULT_ALPHA = float(os.environ.get("EVAL_ALPHA", "0.001"))
 DEFAULT_SEQ_LEN = int(os.environ.get("EVAL_SEQ_LEN", "2048"))
 DEFAULT_DELTA = float(os.environ.get("EVAL_DELTA", "0.01"))
 DEFAULT_BOOTSTRAP_B = int(os.environ.get("EVAL_BOOTSTRAP_B", "10000"))
+
+NORM_CHECK_ENABLED = os.environ.get("TEUTONIC_NORM_CHECK", "1") == "1"
+NORM_MULTIPLIER = float(os.environ.get("TEUTONIC_NORM_MULTIPLIER", "5.0"))
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +262,36 @@ def _run_eval(eval_id: str, req: EvalRequest):
             challenger_eval = king_eval
         else:
             challenger_eval = _load_challenger(req.challenger_repo, req.challenger_revision)
+
+        if not same_model and NORM_CHECK_ENABLED:
+            king_model = king_eval.models[king_eval.gpu_ids[0]]
+            chall_model = challenger_eval.models[challenger_eval.gpu_ids[0]]
+            ok, violations = check_weight_norms(king_model, chall_model,
+                                                max_ratio=NORM_MULTIPLIER)
+            if not ok:
+                log.warning("norm check FAILED for %s: %d violations",
+                            req.challenger_repo, len(violations))
+                for v in violations[:10]:
+                    log.warning("  %s", v)
+
+                challenger_eval.shutdown()
+                del challenger_eval
+                torch.cuda.empty_cache()
+
+                verdict = {
+                    "accepted": False,
+                    "verdict": "king",
+                    "rejection_reason": "weight_norm_violation",
+                    "norm_violations": violations[:20],
+                    "norm_multiplier": NORM_MULTIPLIER,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                record["state"] = "completed"
+                record["verdict"] = verdict
+                event_q.put({"type": "verdict", "data": verdict})
+                _cleanup_hf_cache()
+                return
+            log.info("norm check passed for %s", req.challenger_repo)
 
         seed_str = f"{req.block_hash}:{req.hotkey}"
 

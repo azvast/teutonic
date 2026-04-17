@@ -720,7 +720,8 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
 
     block_hash = "default"
     try:
-        block_hash = subtensor.get_block_hash(entry["block"]) or "default"
+        eval_block = subtensor.block
+        block_hash = subtensor.get_block_hash(eval_block) or "default"
     except Exception:
         pass
 
@@ -745,6 +746,7 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
         "challenger_repo": hf_repo, "challenger_revision": challenger_revision,
         "hotkey": hotkey,
         "N": EVAL_N, "alpha": EVAL_ALPHA, "delta": EVAL_DELTA, "shard": shard_key,
+        "eval_block": eval_block, "block_hash": block_hash,
     })
 
     state.current_eval = {

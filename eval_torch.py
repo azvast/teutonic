@@ -386,13 +386,30 @@ def load_model(repo, device, label="model", force_download=False, revision=None)
 
 NORM_EPSILON = 1e-8
 
+PROJ_TENSOR_SUFFIXES = (
+    "q_proj.weight", "k_proj.weight", "v_proj.weight", "o_proj.weight",
+    "gate_proj.weight", "up_proj.weight", "down_proj.weight",
+)
+
+# Defense-in-depth floor for projection tensors. Mirrors validator.py's
+# TEUTONIC_PROJ_MIN_MEAN_ABS / 5 — anything below this is the RMSNorm/SwiGLU
+# rescale trick, even if the offline gate somehow missed it.
+PROJ_MEAN_ABS_FLOOR = float(os.environ.get(
+    "TEUTONIC_EVAL_PROJ_MEAN_ABS_FLOOR", "2e-5"))
+
+
+def _is_proj_param(name: str) -> bool:
+    return any(name.endswith(suf) for suf in PROJ_TENSOR_SUFFIXES)
+
+
 @torch.no_grad()
 def check_weight_norms(king_model, challenger_model, max_ratio=5.0):
-    """Compare per-parameter L2 norms between king and challenger.
+    """Compare per-parameter L2 norms between king and challenger, and reject
+    challengers whose projection tensors are pathologically tiny (RMSNorm /
+    SwiGLU scale-symmetry exploit).
 
     Returns (ok, violations) where violations is a list of dicts describing
-    each parameter that failed the check (non-finite values or norm ratio
-    exceeding max_ratio).
+    each parameter that failed.
     """
     king_params = dict(king_model.named_parameters())
     violations = []
@@ -401,6 +418,17 @@ def check_weight_norms(king_model, challenger_model, max_ratio=5.0):
         if not torch.isfinite(c_param.data).all():
             violations.append({"param": c_name, "reason": "non-finite values"})
             continue
+
+        if _is_proj_param(c_name):
+            mean_abs = c_param.data.float().abs().mean().item()
+            if mean_abs < PROJ_MEAN_ABS_FLOOR:
+                violations.append({
+                    "param": c_name,
+                    "reason": "proj_mean_abs_collapsed",
+                    "mean_abs": round(mean_abs, 9),
+                    "floor": PROJ_MEAN_ABS_FLOOR,
+                })
+                continue
 
         k_param = king_params.get(c_name)
         if k_param is None:

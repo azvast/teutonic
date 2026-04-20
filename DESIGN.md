@@ -245,16 +245,46 @@ wired into `eval_server.py`'s production path.
   the resolved commit SHA. A miner cannot upload one set of safetensors for
   validation and another for evaluation.
 - **Pathological weights.** Two layers of guard:
-  1. *Offline, pre-eval:* `validate_challenger_sanity` downloads only norm
-     tensors and rejects on non-finite values, on absolute thresholds
-     (`max_abs <= 1000`, `mean_abs <= 100`, `std <= 100`), and on per-tensor
+  1. *Offline, pre-eval:* `validate_challenger_sanity` downloads norm and
+     projection tensors and rejects on non-finite values, on absolute
+     thresholds (`max_abs <= 5000`, `mean_abs <= 1000`, `std <= 1000`), on
+     the reparameterization-trick fingerprint (see below), and on per-tensor
      ratio vs the king (`max_ratio = 50`). See
      [validator.py:344-420](teutonic/validator.py#L344-L420).
   2. *On-GPU, pre-test:* `check_weight_norms` rejects challengers where any
-     parameter's L2 norm is `>5x` the king's, or any parameter has non-finite
-     values. See [eval_torch.py:389-425](teutonic/eval_torch.py#L389-L425) and
-     the gate in
-     [eval_server.py:268-295](teutonic/eval_server.py#L268-L295).
+     parameter's L2 norm is `>5x` the king's, where any projection's
+     `mean_abs` falls below `TEUTONIC_EVAL_PROJ_MEAN_ABS_FLOOR = 2e-5`
+     (defense-in-depth against the reparam trick), or where any parameter
+     has non-finite values. See
+     [eval_torch.py:389-425](teutonic/eval_torch.py#L389-L425) and the gate
+     in [eval_server.py:268-295](teutonic/eval_server.py#L268-L295).
+- **RMSNorm/SwiGLU reparameterization trick.** RMSNorm followed by Linear
+  is invariant under `(gamma, W) -> (alpha*gamma, W/alpha)`; SwiGLU's
+  `silu(g)*u` is invariant under `(g, u) -> (alpha*g, u/alpha)`; and Gemma3's
+  per-head `q_norm`/`k_norm` (which `normalize()` then rescale) make the
+  scale of `q_proj`/`k_proj` irrelevant to attention scores. An attacker can
+  exploit these symmetries to publish a checkpoint whose RMSNorm gains are
+  inflated by 10^4-10^5 and whose `q_proj`/`k_proj`/`o_proj`/`gate_proj`/
+  `down_proj` are shrunk by the inverse factor. The model is mathematically
+  equivalent in output but pathologically brittle: any `~1e-3` perturbation
+  or fine-tune step destroys the now-tiny projections, so naive challengers
+  always lose by a huge margin and the king is effectively undethronable.
+  `check_reparam_sanity` ([validator.py](teutonic/validator.py)) catches this
+  with three layered checks on per-tensor `mean_abs`/`max_abs`:
+  1. The existing `NORM_SANITY_*` absolute caps on RMSNorm tensors.
+  2. A floor `TEUTONIC_PROJ_MIN_MEAN_ABS = 1e-4` on every projection
+     tensor (`q/k/v/o/gate/up/down_proj`). Honest Gemma3 projections are
+     ~5e-3 to 6e-2; trick projections collapse to ~1e-6.
+  3. A within-layer ratio `max(norm.mean_abs) / min(proj.mean_abs)` that
+     must stay below `TEUTONIC_LAYER_SCALE_RATIO_MAX = 1e5`. Honest layers
+     show ratios of ~10^1-10^4; trick layers reach ~10^9-10^10.
+
+  The same check runs on the reigning king at validator startup
+  (`audit_king_on_startup`); a king that fails is replaced by walking the
+  `previous_king` chain until a clean ancestor is found, falling back to
+  `SEED_REPO` if the entire chain is poisoned. Emits
+  `king_dethroned_reparam` (or `king_dethroned_reparam_chain_exhausted`) on
+  the event log.
 - **King disappears.** `check_king_alive` periodically calls
   `HfApi.model_info(king_repo, revision=king_revision)`. On failure we
   auto-revert to `state.king["previous_king"]` and emit
@@ -354,6 +384,14 @@ redesigning for larger models. Not prescriptions — just the dials:
 - `NORM_MULTIPLIER` (`5.0`) and the offline ratio (`50`).
 - `NORM_SANITY_MAX_*` absolute caps. Larger models naturally have larger
   norms; these may need per-layer scaling rather than absolute caps.
+- `TEUTONIC_PROJ_MIN_MEAN_ABS` (`1e-4`) — projection-tensor floor for the
+  reparameterization-trick guard. Lower it if a legitimate training run
+  produces honestly-tiny projections.
+- `TEUTONIC_LAYER_SCALE_RATIO_MAX` (`1e5`) — within-layer
+  max(norm.mean_abs) / min(proj.mean_abs) cap. Raise if honest models with
+  unusually flat projections trip it.
+- `TEUTONIC_EVAL_PROJ_MEAN_ABS_FLOOR` (`2e-5`) — eval-server defense-in-
+  depth floor on loaded torch projection tensors.
 
 **Throughput**
 

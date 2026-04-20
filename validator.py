@@ -620,20 +620,33 @@ def validate_challenger_sanity(hf_repo: str, challenger_revision: str,
     except Exception:
         king_stats = {}
 
+    # Skip the king-ratio cross-check when the king's reference value is
+    # effectively zero. Gemma3 RMSNorm uses the (1 + weight) parameterization,
+    # so input_layernorm / pre_feedforward_layernorm gains are stored as ~0
+    # and the ratio test is mathematically meaningless against that baseline
+    # (any non-zero challenger explodes to ratio ~ 1/eps). The absolute
+    # NORM_SANITY_MAX_* caps already gate genuinely pathological models.
+    KING_REF_MIN = 1e-3
     for name, stats in challenger_norm_stats.items():
         king = king_stats.get(name)
         if not king or king.get("has_non_finite"):
             continue
-        if _safe_ratio(stats["max_abs"], king.get("max_abs", 0.0)) > NORM_SANITY_MAX_RATIO:
-            return (
-                f"norm_weight_ratio:{name} max_abs_ratio="
-                f"{_safe_ratio(stats['max_abs'], king.get('max_abs', 0.0)):.2f} exceeds {NORM_SANITY_MAX_RATIO:.2f}"
-            )
-        if _safe_ratio(stats["mean_abs"], king.get("mean_abs", 0.0)) > NORM_SANITY_MAX_RATIO:
-            return (
-                f"norm_weight_ratio:{name} mean_abs_ratio="
-                f"{_safe_ratio(stats['mean_abs'], king.get('mean_abs', 0.0)):.2f} exceeds {NORM_SANITY_MAX_RATIO:.2f}"
-            )
+        king_max = float(king.get("max_abs", 0.0))
+        king_mean = float(king.get("mean_abs", 0.0))
+        if king_max >= KING_REF_MIN:
+            ratio = _safe_ratio(stats["max_abs"], king_max)
+            if ratio > NORM_SANITY_MAX_RATIO:
+                return (
+                    f"norm_weight_ratio:{name} max_abs_ratio="
+                    f"{ratio:.2f} exceeds {NORM_SANITY_MAX_RATIO:.2f}"
+                )
+        if king_mean >= KING_REF_MIN:
+            ratio = _safe_ratio(stats["mean_abs"], king_mean)
+            if ratio > NORM_SANITY_MAX_RATIO:
+                return (
+                    f"norm_weight_ratio:{name} mean_abs_ratio="
+                    f"{ratio:.2f} exceeds {NORM_SANITY_MAX_RATIO:.2f}"
+                )
 
     return None
 

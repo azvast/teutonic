@@ -53,13 +53,22 @@ log = logging.getLogger("eval_torch")
 
 class R2:
     def __init__(self):
+        # Sized for SHARD_DL_WORKERS parallel ranged GETs.
+        # Hippius can be slow on large ranged reads — 5min read_timeout
+        # avoids spurious "Read timeout on endpoint URL: None" failures.
+        _pool = max(SHARD_DL_WORKERS * 2, 32)
         self.client = boto3.client(
             "s3",
             endpoint_url=os.environ["TEUTONIC_R2_ENDPOINT"],
             aws_access_key_id=os.environ["TEUTONIC_R2_ACCESS_KEY"],
             aws_secret_access_key=os.environ["TEUTONIC_R2_SECRET_KEY"],
             region_name="auto",
-            config=BotoConfig(retries={"max_attempts": 3, "mode": "adaptive"}),
+            config=BotoConfig(
+                retries={"max_attempts": 5, "mode": "adaptive"},
+                max_pool_connections=_pool,
+                connect_timeout=30,
+                read_timeout=300,
+            ),
         )
         self.bucket = os.environ.get("TEUTONIC_R2_BUCKET", "constantinople")
 
@@ -75,8 +84,11 @@ class R2:
                 region_name="decentralized",
                 config=BotoConfig(
                     signature_version="s3v4",
-                    retries={"max_attempts": 3, "mode": "adaptive"},
+                    retries={"max_attempts": 5, "mode": "adaptive"},
                     s3={"addressing_style": "path"},
+                    max_pool_connections=_pool,
+                    connect_timeout=30,
+                    read_timeout=300,
                 ),
             )
             self.ds_bucket = os.environ.get("TEUTONIC_DS_BUCKET", self.bucket)

@@ -164,11 +164,19 @@ async def notify_new_king(king_info: dict, verdict: dict | None = None):
 
 class R2:
     def __init__(self):
+        # Hippius is currently flaky on long-lived reads — bound every S3
+        # call so a single hung connection cannot wedge the validator's
+        # main async loop for minutes (botocore default is 60s + retries).
+        _s3_cfg = dict(
+            connect_timeout=15,
+            read_timeout=45,
+            retries={"max_attempts": 3, "mode": "adaptive"},
+        )
         self.client = boto3.client(
             "s3", endpoint_url=R2_ENDPOINT,
             aws_access_key_id=R2_ACCESS_KEY, aws_secret_access_key=R2_SECRET_KEY,
             region_name="auto",
-            config=BotoConfig(retries={"max_attempts": 3, "mode": "adaptive"}),
+            config=BotoConfig(**_s3_cfg),
         )
         if HIPPIUS_ACCESS_KEY and HIPPIUS_SECRET_KEY:
             self._hippius = boto3.client(
@@ -178,8 +186,8 @@ class R2:
                 region_name="decentralized",
                 config=BotoConfig(
                     signature_version="s3v4",
-                    retries={"max_attempts": 3, "mode": "adaptive"},
                     s3={"addressing_style": "path"},
+                    **_s3_cfg,
                 ),
             )
         else:
@@ -193,8 +201,8 @@ class R2:
                 region_name="decentralized",
                 config=BotoConfig(
                     signature_version="s3v4",
-                    retries={"max_attempts": 3, "mode": "adaptive"},
                     s3={"addressing_style": "path"},
+                    **_s3_cfg,
                 ),
             )
             self._ds_bucket = DS_BUCKET
@@ -478,6 +486,37 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _seed_king_hash(repo: str, revision: str) -> str:
+    """Compute sha256 over the king repo's safetensors so it matches the
+    `king_hash` miners encode in their on-chain commits (see miner.sha256_dir).
+
+    Falls back to the literal string "seed" if the download fails — the live
+    state can be patched later with scripts/patch_seed_king_hash.py.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory(prefix="seed_king_") as tmp:
+            snapshot_download(repo, local_dir=tmp,
+                              token=HF_TOKEN or None,
+                              revision=revision or None,
+                              allow_patterns=["*.safetensors"])
+            h = hashlib.sha256()
+            for p in sorted(Path(tmp).glob("*.safetensors")):
+                with open(p, "rb") as f:
+                    while chunk := f.read(1 << 20):
+                        h.update(chunk)
+            digest = h.hexdigest()
+            log.info("seed king_hash for %s@%s = %s",
+                     repo, (revision or "latest")[:12], digest[:16])
+            return digest
+    except Exception as exc:
+        log.warning("seed king_hash compute failed for %s: %s — using 'seed'",
+                    repo, exc)
+        return "seed"
+
+
 class State:
     def __init__(self, r2):
         self.r2 = r2
@@ -521,6 +560,21 @@ class State:
             self.history = h.get("history", [])
         log.info("loaded state: king=%s queue=%d seen=%d",
                  self.king.get("king_hash", "none")[:16], len(self.queue), len(self.seen))
+
+        if (self.king
+                and self.king.get("king_hash") == "seed"
+                and self.king.get("hf_repo")):
+            log.warning("loaded king has placeholder king_hash='seed'; "
+                        "recomputing from %s@%s ...",
+                        self.king["hf_repo"],
+                        (self.king.get("king_revision") or "latest")[:12])
+            real_hash = _seed_king_hash(self.king["hf_repo"],
+                                        self.king.get("king_revision", ""))
+            if real_hash and real_hash != "seed":
+                self.king["king_hash"] = real_hash
+                self.flush()
+                self.flush_dashboard()
+                log.info("upgraded king_hash to %s and persisted to R2", real_hash[:16])
 
     def flush(self):
         self.r2.put("state/validator_state.json", {
@@ -975,7 +1029,8 @@ async def main():
             log.info("seed king %s at revision %s", SEED_REPO, seed_revision[:12])
         except Exception:
             log.warning("could not get seed king revision from %s", SEED_REPO)
-        state.set_king(wallet.hotkey.ss58_address, SEED_REPO, "seed",
+        seed_king_hash = _seed_king_hash(SEED_REPO, seed_revision)
+        state.set_king(wallet.hotkey.ss58_address, SEED_REPO, seed_king_hash,
                        subtensor.block, king_revision=seed_revision)
 
     maybe_set_weights(subtensor, wallet, state, force=True, reason="startup")

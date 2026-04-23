@@ -56,6 +56,8 @@ DEFAULT_BOOTSTRAP_B = int(os.environ.get("EVAL_BOOTSTRAP_B", "10000"))
 
 PROBE_ENABLED = os.environ.get("TEUTONIC_PROBE_ENABLED", "1") == "1"
 
+EVAL_MAX_RUNTIME_S = int(os.environ.get("EVAL_MAX_RUNTIME_S", "1800"))
+
 
 # ---------------------------------------------------------------------------
 # Lifespan
@@ -356,9 +358,18 @@ def _run_eval(eval_id: str, req: EvalRequest):
         event_q.put({"type": "error", "data": {"error": str(e)}})
 
     finally:
-        _cleanup_hf_cache()
-        _prune_evals()
-        _eval_lock.release()
+        try:
+            _eval_lock.release()
+        except RuntimeError:
+            log.warning("eval %s: eval_lock was not held at release time", eval_id)
+        try:
+            _cleanup_hf_cache()
+        except Exception:
+            log.warning("eval %s: hf cleanup failed", eval_id, exc_info=True)
+        try:
+            _prune_evals()
+        except Exception:
+            log.warning("eval %s: prune failed", eval_id, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +386,37 @@ async def health():
         "active_evals": len(_evals),
         **_get_disk_stats(),
     }
+
+
+def _watchdog(eval_id: str, deadline: float):
+    """Force-fail an eval that overruns EVAL_MAX_RUNTIME_S.
+
+    The wedged worker thread is *not* killed (Python lacks safe thread
+    cancellation), but we mark the record failed and force-release the
+    eval lock so the validator can dispatch a fresh eval. The next call
+    to _ensure_king will reset GPU state.
+    """
+    while time.time() < deadline:
+        time.sleep(30)
+        rec = _evals.get(eval_id)
+        if rec is None or rec.get("state") in ("completed", "failed"):
+            return
+    rec = _evals.get(eval_id)
+    if rec is None or rec.get("state") in ("completed", "failed"):
+        return
+    log.error("watchdog: eval %s exceeded %ds, force-failing and releasing lock",
+              eval_id, EVAL_MAX_RUNTIME_S)
+    rec["state"] = "failed"
+    rec["error"] = f"watchdog timeout after {EVAL_MAX_RUNTIME_S}s"
+    try:
+        rec["events"].put({"type": "error",
+                           "data": {"error": rec["error"]}})
+    except Exception:
+        pass
+    try:
+        _eval_lock.release()
+    except RuntimeError:
+        pass
 
 
 @app.post("/eval")
@@ -396,6 +438,11 @@ async def start_eval(req: EvalRequest):
 
     thread = threading.Thread(target=_run_eval, args=(eval_id, req), daemon=True)
     thread.start()
+    threading.Thread(
+        target=_watchdog,
+        args=(eval_id, time.time() + EVAL_MAX_RUNTIME_S),
+        daemon=True,
+    ).start()
 
     return {"eval_id": eval_id}
 

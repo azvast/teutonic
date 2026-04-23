@@ -31,11 +31,23 @@ import json
 import logging
 import os
 import pathlib
+import socket
 import struct
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+
+# hf-xet (the Rust chunked-CDN downloader) ignores huggingface_hub's HTTP
+# timeouts and has been observed to hang for hours on partial responses,
+# wedging the eval lock. Force the plain HTTPS path which honors socket
+# timeouts via requests/urllib3. Must be set BEFORE huggingface_hub imports.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+# Conservative per-chunk read timeout for the plain HTTPS download path.
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
+# Belt-and-suspenders: any unguarded socket op blocks at most this long.
+socket.setdefaulttimeout(180)
 
 import boto3
 import numpy as np
@@ -363,10 +375,55 @@ def compute_paired_losses(king_model, chall_model, token_batches,
 # Model loading
 # ---------------------------------------------------------------------------
 
+def _prefetch_repo(repo, revision=None, timeout=600):
+    """Pre-download repo files via huggingface_hub with an explicit wall-clock
+    cap. Runs in a background thread so we can abandon a hung download (the
+    actual blocked socket can't be cancelled, but this lets the caller fail
+    fast and let the eval-server watchdog reclaim the eval lock).
+    """
+    from huggingface_hub import snapshot_download
+    import threading
+
+    result = {"path": None, "err": None}
+
+    def _do():
+        try:
+            result["path"] = snapshot_download(
+                repo_id=repo,
+                revision=revision or None,
+                token=os.environ.get("HF_TOKEN") or None,
+                allow_patterns=["*.json", "*.safetensors", "*.txt", "tokenizer*", "*.model"],
+                etag_timeout=int(os.environ.get("HF_HUB_ETAG_TIMEOUT", "30")),
+            )
+        except Exception as e:
+            result["err"] = e
+
+    t = threading.Thread(target=_do, daemon=True, name=f"hf-prefetch-{repo}")
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        raise TimeoutError(f"prefetch of {repo} exceeded {timeout}s (likely stuck CDN)")
+    if result["err"] is not None:
+        raise result["err"]
+    return result["path"]
+
+
 def load_model(repo, device, label="model", force_download=False, revision=None):
     log.info("loading %s from %s onto %s (force_download=%s, revision=%s)",
              label, repo, device, force_download, revision[:12] if revision else None)
     t0 = time.time()
+    # Pre-download with hard timeout so a stuck CDN doesn't hang the eval lock
+    # for half an hour. Skip on force_download (let from_pretrained re-pull).
+    if not force_download:
+        try:
+            _prefetch_repo(repo, revision=revision,
+                           timeout=int(os.environ.get("HF_PREFETCH_TIMEOUT", "600")))
+            log.info("%s prefetch complete in %.1fs", label, time.time() - t0)
+        except TimeoutError as e:
+            log.error("%s prefetch timed out: %s", label, e)
+            raise
+        except Exception as e:
+            log.warning("%s prefetch failed (%s), letting from_pretrained retry", label, e)
     for attn_impl in ("flash_attention_2", "sdpa", "eager"):
         try:
             model = AutoModelForCausalLM.from_pretrained(

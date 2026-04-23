@@ -7,7 +7,7 @@
 <link rel="icon" type="image/x-icon" href="favicon.ico">
 <link rel="icon" type="image/png" href="favicon.png">
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap');
 
 :root {
     --bg: #000;
@@ -17,7 +17,7 @@
     --ink-muted: #999;
     --border: 1px dashed #000;
     --border-faint: 1px dotted rgba(0,0,0,0.15);
-    --font: 'Space Mono', monospace;
+    --font: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     --saw: 8px;
 }
 
@@ -40,7 +40,9 @@ body {
     justify-content: center;
     min-height: 100vh;
     padding: 0;
-    -webkit-font-smoothing: none;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
 }
 
 .page {
@@ -121,8 +123,9 @@ table {
 }
 th {
     text-transform: uppercase;
-    font-weight: normal;
+    font-weight: 600;
     font-size: 11px;
+    letter-spacing: 0.04em;
     text-align: left;
     padding: 4px 0;
     border-bottom: var(--border);
@@ -153,6 +156,7 @@ th:last-child, td:last-child { text-align: right; }
     border: var(--border);
     color: var(--ink);
     font: 11px/1 var(--font);
+    font-weight: 600;
     text-transform: uppercase;
     padding: 3px 8px;
     cursor: pointer;
@@ -267,7 +271,7 @@ th:last-child, td:last-child { text-align: right; }
 
     <div style="text-align:center;margin-bottom:8px;">
         <img src="favicon.png" alt="Teuton" class="logo-img" style="width:80px;height:80px;margin-bottom:8px;">
-        <div class="header-title" style="font-size:20px;font-weight:bold;letter-spacing:0.1em;text-transform:uppercase;">Teutonic-I</div>
+        <div class="header-title" style="font-size:20px;font-weight:bold;letter-spacing:0.1em;text-transform:uppercase;">Teutonic-III</div>
         <div style="font-size:11px;margin-top:4px;display:flex;flex-direction:column;align-items:center;gap:4px;text-transform:uppercase;">
             <span><span id="king-health" title="King repo status"></span> KING: <a id="king-link-top" href="#" target="_blank" style="color:var(--ink);text-decoration:none;border-bottom:var(--border);">--</a> <span id="king-rev" style="opacity:0.6;"></span></span>
             <span>VALIDATOR: <a href="https://github.com/unarbos/teutonic" target="_blank" style="color:var(--ink);text-decoration:none;border-bottom:var(--border);">GitHub</a></span>
@@ -281,7 +285,7 @@ th:last-child, td:last-child { text-align: right; }
             <span id="chart-label">Perplexity</span>
             <span class="chart-controls" style="display:flex;align-items:center;gap:8px;">
                 <label style="font-weight:normal;font-size:11px;display:flex;align-items:center;cursor:default;">SMOOTH<input type="range" id="smooth-slider" min="0" max="1" step="0.05" value="0"><span id="smooth-val" style="min-width:1.8em;text-align:right;">0</span></label>
-                <button id="chart-mode-toggle" style="background:none;border:var(--border);color:var(--ink);font:11px/1 var(--font);text-transform:uppercase;padding:3px 8px;cursor:pointer;letter-spacing:0.05em;">Loss</button>
+                <button id="chart-mode-toggle" style="background:none;border:var(--border);color:var(--ink);font:600 11px/1 var(--font);text-transform:uppercase;padding:3px 8px;cursor:pointer;letter-spacing:0.05em;">Loss</button>
             </span>
         </div>
         <div class="chart-wrap">

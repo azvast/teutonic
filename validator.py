@@ -38,7 +38,7 @@ NETUID = int(os.environ.get("TEUTONIC_NETUID", "3"))
 
 # Watchdogs / anti-stuckness safeguards.
 TICK_WARN_AFTER = int(os.environ.get("TEUTONIC_TICK_WARN_AFTER", "120"))
-TICK_RESTART_AFTER = int(os.environ.get("TEUTONIC_TICK_RESTART_AFTER", "600"))
+TICK_RESTART_AFTER = int(os.environ.get("TEUTONIC_TICK_RESTART_AFTER", "1800"))
 STREAM_IDLE_WARN_AFTER = int(os.environ.get("TEUTONIC_STREAM_IDLE_WARN_AFTER", "180"))
 STREAM_IDLE_TIMEOUT = int(os.environ.get("TEUTONIC_STREAM_IDLE_TIMEOUT", "420"))
 HEALTHCHECK_INTERVAL = int(os.environ.get("TEUTONIC_HEALTHCHECK_INTERVAL", "60"))
@@ -586,6 +586,15 @@ def _now():
 
 def _monotonic_now() -> float:
     return time.monotonic()
+
+
+def _safe_block(subtensor) -> int:
+    """Best-effort current block; returns 0 if the chain call raises so the
+    dethrone path can still record a king transition without losing state."""
+    try:
+        return int(subtensor.block)
+    except Exception:
+        return 0
 
 
 def _age_seconds(ts: str | None) -> float | None:
@@ -1418,18 +1427,54 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
         topk_after = state.score_window.get("topk", [])
         top1 = topk_after[0] if topk_after else None
         prev_top1_hotkey = topk_before[0].get("hotkey") if topk_before else None
+        became_new_top1 = bool(
+            top1 and top1.get("hotkey") == hotkey
+            and top1.get("hotkey") != prev_top1_hotkey
+        )
         if top1 and top1.get("hotkey") != prev_top1_hotkey:
             log.info("top scorer changed to %s via %s (repo=%s rev=%s)",
                      top1.get("hotkey", hotkey)[:16], cid, hf_repo, challenger_revision[:12])
             state.last_winner_hotkey = top1.get("hotkey", hotkey)
-            if top1.get("hotkey") == hotkey:
-                await notify_new_king({
-                    "hotkey": hotkey,
-                    "hf_repo": hf_repo,
-                    "reign_number": state.king.get("reign_number", 0) + 1,
-                    "king_revision": challenger_revision,
-                    "previous_king": state.king.copy() if state.king else None,
-                }, verdict)
+
+        if became_new_top1:
+            # Promote immediately so the next challenger in this weight-set
+            # interval is evaluated against the new frontier (not the old
+            # n-2 king). Previously set_king only fired inside maybe_set_weights
+            # at WEIGHT_INTERVAL boundaries, which let multiple challengers all
+            # win against the same starting king within an interval.
+            prev_king_snapshot = state.king.copy() if state.king else None
+            try:
+                new_king_hash = _seed_king_hash(hf_repo, challenger_revision)
+            except Exception:
+                log.warning("failed to compute new king hash for %s@%s; "
+                            "falling back to verdict marker",
+                            hf_repo, (challenger_revision or "")[:12],
+                            exc_info=True)
+                new_king_hash = "dethrone"
+            dethrone_block = entry.get("block", 0) or _safe_block(subtensor)
+            state.set_king(
+                hotkey, hf_repo, new_king_hash,
+                dethrone_block,
+                challenge_id=cid,
+                king_revision=challenger_revision,
+            )
+            # Score-window entries were measured against the OLD king and are
+            # now stale — reset before forcing a weight-set so the inner
+            # set_king path inside maybe_set_weights is a no-op (top1 will be
+            # None, fallback_hotkey == new king hotkey).
+            state.reset_score_window(dethrone_block)
+            try:
+                maybe_set_weights(subtensor, wallet, state,
+                                   force=True, reason="dethrone")
+            except Exception:
+                log.exception("force weight-set after dethrone failed")
+            await notify_new_king({
+                "hotkey": hotkey,
+                "hf_repo": hf_repo,
+                "reign_number": state.king.get("reign_number", 0),
+                "king_revision": challenger_revision,
+                "previous_king": prev_king_snapshot,
+            }, verdict)
 
     state.flush()
     state.flush_dashboard(force=True)
@@ -1538,13 +1583,10 @@ async def main():
                     state.event({"event": "queued_batch", "count": queued_count, "kind": "new"})
 
             while state.queue:
-                if _monotonic_now() - tick_started_monotonic > TICK_RESTART_AFTER:
-                    reason = f"tick exceeded restart threshold ({_monotonic_now() - tick_started_monotonic:.0f}s)"
-                    log.error(reason)
-                    state.request_restart(reason)
-                    state.flush()
-                    state.flush_dashboard()
-                    raise RuntimeError(reason)
+                # Per-eval watchdog: reset timer for each queue item so we only
+                # restart on a single stuck/hung eval, not on legitimately processing
+                # a large queue back-to-back.
+                eval_started_monotonic = _monotonic_now()
                 entry = state.queue.pop(0)
                 is_reeval = entry.get("reeval", False)
                 state.current_eval = {
@@ -1560,8 +1602,22 @@ async def main():
                 state.flush()
                 state.note_progress(notes=f"starting queue item {entry.get('challenge_id', '?')}")
                 try:
-                    await process_challenge(state, r2, entry, subtensor, wallet,
-                                            check_stale=not is_reeval and args.seen)
+                    await asyncio.wait_for(
+                        process_challenge(state, r2, entry, subtensor, wallet,
+                                          check_stale=not is_reeval and args.seen),
+                        timeout=TICK_RESTART_AFTER,
+                    )
+                except asyncio.TimeoutError as exc:
+                    eval_elapsed = _monotonic_now() - eval_started_monotonic
+                    reason = (f"single-eval timeout: {entry.get('challenge_id')} "
+                              f"exceeded {TICK_RESTART_AFTER}s (took {eval_elapsed:.0f}s)")
+                    log.error(reason)
+                    state.set_phase("eval_timeout", challenge_id=entry.get("challenge_id"),
+                                    notes=reason)
+                    state.flush_dashboard()
+                    state.request_restart(reason)
+                    state.flush()
+                    raise RuntimeError(reason)
                 except Exception as exc:
                     log.exception("eval failed: %s", entry.get("challenge_id"))
                     is_transient, transient_reason = _is_transient_eval_error(exc)

@@ -17,6 +17,7 @@ try:
     market = data.get("market", {})
     current = data.get("current_eval")
 
+    score_window = data.get("score_window", {})
     out = {
         "updated_at": data.get("updated_at"),
         "king": {
@@ -26,6 +27,22 @@ try:
             "crowned_at": king.get("crowned_at"),
         },
         "stats": stats,
+        "score_window": {
+            "window_id": score_window.get("window_id"),
+            "started_at": score_window.get("started_at"),
+            "started_block": score_window.get("started_block"),
+            "top3": [
+                {
+                    "hotkey": e.get("hotkey", "")[:16] + "...",
+                    "repo": e.get("challenger_repo"),
+                    "mu_hat": e.get("mu_hat"),
+                    "lcb": e.get("lcb"),
+                    "challenge_id": e.get("challenge_id"),
+                }
+                for e in score_window.get("topk", [])[:3]
+            ],
+            "last_weight_set": score_window.get("last_weight_set"),
+        },
         "queue_length": len(queue),
         "queue": [
             {"id": e.get("challenge_id"), "repo": e.get("hf_repo"),

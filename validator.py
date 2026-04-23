@@ -14,6 +14,7 @@ import os
 import signal
 import sys
 import time
+from copy import deepcopy
 from datetime import datetime, timezone
 
 import bittensor as bt
@@ -34,6 +35,15 @@ SEQ_LEN = 2048
 POLL_INTERVAL = 30
 WEIGHT_INTERVAL = 300
 NETUID = int(os.environ.get("TEUTONIC_NETUID", "3"))
+
+# Watchdogs / anti-stuckness safeguards.
+TICK_WARN_AFTER = int(os.environ.get("TEUTONIC_TICK_WARN_AFTER", "120"))
+TICK_RESTART_AFTER = int(os.environ.get("TEUTONIC_TICK_RESTART_AFTER", "600"))
+STREAM_IDLE_WARN_AFTER = int(os.environ.get("TEUTONIC_STREAM_IDLE_WARN_AFTER", "180"))
+STREAM_IDLE_TIMEOUT = int(os.environ.get("TEUTONIC_STREAM_IDLE_TIMEOUT", "420"))
+HEALTHCHECK_INTERVAL = int(os.environ.get("TEUTONIC_HEALTHCHECK_INTERVAL", "60"))
+STATE_FLUSH_INTERVAL = int(os.environ.get("TEUTONIC_STATE_FLUSH_INTERVAL", "60"))
+MAX_CONSECUTIVE_TICK_ERRORS = int(os.environ.get("TEUTONIC_MAX_CONSECUTIVE_TICK_ERRORS", "10"))
 NETWORK = os.environ.get("TEUTONIC_NETWORK", "finney")
 SEED_REPO = os.environ.get("TEUTONIC_SEED_REPO", "unconst/Teutonic-III")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
@@ -72,6 +82,19 @@ REPO_PATTERN = r"^[^/]+/Teutonic-III-.+$"
 TMC_BASE = "https://api.taomarketcap.com/public/v1"
 
 log = logging.getLogger("teutonic")
+
+TOPK_WEIGHTS = [0.75, 0.19, 0.06]
+
+# Dashboard/Hippius writes are non-critical presentation updates. Keep them
+# off the hot path and fail open when the public endpoint is degraded.
+DASHBOARD_FLUSH_MIN_INTERVAL = float(os.environ.get("TEUTONIC_DASHBOARD_FLUSH_MIN_INTERVAL", "5"))
+HIPPIUS_COOLDOWN_SECONDS = int(os.environ.get("TEUTONIC_HIPPIUS_COOLDOWN_SECONDS", "300"))
+
+# Transient infra-side failures should not lose queue priority. If an eval
+# fails because the eval server/stream/watchdog got wedged, requeue the same
+# challenge at the front a bounded number of times before falling back to a
+# normal recorded failure.
+MAX_TRANSIENT_EVAL_RETRIES = int(os.environ.get("TEUTONIC_MAX_TRANSIENT_EVAL_RETRIES", "3"))
 
 
 # ---------------------------------------------------------------------------
@@ -211,29 +234,50 @@ class R2:
             self._ds_client = None
             self._ds_bucket = None
 
+    def _hippius_available(self):
+        if not self._hippius:
+            return False
+        retry_after = getattr(self, "_hippius_retry_after", 0.0)
+        return time.monotonic() >= retry_after
+
+    def _mark_hippius_failure(self, key, exc):
+        self._hippius_retry_after = time.monotonic() + HIPPIUS_COOLDOWN_SECONDS
+        log.warning(
+            "Hippius dashboard write failed for %s; cooling down for %ss and falling back to R2: %s",
+            key,
+            HIPPIUS_COOLDOWN_SECONDS,
+            exc,
+        )
+
+    def _put_dashboard_bytes(self, key, body, content_type):
+        if self._hippius_available():
+            try:
+                self._hippius.put_object(
+                    Bucket=HIPPIUS_BUCKET,
+                    Key=key,
+                    Body=body,
+                    ContentType=content_type,
+                )
+                return
+            except Exception as exc:
+                self._mark_hippius_failure(key, exc)
+
+        try:
+            self.client.put_object(
+                Bucket=R2_BUCKET,
+                Key=key,
+                Body=body,
+                ContentType=content_type,
+            )
+        except Exception:
+            log.warning("dashboard fallback put failed for %s (non-fatal)", key, exc_info=True)
+
     def put_dashboard(self, key, data):
         body = json.dumps(data, default=str).encode()
-        ct = "application/json"
-        if self._hippius:
-            self._hippius.put_object(
-                Bucket=HIPPIUS_BUCKET, Key=key, Body=body, ContentType=ct,
-            )
-        else:
-            self.client.put_object(
-                Bucket=R2_BUCKET, Key=key, Body=body, ContentType=ct,
-            )
+        self._put_dashboard_bytes(key, body, "application/json")
 
     def put_dashboard_raw(self, key, body, content_type):
-        if self._hippius:
-            self._hippius.put_object(
-                Bucket=HIPPIUS_BUCKET, Key=key, Body=body,
-                ContentType=content_type,
-            )
-        else:
-            self.client.put_object(
-                Bucket=R2_BUCKET, Key=key, Body=body,
-                ContentType=content_type,
-            )
+        self._put_dashboard_bytes(key, body, content_type)
 
     def put(self, key, data):
         try:
@@ -428,18 +472,53 @@ def scan_reveals(subtensor, netuid, seen):
     return new
 
 
-def set_weights(subtensor, wallet, netuid, king_hotkey) -> bool:
-    """Set 100% weight to *king_hotkey*. Returns True on success."""
+def _rank_sort_key(entry: dict):
+    return (
+        -(entry.get("mu_hat") or 0),
+        -(entry.get("lcb") or 0),
+        entry.get("avg_challenger_loss") or float("inf"),
+        entry.get("timestamp") or "",
+    )
+
+
+def _normalize_weights(base_weights, n):
+    weights = list(base_weights[:n])
+    if not weights:
+        return []
+    total = sum(weights)
+    if total <= 0:
+        return []
+    return [w / total for w in weights]
+
+
+def set_weights(subtensor, wallet, netuid, ranked_hotkeys, ranked_weights) -> bool:
+    """Set weights across one or more ranked hotkeys. Returns True on success."""
     try:
         meta = subtensor.metagraph(netuid)
-        if king_hotkey in meta.hotkeys:
-            uid = meta.hotkeys.index(king_hotkey)
-            subtensor.set_weights(wallet=wallet, netuid=netuid, uids=[uid], weights=[1.0])
-            log.info("weights set 100%% to uid=%d (%s)", uid, king_hotkey[:16])
-            return True
-        else:
-            log.warning("king hotkey %s not in metagraph", king_hotkey[:16])
+        hotkeys = list(getattr(meta, "hotkeys", []))
+        chosen = []
+        missing = []
+        for hotkey, weight in zip(ranked_hotkeys, ranked_weights):
+            if hotkey in hotkeys:
+                chosen.append((hotkeys.index(hotkey), float(weight), hotkey))
+            else:
+                missing.append(hotkey)
+        if missing:
+            log.warning("weight-set dropping missing hotkeys: %s",
+                        ", ".join(h[:16] for h in missing))
+        if not chosen:
+            log.warning("no eligible ranked hotkeys present in metagraph for weight set")
             return False
+        total = sum(weight for _, weight, _ in chosen)
+        if total <= 0:
+            log.warning("ranked weight total is zero")
+            return False
+        uids = [uid for uid, _, _ in chosen]
+        weights = [weight / total for _, weight, _ in chosen]
+        subtensor.set_weights(wallet=wallet, netuid=netuid, uids=uids, weights=weights)
+        log.info("weights set to %s",
+                 ", ".join(f"uid={uid}:{weight:.6f}:{hotkey[:16]}" for (uid, _raw, hotkey), weight in zip(chosen, weights)))
+        return True
     except Exception:
         log.exception("failed to set weights")
         return False
@@ -447,13 +526,9 @@ def set_weights(subtensor, wallet, netuid, king_hotkey) -> bool:
 
 def maybe_set_weights(subtensor, wallet, state, *, force: bool = False,
                       reason: str = "") -> bool:
-    """Set weights to the current king if forced or WEIGHT_INTERVAL has elapsed.
-
-    Always uses ``state.king["hotkey"]`` as the source of truth so the chain
-    keeps tracking the current top miner even when no new dethrone fires.
-    """
-    king_hotkey = state.king.get("hotkey") if state.king else None
-    if not king_hotkey:
+    """Set weights to the current top-3 scoreboard if forced or interval elapsed."""
+    fallback_hotkey = state.king.get("hotkey") if state.king else None
+    if not fallback_hotkey:
         if force:
             log.info("skipping weight set (%s): no king yet", reason or "forced")
         return False
@@ -464,14 +539,37 @@ def maybe_set_weights(subtensor, wallet, state, *, force: bool = False,
         return False
     if not force and current_block - state.last_weight_block < WEIGHT_INTERVAL:
         return False
-    log.info("setting weights at block %d (last=%d, %s) to king %s",
+
+    ranked = state.topk_for_weight_set()
+    ranked_hotkeys = [e["hotkey"] for e in ranked]
+    ranked_weights = _normalize_weights(TOPK_WEIGHTS, len(ranked_hotkeys))
+    if not ranked_hotkeys:
+        ranked_hotkeys = [fallback_hotkey]
+        ranked_weights = [1.0]
+
+    log.info("setting weights at block %d (last=%d, %s) to %s",
              current_block, state.last_weight_block,
-             reason or ("forced" if force else "interval"), king_hotkey[:16])
-    if set_weights(subtensor, wallet, NETUID, king_hotkey):
+             reason or ("forced" if force else "interval"),
+             ", ".join(f"{hk[:16]}:{w:.6f}" for hk, w in zip(ranked_hotkeys, ranked_weights)))
+    if set_weights(subtensor, wallet, NETUID, ranked_hotkeys, ranked_weights):
         state.last_weight_block = current_block
-        state.last_winner_hotkey = king_hotkey
+        state.last_winner_hotkey = ranked_hotkeys[0]
+        top1 = ranked[0] if ranked else None
+        if top1:
+            revision = top1.get("challenger_revision") or state.best_known_revision(top1.get("hotkey", ""), top1.get("challenger_repo", ""))
+            state.set_king(
+                top1.get("hotkey", fallback_hotkey),
+                top1.get("challenger_repo", state.king.get("hf_repo", "")),
+                state.king.get("king_hash", ""),
+                current_block,
+                top1.get("challenge_id", "weight-set"),
+                king_revision=revision or state.king.get("king_revision", ""),
+            )
+        state.note_weight_set(current_block, ranked_hotkeys, ranked_weights, reason or ("forced" if force else "interval"))
         try:
+            state.reset_score_window(current_block)
             state.flush()
+            state.flush_dashboard()
         except Exception:
             log.exception("failed to flush state after weight set")
         return True
@@ -484,6 +582,19 @@ def maybe_set_weights(subtensor, wallet, state, *, force: bool = False,
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _monotonic_now() -> float:
+    return time.monotonic()
+
+
+def _age_seconds(ts: str | None) -> float | None:
+    if not ts:
+        return None
+    try:
+        return max(0.0, datetime.now(timezone.utc).timestamp() - datetime.fromisoformat(ts).timestamp())
+    except Exception:
+        return None
 
 
 def _seed_king_hash(repo: str, revision: str) -> str:
@@ -533,6 +644,31 @@ class State:
         self.last_winner_hotkey: str | None = None
         self.market: dict | None = None
         self.uid_map: dict[str, int] = {}
+        self.score_window = {
+            "window_id": "window-0000",
+            "started_at": _now(),
+            "started_block": 0,
+            "accepted_by_hotkey": {},
+            "topk": [],
+            "last_weight_set": None,
+        }
+        self.known_revisions: dict[str, dict[str, str]] = {}
+        self.watchdog = {
+            "started_at": _now(),
+            "last_tick_started_at": None,
+            "last_tick_completed_at": None,
+            "last_progress_at": None,
+            "last_state_flush_at": None,
+            "last_dashboard_flush_at": None,
+            "phase": "startup",
+            "phase_since": _now(),
+            "current_challenge_id": None,
+            "current_eval_id": None,
+            "consecutive_tick_errors": 0,
+            "restart_requested": False,
+            "restart_reason": "",
+            "notes": "",
+        }
 
     def load(self):
         k = self.r2.get("king/current.json")
@@ -555,9 +691,22 @@ class State:
             self.counter = st.get("counter", 0)
             self.last_weight_block = st.get("last_weight_block", 0)
             self.last_winner_hotkey = st.get("last_winner_hotkey")
+            loaded_window = st.get("score_window")
+            if loaded_window:
+                loaded_window.setdefault("window_id", "window-0000")
+                loaded_window.setdefault("started_at", _now())
+                loaded_window.setdefault("started_block", self.last_weight_block)
+                loaded_window.setdefault("accepted_by_hotkey", {})
+                loaded_window.setdefault("topk", [])
+                loaded_window.setdefault("last_weight_set", None)
+                self.score_window = loaded_window
+            self.known_revisions = st.get("known_revisions", {})
         h = self.r2.get("state/dashboard_history.json")
         if h:
             self.history = h.get("history", [])
+        wd = self.r2.get("state/watchdog.json")
+        if wd:
+            self.watchdog.update(wd)
         log.info("loaded state: king=%s queue=%d seen=%d",
                  self.king.get("king_hash", "none")[:16], len(self.queue), len(self.seen))
 
@@ -573,22 +722,27 @@ class State:
             if real_hash and real_hash != "seed":
                 self.king["king_hash"] = real_hash
                 self.flush()
-                self.flush_dashboard()
+                self.flush_dashboard(force=True)
                 log.info("upgraded king_hash to %s and persisted to R2", real_hash[:16])
 
     def flush(self):
+        now = _now()
+        self.watchdog["last_state_flush_at"] = now
         self.r2.put("state/validator_state.json", {
             "king": self.king, "queue": self.queue,
             "stats": self.stats, "counter": self.counter,
             "last_weight_block": self.last_weight_block,
             "last_winner_hotkey": self.last_winner_hotkey,
-            "updated_at": _now(),
+            "score_window": self.score_window,
+            "known_revisions": self.known_revisions,
+            "updated_at": now,
         })
-        self.r2.put("state/queue.json", {"pending": self.queue, "updated_at": _now()})
+        self.r2.put("state/queue.json", {"pending": self.queue, "updated_at": now})
         self.r2.put("king/current.json", self.king)
         self.r2.put("state/seen_hotkeys.json", {
-            "hotkeys": sorted(self.seen), "updated_at": _now(),
+            "hotkeys": sorted(self.seen), "updated_at": now,
         })
+        self.r2.put("state/watchdog.json", self.watchdog)
 
     def event(self, data):
         data.setdefault("timestamp", _now())
@@ -619,14 +773,135 @@ class State:
             log.info("skipping %s: already evaluated this cycle", repo)
             return None
         cid = self.next_id()
-        entry = {"challenge_id": cid, **reveal, "queued_at": _now()}
+        entry = {"challenge_id": cid, **reveal, "queued_at": _now(), "retry_count": int(reveal.get("retry_count", 0))}
         self.queue.append(entry)
         self.stats["queued"] += 1
         if not defer_flush:
             self.flush()
-            self.flush_dashboard()
+            self.flush_dashboard(force=True)
             self.event({"event": "queued", **entry})
         return cid
+
+    def requeue_front(self, entry, *, reason: str, error_code: str = "", error_detail: str = ""):
+        """Requeue an existing challenge at the front for transient infra failures.
+
+        Keeps challenge_id and original repo/hotkey, increments retry_count,
+        refreshes queued_at, and avoids duplicating the same repo if it's already
+        pending elsewhere in the queue.
+        """
+        repo = entry.get("hf_repo", "")
+        retry_count = int(entry.get("retry_count", 0)) + 1
+        new_entry = {**entry, "retry_count": retry_count, "queued_at": _now(), "reeval": False}
+
+        deduped = []
+        for existing in self.queue:
+            if existing.get("hf_repo") == repo:
+                continue
+            deduped.append(existing)
+        self.queue = [new_entry] + deduped
+        self.current_eval = None
+        self.flush()
+        self.flush_dashboard(force=True)
+        self.event({
+            "event": "requeued_front",
+            "challenge_id": entry.get("challenge_id", "?"),
+            "hotkey": entry.get("hotkey", ""),
+            "hf_repo": repo,
+            "retry_count": retry_count,
+            "reason": reason,
+            "error_code": error_code,
+            "error_detail": str(error_detail),
+        })
+        log.warning("re-queued %s at front (retry %d/%d) due to %s: %s",
+                    entry.get("challenge_id", "?"), retry_count,
+                    MAX_TRANSIENT_EVAL_RETRIES, reason, error_detail)
+        return retry_count
+
+    def remember_revision(self, hotkey, repo, revision):
+        if not hotkey:
+            return
+        self.known_revisions[hotkey] = {
+            "repo": repo,
+            "revision": revision,
+            "updated_at": _now(),
+        }
+
+    def best_known_revision(self, hotkey, repo=""):
+        info = self.known_revisions.get(hotkey, {})
+        if repo and info.get("repo") and info.get("repo") != repo:
+            return ""
+        return info.get("revision", "")
+
+    def _best_of(self, entries):
+        return sorted(entries, key=_rank_sort_key)[0] if entries else None
+
+    def recompute_topk(self):
+        accepted = list(self.score_window.get("accepted_by_hotkey", {}).values())
+        ranked = sorted(accepted, key=_rank_sort_key)
+        self.score_window["topk"] = ranked[: len(TOPK_WEIGHTS)]
+        return self.score_window["topk"]
+
+    def record_accepted_result(self, verdict, challenger_repo, hotkey, block=0):
+        entry = {
+            "challenge_id": verdict["challenge_id"],
+            "hotkey": hotkey,
+            "uid": self.uid_map.get(hotkey, "?"),
+            "challenger_repo": challenger_repo,
+            "challenger_revision": verdict.get("challenger_revision", self.best_known_revision(hotkey, challenger_repo)),
+            "mu_hat": verdict.get("mu_hat", 0),
+            "lcb": verdict.get("lcb", 0),
+            "avg_challenger_loss": verdict.get("avg_challenger_loss", 0),
+            "avg_king_loss": verdict.get("avg_king_loss", 0),
+            "verdict": verdict.get("verdict", "accepted"),
+            "accepted": True,
+            "timestamp": verdict.get("timestamp", _now()),
+            "block": block,
+        }
+        existing = self.score_window.setdefault("accepted_by_hotkey", {}).get(hotkey)
+        if existing is None or _rank_sort_key(entry) < _rank_sort_key(existing):
+            self.score_window["accepted_by_hotkey"][hotkey] = entry
+        return self.recompute_topk()
+
+    def topk_for_weight_set(self):
+        ranked = []
+        seen_hotkeys = set()
+        for entry in sorted(self.score_window.get("accepted_by_hotkey", {}).values(), key=_rank_sort_key):
+            hotkey = entry.get("hotkey")
+            if not hotkey or hotkey in seen_hotkeys:
+                continue
+            if hotkey not in self.uid_map:
+                continue
+            ranked.append(entry)
+            seen_hotkeys.add(hotkey)
+            if len(ranked) >= len(TOPK_WEIGHTS):
+                break
+        return ranked
+
+    def note_weight_set(self, block, ranked_hotkeys, ranked_weights, reason):
+        self.score_window["last_weight_set"] = {
+            "timestamp": _now(),
+            "block": block,
+            "reason": reason,
+            "ranked_hotkeys": ranked_hotkeys,
+            "ranked_weights": ranked_weights,
+        }
+
+    def reset_score_window(self, current_block):
+        prev_num = 0
+        wid = self.score_window.get("window_id", "window-0000")
+        try:
+            prev_num = int(str(wid).split("-")[-1])
+        except Exception:
+            prev_num = 0
+        self.score_window = {
+            "window_id": f"window-{prev_num + 1:04d}",
+            "started_at": _now(),
+            "started_block": current_block,
+            "accepted_by_hotkey": {},
+            "topk": [],
+            "last_weight_set": self.score_window.get("last_weight_set"),
+        }
+        self.evaluated_repos.clear()
 
     def set_king(self, hotkey, hf_repo, king_hash, block, challenge_id="seed",
                   king_revision=""):
@@ -647,7 +922,7 @@ class State:
             "previous_king": prev,
         }
         self.flush()
-        self.flush_dashboard()
+        self.flush_dashboard(force=True)
         self.event({"event": "king_changed", "hotkey": hotkey, "reign": reign,
                      "challenge_id": challenge_id})
 
@@ -722,27 +997,89 @@ class State:
                 log.info("queued %s from %s (re-eval)", cid, rev["hotkey"][:16])
         if count:
             self.flush()
-            self.flush_dashboard()
+            self.flush_dashboard(force=True)
             self.event({"event": "replenish_reeval", "count": count})
             log.info("replenished queue with %d re-eval candidates", count)
         return count
 
-    def flush_dashboard(self):
-        payload = {
-            "updated_at": _now(),
-            "king": self.king,
-            "stats": self.stats,
-            "current_eval": self.current_eval,
-            "queue": [{"challenge_id": e.get("challenge_id"), "hotkey": e.get("hotkey"),
-                        "uid": self.uid_map.get(e.get("hotkey", ""), "?"),
-                        "hf_repo": e.get("hf_repo"), "queued_at": e.get("queued_at"),
-                        "block": e.get("block"), "reeval": e.get("reeval", False)}
-                       for e in self.queue],
-            "history": self.history,
-        }
-        if self.market:
-            payload["market"] = self.market
-        self.r2.put_dashboard("dashboard.json", payload)
+    def flush_dashboard(self, *, force: bool = False):
+        # Dashboard flush is presentational: it MUST NEVER raise into the main
+        # eval loop. A Hippius/R2 outage here used to propagate up through
+        # process_challenge and get logged as `eval failed:` even though the
+        # eval verdict had already been recorded. Catch absolutely everything.
+        try:
+            now_monotonic = _monotonic_now()
+            last_flush = getattr(self, "_last_dashboard_flush_monotonic", 0.0)
+            if not force and (now_monotonic - last_flush) < DASHBOARD_FLUSH_MIN_INTERVAL:
+                return False
+
+            self._last_dashboard_flush_monotonic = now_monotonic
+            self.watchdog["last_dashboard_flush_at"] = _now()
+            payload = {
+                "updated_at": _now(),
+                "king": self.king,
+                "stats": self.stats,
+                "current_eval": self.current_eval,
+                "watchdog": self.watchdog,
+                "score_window": self.score_window,
+                "queue": [{"challenge_id": e.get("challenge_id"), "hotkey": e.get("hotkey"),
+                            "uid": self.uid_map.get(e.get("hotkey", ""), "?"),
+                            "hf_repo": e.get("hf_repo"), "queued_at": e.get("queued_at"),
+                            "block": e.get("block"), "reeval": e.get("reeval", False)}
+                           for e in self.queue],
+                "history": self.history,
+            }
+            if self.market:
+                payload["market"] = self.market
+            self.r2.put_dashboard("dashboard.json", payload)
+            return True
+        except Exception:
+            log.warning("flush_dashboard failed (non-fatal, eval continues)", exc_info=True)
+            return False
+
+    def set_phase(self, phase: str, *, challenge_id: str | None = None,
+                  eval_id: str | None = None, notes: str = ""):
+        now = _now()
+        self.watchdog.update({
+            "phase": phase,
+            "phase_since": now,
+            "notes": notes,
+        })
+        if challenge_id is not None:
+            self.watchdog["current_challenge_id"] = challenge_id
+        if eval_id is not None:
+            self.watchdog["current_eval_id"] = eval_id
+
+    def note_progress(self, *, notes: str = ""):
+        now = _now()
+        self.watchdog["last_progress_at"] = now
+        if notes:
+            self.watchdog["notes"] = notes
+
+    def begin_tick(self):
+        now = _now()
+        self.watchdog["last_tick_started_at"] = now
+        self.set_phase("tick", notes="validator tick started")
+
+    def complete_tick(self):
+        now = _now()
+        self.watchdog["last_tick_completed_at"] = now
+        self.watchdog["consecutive_tick_errors"] = 0
+        self.set_phase("sleep", notes="validator tick completed")
+
+    def fail_tick(self, reason: str):
+        self.watchdog["consecutive_tick_errors"] = self.watchdog.get("consecutive_tick_errors", 0) + 1
+        self.set_phase("tick_error", notes=reason)
+
+    def request_restart(self, reason: str):
+        self.watchdog["restart_requested"] = True
+        self.watchdog["restart_reason"] = reason
+        self.set_phase("restart_requested", notes=reason)
+        self.event({"event": "watchdog_restart_requested", "reason": reason})
+
+    def clear_restart_request(self):
+        self.watchdog["restart_requested"] = False
+        self.watchdog["restart_reason"] = ""
 
 
 
@@ -787,11 +1124,72 @@ def check_king_alive(state):
 # Main
 # ---------------------------------------------------------------------------
 
+async def _stream_events_with_idle_watchdog(stream, state, cid):
+    # IMPORTANT: bind the iterator ONCE outside the loop. httpx's aiter_lines()
+    # returns iterators that share the underlying stream — calling it more than
+    # once on the same response raises StreamConsumed on subsequent iterators.
+    # Re-creating it per loop iteration was the cause of the validator losing
+    # every eval after the first HEALTHCHECK_INTERVAL tick.
+    line_iter = stream.aiter_lines()
+    last_event_monotonic = _monotonic_now()
+    warned = False
+    while True:
+        try:
+            line = await asyncio.wait_for(line_iter.__anext__(), timeout=HEALTHCHECK_INTERVAL)
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError:
+            idle = _monotonic_now() - last_event_monotonic
+            if idle >= STREAM_IDLE_TIMEOUT:
+                raise TimeoutError(f"{cid}: eval stream idle for {idle:.0f}s")
+            if idle >= STREAM_IDLE_WARN_AFTER and not warned:
+                warned = True
+                log.warning("%s: eval stream idle for %.0fs", cid, idle)
+                state.event({"event": "eval_stream_idle_warning", "challenge_id": cid,
+                             "idle_s": round(idle, 1)})
+                state.set_phase("eval_stream_idle", challenge_id=cid,
+                                notes=f"idle {idle:.0f}s waiting for eval stream")
+                state.flush_dashboard()
+            continue
+        last_event_monotonic = _monotonic_now()
+        warned = False
+        yield line
+
+
+def _is_transient_eval_error(exc: Exception | str) -> tuple[bool, str]:
+    text = str(exc).lower()
+    transient_markers = (
+        "eval server error",
+        "internal error",
+        "stream idle",
+        "watchdog timeout",
+        "timed out",
+        "timeout",
+        "server disconnected",
+        "connection reset",
+        "connecterror",
+        "readerror",
+        "remoteprotocolerror",
+        "streamconsumed",
+        "streamclosed",
+        "streamerror",
+        "503",
+        "502",
+        "504",
+    )
+    for marker in transient_markers:
+        if marker in text:
+            return True, marker
+    return False, ""
+
+
 async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=True):
     cid = entry["challenge_id"]
     hotkey = entry["hotkey"]
     hf_repo = entry["hf_repo"]
     log.info("processing %s from %s repo=%s", cid, hotkey[:16], hf_repo)
+    state.set_phase("process_challenge", challenge_id=cid, notes=f"processing {hf_repo}")
+    state.note_progress(notes=f"started processing {cid}")
 
     king_hotkey = state.king.get("hotkey", "")
     if king_hotkey and hotkey == king_hotkey:
@@ -815,8 +1213,10 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
             return
 
     try:
+        state.set_phase("hf_metadata", challenge_id=cid, notes=f"resolving {hf_repo}@main")
         challenger_info = HfApi(token=HF_TOKEN or None).model_info(hf_repo, revision="main")
         challenger_revision = challenger_info.sha
+        state.remember_revision(hotkey, hf_repo, challenger_revision)
         log.info("challenger %s pinned at revision %s", hf_repo, challenger_revision[:12])
     except Exception as exc:
         log.warning("cannot get commit SHA for %s, skipping", hf_repo)
@@ -824,6 +1224,7 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
         state.record_failure(entry, "hf_metadata_error", str(exc))
         return
 
+    state.set_phase("validate_config", challenge_id=cid, notes=f"validating {hf_repo}")
     rejection = validate_challenger_config(
         hf_repo, challenger_revision,
         king_repo=state.king.get("hf_repo", ""),
@@ -844,6 +1245,7 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
     except Exception:
         pass
 
+    state.set_phase("dataset_manifest", challenge_id=cid, notes="fetching dataset manifest")
     manifest = None
     manifest_attempts = 4
     for attempt in range(manifest_attempts):
@@ -871,6 +1273,7 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
     king_repo = state.king.get("hf_repo", SEED_REPO)
     king_revision = state.king.get("king_revision", "")
 
+    state.set_phase("dispatch_eval", challenge_id=cid, notes=f"dispatching {cid} to eval server")
     r2.put(f"eval/{cid}/meta.json", {
         "challenge_id": cid, "king_repo": king_repo,
         "king_revision": king_revision,
@@ -886,7 +1289,7 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
         "avg_king_loss": 0, "avg_challenger_loss": 0,
         "started_at": _now(),
     }
-    state.flush_dashboard()
+    state.flush_dashboard(force=True)
 
     verdict = None
     async with httpx.AsyncClient(timeout=httpx.Timeout(1800.0, connect=30.0)) as client:
@@ -907,6 +1310,8 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
 
         max_busy_retries = 20
         for attempt in range(max_busy_retries):
+            state.set_phase("eval_dispatch_wait", challenge_id=cid,
+                            notes=f"dispatch attempt {attempt + 1}/{max_busy_retries}")
             resp = await client.post(f"{EVAL_SERVER_URL}/eval", json=eval_payload)
             if resp.status_code != 409:
                 break
@@ -919,22 +1324,27 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
             state.queue.insert(0, entry)
             state.current_eval = None
             state.flush()
-            state.flush_dashboard()
+            state.flush_dashboard(force=True)
             return
 
         resp.raise_for_status()
         eval_id = resp.json()["eval_id"]
+        state.set_phase("eval_stream", challenge_id=cid, eval_id=eval_id,
+                        notes=f"streaming eval {eval_id}")
+        state.note_progress(notes=f"eval {eval_id} started")
+        state.flush_dashboard(force=True)
         log.info("eval %s dispatched to eval server as %s", cid, eval_id)
 
         async with client.stream("GET", f"{EVAL_SERVER_URL}/eval/{eval_id}/stream",
                                   timeout=httpx.Timeout(1800.0)) as stream:
-            async for line in stream.aiter_lines():
+            async for line in _stream_events_with_idle_watchdog(stream, state, cid):
                 if not line.startswith("data: "):
                     continue
                 event = json.loads(line[6:])
 
                 if event["type"] == "progress":
                     d = event["data"]
+                    state.note_progress(notes=f"eval {eval_id} progress {d.get('done', 0)}/{d.get('total', EVAL_N)}")
                     state.current_eval.update({
                         "progress": d.get("done", 0),
                         "total": d.get("total", EVAL_N),
@@ -945,8 +1355,10 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
                     state.flush_dashboard()
 
                 elif event["type"] == "verdict":
+                    state.note_progress(notes=f"eval {eval_id} produced verdict")
                     verdict = event["data"]
                     verdict["challenge_id"] = cid
+                    verdict["challenger_revision"] = challenger_revision
                     break
 
                 elif event["type"] == "error":
@@ -961,6 +1373,7 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
              verdict.get("delta", 0), verdict["wall_time_s"])
 
     state.current_eval = None
+    state.set_phase("post_eval", challenge_id=cid, notes="recording verdict")
     state.evaluated_repos.add(hf_repo)
     state.record_verdict(verdict, hf_repo, hotkey)
 
@@ -970,22 +1383,31 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
     else:
         state.stats["rejected"] += 1
 
-    state.flush_dashboard()
+    state.flush_dashboard(force=True)
     state.event({"event": "eval_completed", "challenge_id": cid,
                  "hotkey": hotkey, "accepted": accepted, **verdict})
 
     if accepted:
-        log.info("DETHRONE! %s wins via %s (repo=%s rev=%s)",
-                 hotkey[:16], cid, hf_repo, challenger_revision[:12])
-        state.set_king(hotkey, hf_repo, entry.get("model_hash", ""),
-                       entry.get("block", 0), cid,
-                       king_revision=challenger_revision)
-        state.last_winner_hotkey = hotkey
-        await notify_new_king(state.king, verdict)
-        maybe_set_weights(subtensor, wallet, state, force=True,
-                          reason=f"new king via {cid}")
+        topk_before = deepcopy(state.score_window.get("topk", []))
+        state.record_accepted_result(verdict, hf_repo, hotkey, entry.get("block", 0))
+        topk_after = state.score_window.get("topk", [])
+        top1 = topk_after[0] if topk_after else None
+        prev_top1_hotkey = topk_before[0].get("hotkey") if topk_before else None
+        if top1 and top1.get("hotkey") != prev_top1_hotkey:
+            log.info("top scorer changed to %s via %s (repo=%s rev=%s)",
+                     top1.get("hotkey", hotkey)[:16], cid, hf_repo, challenger_revision[:12])
+            state.last_winner_hotkey = top1.get("hotkey", hotkey)
+            if top1.get("hotkey") == hotkey:
+                await notify_new_king({
+                    "hotkey": hotkey,
+                    "hf_repo": hf_repo,
+                    "reign_number": state.king.get("reign_number", 0) + 1,
+                    "king_revision": challenger_revision,
+                    "previous_king": state.king.copy() if state.king else None,
+                }, verdict)
 
     state.flush()
+    state.flush_dashboard(force=True)
 
 
 async def main():
@@ -1012,7 +1434,7 @@ async def main():
     wallet = bt.wallet(name=WALLET_NAME, hotkey=WALLET_HOTKEY)
     subtensor = bt.subtensor(network=NETWORK)
     state.refresh_uid_map(subtensor, NETUID)
-    state.flush_dashboard()
+    state.flush_dashboard(force=True)
 
     html_path = os.path.join(os.path.dirname(__file__) or ".", "index.html")
     if os.path.exists(html_path):
@@ -1033,6 +1455,7 @@ async def main():
         state.set_king(wallet.hotkey.ss58_address, SEED_REPO, seed_king_hash,
                        subtensor.block, king_revision=seed_revision)
 
+    state.clear_restart_request()
     maybe_set_weights(subtensor, wallet, state, force=True, reason="startup")
 
     # Verify eval server is reachable
@@ -1056,18 +1479,26 @@ async def main():
              EVAL_SERVER_URL, POLL_INTERVAL)
 
     while True:
+        tick_started_monotonic = _monotonic_now()
+        state.begin_tick()
         try:
             if not check_king_alive(state):
                 log.warning("king repo check failed, skipping this tick")
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
+            if _monotonic_now() - tick_started_monotonic > TICK_WARN_AFTER:
+                log.warning("tick already running for %.0fs before uid refresh",
+                            _monotonic_now() - tick_started_monotonic)
+            state.set_phase("refresh_uid_map", notes="refreshing metagraph uid map")
             state.refresh_uid_map(subtensor, NETUID)
 
+            state.set_phase("fetch_market_data", notes="fetching TaoMarketCap data")
             tmc = await fetch_tmc_data()
             if tmc:
                 state.market = tmc
 
+            state.set_phase("scan_reveals", notes="polling chain for reveals")
             reveals = scan_reveals(subtensor, NETUID, state.seen)
             if reveals:
                 queued_count = 0
@@ -1082,6 +1513,13 @@ async def main():
                     state.event({"event": "queued_batch", "count": queued_count, "kind": "new"})
 
             while state.queue:
+                if _monotonic_now() - tick_started_monotonic > TICK_RESTART_AFTER:
+                    reason = f"tick exceeded restart threshold ({_monotonic_now() - tick_started_monotonic:.0f}s)"
+                    log.error(reason)
+                    state.request_restart(reason)
+                    state.flush()
+                    state.flush_dashboard()
+                    raise RuntimeError(reason)
                 entry = state.queue.pop(0)
                 is_reeval = entry.get("reeval", False)
                 state.current_eval = {
@@ -1095,15 +1533,30 @@ async def main():
                 }
                 state.flush_dashboard()
                 state.flush()
+                state.note_progress(notes=f"starting queue item {entry.get('challenge_id', '?')}")
                 try:
                     await process_challenge(state, r2, entry, subtensor, wallet,
                                             check_stale=not is_reeval and args.seen)
                 except Exception as exc:
                     log.exception("eval failed: %s", entry.get("challenge_id"))
-                    state.stats["failed"] += 1
-                    state.record_failure(entry, "eval_error", str(exc))
-                    state.current_eval = None
-                    state.flush_dashboard()
+                    is_transient, transient_reason = _is_transient_eval_error(exc)
+                    retry_count = int(entry.get("retry_count", 0))
+                    if is_transient and retry_count < MAX_TRANSIENT_EVAL_RETRIES:
+                        state.set_phase("eval_retrying", challenge_id=entry.get("challenge_id"),
+                                        notes=str(exc))
+                        state.requeue_front(
+                            entry,
+                            reason=transient_reason or "transient_eval_error",
+                            error_code="eval_error_transient",
+                            error_detail=str(exc),
+                        )
+                    else:
+                        state.stats["failed"] += 1
+                        state.record_failure(entry, "eval_error", str(exc))
+                        state.current_eval = None
+                        state.set_phase("eval_failed", challenge_id=entry.get("challenge_id"),
+                                        notes=str(exc))
+                        state.flush_dashboard()
 
                 fresh = scan_reveals(subtensor, NETUID, state.seen)
                 if fresh:
@@ -1136,6 +1589,7 @@ async def main():
             if not args.seen and not state.queue:
                 log.info("idle: all hotkeys seen, waiting for new submissions")
 
+            state.complete_tick()
             state.flush_dashboard()
 
             try:
@@ -1146,8 +1600,27 @@ async def main():
 
         except KeyboardInterrupt:
             break
-        except Exception:
+        except Exception as exc:
+            state.fail_tick(str(exc))
             log.exception("tick error")
+            if state.watchdog.get("consecutive_tick_errors", 0) >= MAX_CONSECUTIVE_TICK_ERRORS:
+                reason = (f"too many consecutive tick errors: "
+                          f"{state.watchdog.get('consecutive_tick_errors', 0)}")
+                log.error(reason)
+                state.request_restart(reason)
+                state.flush()
+                state.flush_dashboard()
+                raise RuntimeError(reason)
+        finally:
+            tick_elapsed = _monotonic_now() - tick_started_monotonic
+            if tick_elapsed >= TICK_WARN_AFTER:
+                log.warning("tick duration %.1fs exceeded warn threshold %ss",
+                            tick_elapsed, TICK_WARN_AFTER)
+                state.event({"event": "tick_slow", "duration_s": round(tick_elapsed, 1)})
+            flush_age = _age_seconds(state.watchdog.get("last_state_flush_at"))
+            if flush_age is not None and flush_age >= STATE_FLUSH_INTERVAL:
+                state.flush()
+                state.flush_dashboard()
 
         await asyncio.sleep(POLL_INTERVAL)
 

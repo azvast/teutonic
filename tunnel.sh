@@ -6,4 +6,4 @@ exec ssh -N \
   -o ExitOnForwardFailure=yes \
   -o StrictHostKeyChecking=no \
   -o UserKnownHostsFile=/dev/null \
-  wrk-wbqzbod2yype@ssh.deployments.targon.com
+  wrk-0638a6gucc7t@ssh.deployments.targon.com

@@ -1774,6 +1774,14 @@ async def _stream_events_with_idle_watchdog(stream, state, cid):
 
 
 def _is_transient_eval_error(exc: Exception | str) -> tuple[bool, str]:
+    # asyncio.CancelledError fires when the validator itself is shutting down
+    # (SIGINT/SIGTERM from `pm2 restart`, deploys, etc.). The eval is still
+    # running on the eval server, and the miner did nothing wrong, so this
+    # should re-queue rather than record a permanent failure in duel history.
+    # str(CancelledError()) is "" so the marker scan below would mis-classify
+    # it as fatal — short-circuit on type instead.
+    if isinstance(exc, asyncio.CancelledError):
+        return True, "validator_cancelled"
     text = str(exc).lower()
     transient_markers = (
         "eval server error",

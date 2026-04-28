@@ -1107,7 +1107,7 @@ class State:
         entry = {
             "challenge_id": verdict["challenge_id"],
             "hotkey": hotkey,
-            "uid": self.uid_map.get(hotkey, "?"),
+            "uid": self.uid_map.get(hotkey),
             "challenger_repo": challenger_repo,
             "challenger_revision": verdict.get("challenger_revision", self.best_known_revision(hotkey, challenger_repo)),
             "mu_hat": verdict.get("mu_hat", 0),
@@ -1248,7 +1248,7 @@ class State:
         entry = {
             "challenge_id": verdict.get("challenge_id"),
             "hotkey": hotkey,
-            "uid": self.uid_map.get(hotkey, "?"),
+            "uid": self.uid_map.get(hotkey),
             "challenger_repo": challenger_repo,
             "accepted": verdict.get("accepted", False),
             "verdict": verdict.get("verdict", "unknown"),
@@ -1270,7 +1270,7 @@ class State:
         self.history.insert(0, {
             "challenge_id": entry.get("challenge_id", "?"),
             "hotkey": entry.get("hotkey", ""),
-            "uid": self.uid_map.get(entry.get("hotkey", ""), "?"),
+            "uid": self.uid_map.get(entry.get("hotkey", "")),
             "challenger_repo": entry.get("hf_repo", ""),
             "accepted": False,
             "verdict": "error",
@@ -1330,6 +1330,19 @@ class State:
             log.info("replenished queue with %d re-eval candidates", count)
         return count
 
+    def _with_fresh_uid(self, entry):
+        """Return a copy of `entry` whose `uid` is re-derived from the current
+        metagraph. Insert-time uids can go stale (deregistration, hotkey
+        re-registration under a new uid) and old payloads from before this
+        function existed had `uid="?"` for hotkeys that weren't in the map at
+        insert time. We project at flush time so the dashboard is always
+        consistent with the latest `refresh_uid_map` snapshot.
+        """
+        hk = entry.get("hotkey") if isinstance(entry, dict) else None
+        if not hk:
+            return entry
+        return {**entry, "uid": self.uid_map.get(hk)}
+
     def flush_dashboard(self, *, force: bool = False):
         # Dashboard flush is presentational: it MUST NEVER raise into the main
         # eval loop. A Hippius/R2 outage here used to propagate up through
@@ -1372,7 +1385,7 @@ class State:
                 usd_per_hour = alpha_per_hour * alpha_usd
                 entry = {
                     "hotkey": hk,
-                    "uid": self.uid_map.get(hk, "?"),
+                    "uid": self.uid_map.get(hk),
                     "weight": round(w, 6),
                     "weight_share": round(share, 6),
                     "emission_per_block": round(em_per_block, 9),
@@ -1390,7 +1403,7 @@ class State:
                 money = per_hotkey_money.get(hk, {})
                 king_chain.append({
                     "hotkey": hk,
-                    "uid": self.uid_map.get(hk, "?"),
+                    "uid": self.uid_map.get(hk),
                     "hf_repo": e.get("hf_repo"),
                     "king_revision": e.get("king_revision"),
                     "reign_number": e.get("reign_number"),
@@ -1415,11 +1428,11 @@ class State:
                 "watchdog": self.watchdog,
                 "score_window": self.score_window,
                 "queue": [{"challenge_id": e.get("challenge_id"), "hotkey": e.get("hotkey"),
-                            "uid": self.uid_map.get(e.get("hotkey", ""), "?"),
+                            "uid": self.uid_map.get(e.get("hotkey", "")),
                             "hf_repo": e.get("hf_repo"), "queued_at": e.get("queued_at"),
                             "block": e.get("block"), "reeval": e.get("reeval", False)}
                            for e in self.queue],
-                "history": self.history,
+                "history": [self._with_fresh_uid(h) for h in self.history],
             }
             if self.market:
                 payload["market"] = self.market

@@ -34,6 +34,7 @@ import pathlib
 import socket
 import struct
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -202,6 +203,13 @@ SHARD_CACHE_DIR = os.environ.get("TEUTONIC_SHARD_CACHE", "/tmp/shard_cache")
 SHARD_CACHE_MAX = int(os.environ.get("TEUTONIC_SHARD_CACHE_MAX", "10"))
 SHARD_DL_WORKERS = int(os.environ.get("TEUTONIC_SHARD_DL_WORKERS", "16"))
 
+# Per-shard lock so two callers (e.g. background prefetch + the synchronous
+# download_shard inside run_bootstrap_test) don't both spend bandwidth on the
+# same shard. The first one downloads; the second one sees the cache file
+# exist and reads it back.
+_shard_locks: dict[str, threading.Lock] = {}
+_shard_locks_guard = threading.Lock()
+
 
 def _parse_npy_header(raw: bytes) -> int:
     """Return the byte offset where data begins in a .npy file."""
@@ -225,20 +233,59 @@ def _evict_shard_cache():
         log.info("evicted cached shard %s", victim.name)
 
 
+def _shard_lock(shard_key: str) -> threading.Lock:
+    with _shard_locks_guard:
+        lock = _shard_locks.get(shard_key)
+        if lock is None:
+            lock = threading.Lock()
+            _shard_locks[shard_key] = lock
+        return lock
+
+
+def prefetch_shard(r2, shard_key):
+    """Background-thread shard prefetch. Idempotent; multiple callers coalesce
+    on the per-shard lock and the cache file. Used by eval_server to overlap
+    shard download with model loading on each new eval.
+    """
+    cache_name = shard_key.replace("/", "_")
+    cache_path = pathlib.Path(SHARD_CACHE_DIR) / cache_name
+    if cache_path.exists():
+        return
+
+    def _do():
+        try:
+            download_shard(r2, shard_key)
+        except Exception:
+            log.warning("background shard prefetch failed for %s", shard_key, exc_info=True)
+
+    threading.Thread(
+        target=_do, daemon=True, name=f"shard-prefetch-{shard_key[:30]}"
+    ).start()
+
+
 def download_shard(r2, shard_key):
-    """Download shard with parallel streams and local disk cache."""
+    """Download shard with parallel streams and local disk cache.
+
+    Per-shard lock ensures two concurrent callers don't both eat bandwidth.
+    """
     cache_name = shard_key.replace("/", "_")
     cache_path = pathlib.Path(SHARD_CACHE_DIR) / cache_name
 
-    if cache_path.exists():
-        t0 = time.time()
-        raw = cache_path.read_bytes()
-        data_offset = _parse_npy_header(raw)
-        elapsed = time.time() - t0
-        log.info("shard cache HIT %s: %.1f MB read in %.2fs",
-                 shard_key, len(raw) / 1e6, elapsed)
-        return data_offset, raw
+    with _shard_lock(shard_key):
+        if cache_path.exists():
+            t0 = time.time()
+            raw = cache_path.read_bytes()
+            data_offset = _parse_npy_header(raw)
+            elapsed = time.time() - t0
+            log.info("shard cache HIT %s: %.1f MB read in %.2fs",
+                     shard_key, len(raw) / 1e6, elapsed)
+            return data_offset, raw
 
+        return _download_shard_locked(r2, shard_key, cache_path)
+
+
+def _download_shard_locked(r2, shard_key, cache_path):
+    """Actual download. Caller already holds the per-shard lock."""
     t0 = time.time()
     head = r2.ds_client.head_object(Bucket=r2.ds_bucket, Key=shard_key)
     total_size = head["ContentLength"]

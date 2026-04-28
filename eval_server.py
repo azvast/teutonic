@@ -331,6 +331,16 @@ def _run_eval(eval_id: str, req: EvalRequest):
     event_q: Queue = record["events"]
 
     try:
+        # Kick off shard download in the background so it overlaps with king
+        # reload + challenger load + probe. Saves ~30s/eval once the shard
+        # cache is cold for that key.
+        if req.shard_key:
+            try:
+                from eval_torch import prefetch_shard
+                prefetch_shard(_r2, req.shard_key)
+            except Exception:
+                log.warning("shard prefetch kickoff failed (non-fatal)", exc_info=True)
+
         king_eval = _ensure_king(req.king_repo, req.king_hash, req.king_revision)
 
         same_model = (req.king_repo == req.challenger_repo

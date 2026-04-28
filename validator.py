@@ -1798,6 +1798,12 @@ def _is_transient_eval_error(exc: Exception | str) -> tuple[bool, str]:
         "streamconsumed",
         "streamclosed",
         "streamerror",
+        # Eval-server SSE stream getting truncated (eval-server restart, tunnel
+        # blip, k8s pod cycle). These are infrastructure and should never go
+        # in the miner's duel-history as a permanent failure.
+        "peer closed connection",
+        "incomplete chunked",
+        "incompleteread",
         "503",
         "502",
         "504",

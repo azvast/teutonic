@@ -491,6 +491,16 @@ var ERROR_MESSAGES = {
             return "Your model config was rejected: " + detail;
         }
     },
+    coldkey_required: {
+        title: "Coldkey Missing",
+        message: function(detail) {
+            return "Your HF repo name must contain the first 8 chars of your " +
+                "coldkey ss58 address (case-insensitive substring, anywhere " +
+                "in account or model name). This stops anyone from submitting " +
+                "someone else's checkpoint as their own. " +
+                "Rename your repo and re-reveal on chain. (" + detail + ")";
+        }
+    },
     no_manifest: {
         title: "Dataset Unavailable",
         message: function() {

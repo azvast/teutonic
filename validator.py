@@ -83,6 +83,15 @@ DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")
 
 REPO_PATTERN = r"^[^/]+/Teutonic-VIII-.+$"
 
+# Anti-impersonation: miners must include the first N ss58 chars of their
+# coldkey somewhere in their HF repo name. Two miners trying to claim the
+# same checkpoint would have to advertise different coldkey prefixes, so
+# only the legit owner can submit a repo whose name embeds *their* coldkey.
+# (Also forces miners to host under their own HF account: the basename or
+# namespace must contain the prefix; case-insensitive substring check.)
+# 8 chars of ss58 ≈ 40 bits of entropy after the universal "5" prefix.
+COLDKEY_PREFIX_LEN = int(os.environ.get("TEUTONIC_COLDKEY_PREFIX_LEN", "8"))
+
 # Magnitude/ratio sanity checks have been removed in favor of a single
 # first-principles trainability probe that runs on the eval server (see
 # eval_torch.trainability_probe). The probe takes one SGD step on the
@@ -783,6 +792,10 @@ class State:
         # `flush_dashboard` to express each king's incentive in alpha/hour and
         # USD/hour. Empty until the first metagraph refresh succeeds.
         self.uid_emission_per_block: dict[str, float] = {}
+        # Hotkey -> coldkey, also captured from the metagraph. Used to
+        # enforce that miners include their coldkey prefix in the HF repo
+        # name so they can't submit someone else's checkpoint.
+        self.hotkey_coldkey: dict[str, str] = {}
         self.score_window = {
             "window_id": "window-0000",
             "started_at": _now(),
@@ -1300,8 +1313,27 @@ class State:
                 hk: (float(emissions[uid]) if uid < len(emissions) else 0.0)
                 for hk, uid in self.uid_map.items()
             }
+            cks = list(getattr(meta, "coldkeys", []) or [])
+            self.hotkey_coldkey = {
+                hk: cks[uid]
+                for hk, uid in self.uid_map.items()
+                if uid < len(cks) and cks[uid]
+            }
         except Exception:
             log.warning("failed to refresh uid_map", exc_info=True)
+
+    def coldkey_for(self, hotkey: str) -> str | None:
+        return self.hotkey_coldkey.get(hotkey) or None
+
+    def expected_coldkey_prefix(self, hotkey: str) -> str | None:
+        """First N chars of the miner's coldkey ss58, used to gate HF repo
+        names. Returns None when the metagraph hasn't surfaced this hotkey
+        yet — callers should treat that as "skip the check, retry later".
+        """
+        ck = self.coldkey_for(hotkey)
+        if not ck:
+            return None
+        return ck[:COLDKEY_PREFIX_LEN]
 
     def replenish_reeval(self, subtensor, netuid):
         """Fill queue with re-eval candidates so the dashboard never shows empty.
@@ -1834,6 +1866,31 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
     if hf_repo in state.evaluated_repos:
         log.info("skipping %s: repo %s already evaluated this cycle", cid, hf_repo)
         return
+
+    expected_ck_prefix = state.expected_coldkey_prefix(hotkey)
+    if expected_ck_prefix:
+        # Case-insensitive substring match anywhere in the full repo (so the
+        # miner can put their coldkey prefix in the HF account name OR the
+        # model basename — whichever they prefer).
+        if expected_ck_prefix.lower() not in hf_repo.lower():
+            reason = (f"hf repo '{hf_repo}' must contain miner coldkey prefix "
+                      f"'{expected_ck_prefix}' (first {COLDKEY_PREFIX_LEN} chars "
+                      f"of the coldkey ss58); rename your HF account or model "
+                      f"to embed it, then re-reveal on chain")
+            log.warning("rejecting %s (%s): %s", cid, hf_repo, reason)
+            state.failed_repos.add(hf_repo)
+            state.record_failure(entry, "coldkey_required", reason)
+            state.event({"event": "coldkey_required", "challenge_id": cid,
+                         "hotkey": hotkey, "hf_repo": hf_repo,
+                         "expected_prefix": expected_ck_prefix})
+            return
+    else:
+        # Metagraph hasn't surfaced this hotkey's coldkey yet (fresh
+        # registration, refresh_uid_map staleness). Skip the check and let
+        # the next tick retry — we don't want to penalize miners for our
+        # own metagraph latency.
+        log.info("%s: coldkey for %s not in metagraph yet, skipping coldkey check",
+                 cid, hotkey[:16])
 
     if check_stale:
         current_hash = state.king.get("king_hash", "")

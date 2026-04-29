@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Wrapper invoked inside the tmux session on the GPU box.
 # Reads HF_TOKEN from /root/teutonic-mining/.hf_token (chmod 600).
+#
+# UPLOAD_REPO must contain the first 8 ss58 chars of your coldkey
+# (case-insensitive substring, anywhere in account or basename).
+# Without that the validator rejects with `coldkey_required` and the
+# whole training run is wasted. run_pipeline.sh verifies this locally
+# before launching us; if you invoke this script directly, double-check.
 set -euo pipefail
 cd /root/teutonic-mining
 export HF_TOKEN="$(cat .hf_token)"

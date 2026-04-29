@@ -9,11 +9,21 @@
 # 6. Write a status report to .arbos/outbox/.
 #
 # Usage:
-#   ./run_pipeline.sh start [--hotkey h0] [--upload-repo unconst/Teutonic-VIII-h0]
+#   ./run_pipeline.sh start [--hotkey h0] [--upload-repo unconst/Teutonic-VIII-5DhAqMpd-h0]
 #   ./run_pipeline.sh tail
 #   ./run_pipeline.sh status
 #   ./run_pipeline.sh fetch        # pull verdict only
 #   ./run_pipeline.sh submit       # submit reveal locally using fetched verdict
+#
+# REQUIRED — coldkey prefix in HF repo name (since 2026-04-29):
+#   Your UPLOAD_REPO must contain the first 8 ss58 chars of YOUR coldkey
+#   somewhere (case-insensitive, in either the HF account or the model
+#   basename). Without that, the validator will reject your eval with
+#   `coldkey_required` — anti-impersonation gate. Find your coldkey ss58
+#   with `btcli wallet list` (column "ss58" under your coldkey block).
+#   Example: if your coldkey is `5DhAqMpd...`, valid UPLOAD_REPO names
+#   include `myaccount/Teutonic-VIII-5DhAqMpd-v3` or
+#   `someaccount-5DhAqMpd/Teutonic-VIII-mymodel`.
 set -euo pipefail
 
 cd "$(dirname "$0")/../../.."
@@ -25,6 +35,8 @@ VERDICT_REMOTE="$REMOTE_DIR/work/verdict.json"
 VERDICT_LOCAL="$ROOT/reports/teutonic-mining/verdict.json"
 LOG_REMOTE="$REMOTE_DIR/work/train.log"
 HOTKEY="${HOTKEY:-h0}"
+# Default placeholder; override with UPLOAD_REPO=<account>/Teutonic-VIII-<your-coldkey-prefix>-<tag>
+# (must contain the first 8 chars of your coldkey ss58 — see header).
 UPLOAD_REPO="${UPLOAD_REPO:-unconst/Teutonic-VIII-h0}"
 
 ssh_run() { ssh -o ConnectTimeout=15 -o StrictHostKeyChecking=no "$REMOTE_HOST" "$@"; }
@@ -46,9 +58,34 @@ pull_file() {
   scp -q -o StrictHostKeyChecking=no "$REMOTE_HOST":"$src" "$dst"
 }
 
+verify_coldkey_prefix() {
+  # Exits non-zero if the wallet's coldkey prefix isn't in UPLOAD_REPO.
+  # Runs locally where the wallet lives, before we burn any GPU/HF time.
+  source "$ROOT/.venv/bin/activate" 2>/dev/null || true
+  python3 - "$HOTKEY" "$UPLOAD_REPO" <<'PY'
+import sys
+import bittensor as bt
+HOTKEY, UPLOAD_REPO = sys.argv[1], sys.argv[2]
+PREFIX_LEN = 8
+w = bt.wallet(name="teutonic", hotkey=HOTKEY)
+ck = w.coldkeypub.ss58_address
+prefix = ck[:PREFIX_LEN]
+if prefix.lower() not in UPLOAD_REPO.lower():
+    print(f"[pipeline] FATAL: UPLOAD_REPO='{UPLOAD_REPO}' does not contain "
+          f"your coldkey prefix '{prefix}' (first {PREFIX_LEN} chars of {ck}).",
+          file=sys.stderr)
+    print(f"[pipeline] Validator will reject this with 'coldkey_required'. "
+          f"Rename your repo to embed '{prefix}' (case-insensitive substring "
+          f"anywhere in account or basename) and retry.", file=sys.stderr)
+    sys.exit(7)
+print(f"[pipeline] coldkey gate ok: '{prefix}' is in UPLOAD_REPO='{UPLOAD_REPO}'")
+PY
+}
+
 cmd="${1:-}"; shift || true
 case "$cmd" in
   start)
+    verify_coldkey_prefix
     echo "[pipeline] syncing scripts to $REMOTE_HOST..."
     ssh_run "mkdir -p $REMOTE_DIR/bundle $REMOTE_DIR/work" >/dev/null
     push_file teutonic/scripts/mining/train_challenger.py "$REMOTE_DIR/train_challenger.py"

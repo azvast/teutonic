@@ -20,6 +20,20 @@ the budget is spent.
 This script is meant to live on the GPU box (e.g. /root/teutonic-mining/)
 and be invoked there. It does NOT touch bittensor — that step is handled
 by submit_challenger.py on the templar host where the wallet lives.
+
+REQUIRED — coldkey prefix in --upload-repo (since 2026-04-29):
+  The Teutonic-VIII validator rejects any HF repo whose name doesn't
+  contain the first 8 ss58 chars of the miner's coldkey (case-insensitive
+  substring, in either the HF account or the model basename). This is
+  an anti-impersonation gate — only the legit coldkey owner can publish
+  a repo whose name embeds *their* coldkey. Imposters who lift somebody
+  else's URL end up advertising the victim's coldkey on chain.
+
+  This script doesn't have wallet access so it can't enforce locally —
+  the orchestrator (run_pipeline.sh) and the on-chain submitter
+  (submit_challenger.py) both check before they burn HF / TAO. Pass an
+  --upload-repo whose full id contains your coldkey prefix, e.g.
+      myaccount/Teutonic-VIII-5DhAqMpd-v3
 """
 from __future__ import annotations
 
@@ -443,7 +457,11 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--n-gpus", type=int, default=8)
     ap.add_argument("--upload-repo", default="",
-                    help="If set + accepted, push merged model to this HF repo")
+                    help="If set + accepted, push merged model to this HF repo. "
+                         "Must contain the first 8 ss58 chars of your coldkey "
+                         "(case-insensitive substring) or the validator will "
+                         "reject the eval with `coldkey_required`. See "
+                         "submit_challenger.py for the gate that enforces this.")
     ap.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""))
     ap.add_argument("--report-out", default="",
                     help="Write a final JSON verdict to this path")

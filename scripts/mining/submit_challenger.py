@@ -6,6 +6,26 @@ king_hash, uploaded HF repo, uploaded revision, challenger_hash) and posts
 the bittensor reveal commitment.
 
 Run this on the templar host where the wallet lives.
+
+IMPORTANT — coldkey gate (added 2026-04-29):
+    The Teutonic-VIII validator REJECTS any HF repo whose name does NOT
+    contain the first 8 ss58 chars of your **coldkey** (case-insensitive
+    substring match against the full "<account>/<basename>" string).
+
+    This stops anyone from re-revealing somebody else's HF URL under
+    their own hotkey: only YOU know your coldkey, and an imposter who
+    lifts your URL ends up advertising YOUR coldkey on chain — which is
+    self-incriminating.
+
+    So an HF repo like:
+        my-team/Teutonic-VIII-5DhAqMpd-v3
+                              ^^^^^^^^
+    works (matches my coldkey 5DhAqMpd...). Without that prefix, the
+    validator will record your eval as `coldkey_required` and skip it.
+
+    This script will refuse to broadcast a reveal whose repo doesn't
+    contain your coldkey prefix — fail fast locally rather than burn
+    a tx for nothing.
 """
 import argparse
 import json
@@ -19,6 +39,10 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s [submit] %(message)s",
                     datefmt="%H:%M:%S")
 log = logging.getLogger("submit_challenger")
+
+# Must match validator.py's COLDKEY_PREFIX_LEN. If the validator side ever
+# changes this, miners need to update too.
+COLDKEY_PREFIX_LEN = 8
 
 
 def main():
@@ -45,15 +69,36 @@ def main():
                   v["best"]["mu_hat"], v["best"]["lcb"], v["best"]["delta"])
         sys.exit(3)
 
+    wallet = bt.wallet(name=args.wallet_name, hotkey=args.hotkey)
+    log.info("wallet hotkey: %s", wallet.hotkey.ss58_address)
+
+    coldkey_ss58 = wallet.coldkeypub.ss58_address
+    expected_prefix = coldkey_ss58[:COLDKEY_PREFIX_LEN]
+    if expected_prefix.lower() not in repo.lower():
+        log.error(
+            "HF repo '%s' does NOT contain your coldkey prefix '%s' "
+            "(first %d chars of %s).\n"
+            "    The Teutonic-VIII validator will reject this submission "
+            "with `coldkey_required` and your tx will be wasted.\n"
+            "    Rename your HF repo or HF account so its full id "
+            "contains '%s' (case-insensitive substring) anywhere — e.g.\n"
+            "        %s/Teutonic-VIII-%s-v1\n"
+            "    then re-upload and rerun this script.",
+            repo, expected_prefix, COLDKEY_PREFIX_LEN, coldkey_ss58,
+            expected_prefix,
+            repo.split("/", 1)[0] if "/" in repo else "<your-hf-account>",
+            expected_prefix,
+        )
+        sys.exit(6)
+    log.info("coldkey gate ok: repo '%s' contains coldkey prefix '%s'",
+             repo, expected_prefix)
+
     payload = f"{king_hash}:{repo}:{chall_hash}"
     log.info("payload: %s", payload)
 
     if args.dry_run:
         log.info("[dry-run] not submitting")
         return
-
-    wallet = bt.wallet(name=args.wallet_name, hotkey=args.hotkey)
-    log.info("wallet hotkey: %s", wallet.hotkey.ss58_address)
 
     sub = bt.subtensor(network=args.network)
     meta = sub.metagraph(args.netuid)

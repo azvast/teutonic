@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Smoke test eval of Teutonic-XXIV without going through the prod eval server.
 
-Forks smoke_eval_teutonic_viii.py. Validates: model loads at ~24B total /
-~8B active, trainability probe passes, paired loss == 0 (king == challenger),
-no OOM at chosen batch size, throughput estimate.
+Validates: model loads at ~24B total / ~8B active, trainability probe passes,
+paired loss == 0 (king == challenger), no OOM at chosen batch size, throughput
+estimate.
 
 Quasar specifics:
 - We pre-import teutonic.quasar so AutoModelForCausalLM resolves "quasar"
@@ -42,11 +42,11 @@ sys.path.insert(0, _script_dir)
 os.environ.setdefault("HF_PREFETCH_TIMEOUT", "3600")
 import teutonic.quasar  # noqa: F401
 
-from eval_torch import (
+from eval.torch_runner import (
     R2, MultiGPUEvaluator, run_bootstrap_test, parse_gpu_ids,
     trainability_probe, download_shard, get_shard_info,
 )
-import eval_torch as _et
+from eval import torch_runner as _et
 
 
 def main():

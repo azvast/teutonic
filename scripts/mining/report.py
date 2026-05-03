@@ -20,7 +20,10 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parents[3]
 OUTBOX = Path("/home/const/workspace/.arbos/outbox")
 REPORTS = ROOT / "reports" / "teutonic-mining"
-DASHBOARD = "https://s3.hippius.com/teutonic-sn3/dashboard.json"
+DASHBOARD = os.environ.get(
+    "TEUTONIC_DASHBOARD_URL",
+    "https://us-east-1.hippius.com/teutonic-sn3/dashboard.json",
+)
 LAST_HASH_FILE = REPORTS / ".last_report_hash"
 
 

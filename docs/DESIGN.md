@@ -109,7 +109,7 @@ chain keeps crediting the rolling-5 set.
 
 - Subnet 3 registration burn (TAO, tracked live in `fetch_tmc_data`).
 - GPU compute to actually beat the king by `delta` nats/token. The trivial
-  noise-perturbation in [miner.py:187-197](teutonic/miner.py#L187-L197) will
+  noise-perturbation in [miner.py:187-197](../miner.py#L187-L197) will
   almost never clear the bar — it's a structural placeholder, not a strategy.
 - HuggingFace storage/bandwidth for full safetensors.
 
@@ -121,7 +121,7 @@ investment by the miner.
 
 ## 4. Mining loop
 
-From [miner.py](teutonic/miner.py):
+From [miner.py](../miner.py):
 
 1. Read the current dashboard (`dashboard.json` on Hippius) to discover
    `king.hf_repo` and `king.king_revision` (a pinned commit SHA).
@@ -154,7 +154,7 @@ From [miner.py](teutonic/miner.py):
 
 ## 5. Validation loop
 
-From [validator.py:1015-1164](teutonic/validator.py#L1015-L1164). Single async
+From [validator.py:1015-1164](../validator.py#L1015-L1164). Single async
 process; one outstanding eval at a time.
 
 ```mermaid
@@ -190,7 +190,7 @@ Key invariants:
 - **TOCTOU pinning.** Every HF read after `process_challenge` uses
   `challenger_revision` (the commit SHA returned from `HfApi.model_info`). A
   miner cannot swap the safetensors out from under the validator between
-  validation and evaluation. See [validator.py:854-873](teutonic/validator.py#L854-L873).
+  validation and evaluation. See [validator.py:854-873](../validator.py#L854-L873).
 - **Shard randomization.** The shard each challenger is evaluated on is
   derived from `blake2b(block_hash || hotkey)`. The miner cannot pick the
   shard, and they don't know it ahead of time because `block_hash` only
@@ -204,7 +204,7 @@ Key invariants:
 ## 6. Evaluation method
 
 The full math lives in
-[eval_torch.py:536-642](teutonic/eval_torch.py#L536-L642). Summary:
+[eval/torch_runner.py:536-642](../eval/torch_runner.py#L536-L642). Summary:
 
 1. **Sample.** Deterministically select `actual_N = min(EVAL_N=20_000,
    n_sequences)` non-overlapping sequences of `SEQ_LEN=2048` tokens from the
@@ -224,7 +224,7 @@ The full math lives in
    improvement is strictly larger than the per-sample-resolution floor.
 
 ```python
-# eval_torch.py:614-625
+# eval/torch_runner.py:614-625
 boot_rng = np.random.Generator(np.random.PCG64(seed ^ 0xB007))
 boot_means = np.empty(n_bootstrap)
 for b in range(n_bootstrap):
@@ -239,13 +239,11 @@ The `delta > 0` floor is what blocks "free" wins from numerical noise: a
 miner who submits the king verbatim has `mu_hat ~= 0` and `lcb < 0 < delta`,
 so they cannot dethrone by tying.
 
-There is also a regression-penalized variant in
-[eval_penalized.py](teutonic/eval_penalized.py) defined as
-`u_i = d_i - beta * max(-d_i, 0)`, evaluated with a one-sided `scipy`
-t-test against `popmean=delta`. It penalizes per-sequence regressions
-(`beta=1` means a per-sequence regression hurts twice as much as an equal
-improvement helps). This path is implemented and CLI-runnable but is not
-wired into `eval_server.py`'s production path.
+A regression-penalized variant `u_i = d_i - beta * max(-d_i, 0)` (one-sided
+`scipy` t-test against `popmean=delta`, where `beta=1` means a per-sequence
+regression hurts twice as much as an equal improvement helps) was prototyped
+but never wired into `eval_server.py`'s production path; see git history for
+the original `eval_penalized.py` implementation if revisited.
 
 ---
 
@@ -282,14 +280,14 @@ wired into `eval_server.py`'s production path.
      thresholds (`max_abs <= 5000`, `mean_abs <= 1000`, `std <= 1000`), on
      the reparameterization-trick fingerprint (see below), and on per-tensor
      ratio vs the king (`max_ratio = 50`). See
-     [validator.py:344-420](teutonic/validator.py#L344-L420).
+     [validator.py:344-420](../validator.py#L344-L420).
   2. *On-GPU, pre-test:* `check_weight_norms` rejects challengers where any
      parameter's L2 norm is `>5x` the king's, where any projection's
      `mean_abs` falls below `TEUTONIC_EVAL_PROJ_MEAN_ABS_FLOOR = 2e-5`
      (defense-in-depth against the reparam trick), or where any parameter
      has non-finite values. See
-     [eval_torch.py:389-425](teutonic/eval_torch.py#L389-L425) and the gate
-     in [eval_server.py:268-295](teutonic/eval_server.py#L268-L295).
+     [eval/torch_runner.py:389-425](../eval/torch_runner.py#L389-L425) and the gate
+     in [eval_server.py:268-295](../eval_server.py#L268-L295).
 - **RMSNorm/SwiGLU reparameterization trick.** RMSNorm followed by Linear
   is invariant under `(gamma, W) -> (alpha*gamma, W/alpha)`; SwiGLU's
   `silu(g)*u` is invariant under `(g, u) -> (alpha*g, u/alpha)`; and Gemma3's
@@ -301,7 +299,7 @@ wired into `eval_server.py`'s production path.
   equivalent in output but pathologically brittle: any `~1e-3` perturbation
   or fine-tune step destroys the now-tiny projections, so naive challengers
   always lose by a huge margin and the king is effectively undethronable.
-  `check_reparam_sanity` ([validator.py](teutonic/validator.py)) catches this
+  `check_reparam_sanity` ([validator.py](../validator.py)) catches this
   with three layered checks on per-tensor `mean_abs`/`max_abs`:
   1. The existing `NORM_SANITY_*` absolute caps on RMSNorm tensors.
   2. A floor `TEUTONIC_PROJ_MIN_MEAN_ABS = 1e-4` on every projection

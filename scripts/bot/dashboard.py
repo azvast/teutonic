@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Fetch and format the public Teutonic dashboard."""
 import json
+import os
 import sys
 import urllib.request
 
-DASHBOARD_URL = "https://s3.hippius.com/teutonic-sn3/dashboard.json"
+DASHBOARD_URL = os.environ.get(
+    "TEUTONIC_DASHBOARD_URL",
+    "https://us-east-1.hippius.com/teutonic-sn3/dashboard.json",
+)
 
 try:
     with urllib.request.urlopen(DASHBOARD_URL, timeout=10) as resp:

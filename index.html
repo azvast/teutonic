@@ -114,7 +114,6 @@ body {
 .scroll-box::-webkit-scrollbar-thumb { background: var(--ink); }
 .scroll-queue { max-height: 200px; }
 .scroll-hist { max-height: 60vh; }
-.scroll-king-chain { max-height: 240px; }
 
 table {
     width: 100%;
@@ -237,13 +236,11 @@ th:last-child, td:last-child { text-align: right; }
 
     .scroll-box { overflow-x: auto; }
     .scroll-hist table,
-    .scroll-queue table,
-    .scroll-king-chain table {
+    .scroll-queue table {
         table-layout: auto;
         min-width: 500px;
     }
     .scroll-hist table { min-width: 700px; }
-    .scroll-king-chain table { min-width: 720px; }
 
     .scroll-hist th:nth-child(6),
     .scroll-hist td:nth-child(6),
@@ -274,7 +271,7 @@ th:last-child, td:last-child { text-align: right; }
 
     <div style="text-align:center;margin-bottom:8px;">
         <img src="favicon.png" alt="Teuton" class="logo-img" style="width:80px;height:80px;margin-bottom:8px;">
-        <div class="header-title" style="font-size:20px;font-weight:bold;letter-spacing:0.1em;text-transform:uppercase;">Teutonic-VIII</div>
+        <div class="header-title" style="font-size:20px;font-weight:bold;letter-spacing:0.1em;text-transform:uppercase;">Teutonic-III</div>
         <div style="font-size:11px;margin-top:4px;display:flex;flex-direction:column;align-items:center;gap:4px;text-transform:uppercase;">
             <span><span id="king-health" title="King repo status"></span> KING: <a id="king-link-top" href="#" target="_blank" style="color:var(--ink);text-decoration:none;border-bottom:var(--border);">--</a> <span id="king-rev" style="opacity:0.6;"></span></span>
             <span>VALIDATOR: <a href="https://github.com/unarbos/teutonic" target="_blank" style="color:var(--ink);text-decoration:none;border-bottom:var(--border);">GitHub</a></span>
@@ -308,67 +305,6 @@ th:last-child, td:last-child { text-align: right; }
     <div>
         <div class="section-label">Last Winner</div>
         <div id="last-winner" style="font-size:12px;line-height:1.8;min-height:48px;display:flex;flex-wrap:wrap;gap:0 16px;">--</div>
-    </div>
-
-    <div>
-        <div class="section-label" style="display:flex;justify-content:space-between;align-items:center;">
-            <span>Pre-training Benchmarks</span>
-            <span style="font-weight:normal;font-size:10px;text-transform:none;letter-spacing:0;">
-                <label style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;">
-                    <input type="checkbox" id="bench-show-ref" style="cursor:pointer;"> show paper references
-                </label>
-            </span>
-        </div>
-        <div class="scroll-box scroll-bench">
-            <table id="bench-table">
-                <thead>
-                    <tr>
-                        <th style="width:48px">Reign</th>
-                        <th>Repo</th>
-                        <th>ARC-C</th>
-                        <th>ARC-E</th>
-                        <th>PIQA</th>
-                        <th>OBQA</th>
-                        <th>HellaSwag</th>
-                        <th>WinoGrande</th>
-                        <th>MMLU</th>
-                        <th style="width:70px">When</th>
-                    </tr>
-                    <tr class="bench-spark-row" id="bench-sparks">
-                        <th colspan="2" style="text-align:left;font-size:10px;color:var(--ink-muted);text-transform:none;letter-spacing:0;">trend (oldest -> newest)</th>
-                        <th data-task="arc_challenge"></th>
-                        <th data-task="arc_easy"></th>
-                        <th data-task="piqa"></th>
-                        <th data-task="openbookqa"></th>
-                        <th data-task="hellaswag"></th>
-                        <th data-task="winogrande"></th>
-                        <th data-task="mmlu"></th>
-                        <th></th>
-                    </tr>
-                </thead>
-                <tbody id="bench"></tbody>
-            </table>
-        </div>
-    </div>
-
-    <div>
-        <div class="section-label">Rolling Reign Window</div>
-        <div class="scroll-box scroll-king-chain">
-            <table>
-                <thead><tr>
-                    <th>#</th>
-                    <th>Reign</th>
-                    <th>UID</th>
-                    <th>Hotkey</th>
-                    <th>Repo</th>
-                    <th>Weight</th>
-                    <th>&alpha; / hr</th>
-                    <th>$ / hr</th>
-                    <th>Crowned</th>
-                </tr></thead>
-                <tbody id="king-chain"></tbody>
-            </table>
-        </div>
     </div>
 
     <div>
@@ -415,24 +351,12 @@ var DATA_ENDPOINTS = [
     "https://eu-central-1.hippius.com/teutonic-sn3/dashboard.json",
     "https://s3.hippius.com/teutonic-sn3/dashboard.json"
 ];
-var BENCH_ENDPOINTS = [
-    "https://us-east-1.hippius.com/teutonic-sn3/benchmarks.json",
-    "https://eu-central-1.hippius.com/teutonic-sn3/benchmarks.json",
-    "https://s3.hippius.com/teutonic-sn3/benchmarks.json"
-];
 var DATA_URL = DATA_ENDPOINTS[0];
-var BENCH_URL = BENCH_ENDPOINTS[0];
 var POLL_MS = 5000;
-var BENCH_POLL_MS = 60000;
 var ENDPOINT_CACHE_KEY = "dashboardEndpoint";
-var BENCH_ENDPOINT_CACHE_KEY = "benchEndpoint";
 var ENDPOINT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 var _lastData = null;
-var _lastBench = null;
 var _chartMode = localStorage.getItem("chartMode") || "ppl";
-var _benchShowRef = localStorage.getItem("benchShowRef") === "1";
-
-var BENCH_TASKS = ["arc_challenge","arc_easy","piqa","openbookqa","hellaswag","winogrande","mmlu"];
 
 (function initTheme() {
     var saved = localStorage.getItem("theme");
@@ -489,16 +413,6 @@ var ERROR_MESSAGES = {
                 return "Could not download config.json from your repo. " +
                     "Make sure config.json exists at the repo root and the repo is accessible.";
             return "Your model config was rejected: " + detail;
-        }
-    },
-    coldkey_required: {
-        title: "Coldkey Missing",
-        message: function(detail) {
-            return "Your HF repo name must contain the first 8 chars of your " +
-                "coldkey ss58 address (case-insensitive substring, anywhere " +
-                "in account or model name). This stops anyone from submitting " +
-                "someone else's checkpoint as their own. " +
-                "Rename your repo and re-reveal on chain. (" + detail + ")";
         }
     },
     no_manifest: {
@@ -731,6 +645,58 @@ function render(d) {
     } // end chart data block
 
     // --- Current Duel ---
+    var STAGE_LABELS = {
+        queued: "Queued",
+        dispatching: "Dispatching to eval server",
+        waiting_for_slot: "Waiting for eval slot",
+        eval_start: "Starting eval",
+        king_load_cached: "King already loaded",
+        king_reload: "Swapping king model",
+        king_load_start: "Loading king model",
+        model_prefetch_start: "Downloading king from HuggingFace",
+        model_prefetch_done: "King download complete",
+        model_load_attn: "Initialising attention",
+        model_load_start: "Loading model onto GPU",
+        model_load_done: "Model on GPU",
+        king_load_done: "King ready",
+        king_probe_start: "Probing king trainability",
+        king_probe_done: "King probe done",
+        challenger_same_as_king: "Re-using king as challenger",
+        challenger_load_start: "Loading challenger model",
+        challenger_load_done: "Challenger ready",
+        challenger_probe_start: "Probing challenger trainability",
+        challenger_probe_done: "Challenger probe done",
+        shard_cache_hit: "Reading shard from cache",
+        shard_cache_read_done: "Shard ready",
+        shard_download_start: "Downloading eval shard",
+        shard_chunk: "Downloading eval shard",
+        shard_extract: "Preparing sequences",
+        bootstrap_start: "Starting bootstrap",
+        bootstrap_running: "Running bootstrap",
+        bootstrap_compute: "Computing confidence bound"
+    };
+    function stageDescription(ev) {
+        var name = ev.stage;
+        if (!name) return null;
+        var label = STAGE_LABELS[name] || name.replace(/_/g, " ");
+        var extra = ev.stage_extra || {};
+        if (name === "shard_chunk" && extra.done && extra.total) {
+            label += " " + extra.done + "/" + extra.total;
+        } else if (name === "shard_download_start" && extra.total_mb) {
+            label += " (" + extra.total_mb.toFixed(0) + " MB)";
+        } else if (name === "model_load_attn" && extra.attn) {
+            label += " (" + extra.attn + ")";
+        } else if (name === "waiting_for_slot" && extra.attempt && extra.max_attempts) {
+            label += " (" + extra.attempt + "/" + extra.max_attempts + ")";
+        } else if (name === "bootstrap_start" && extra.n_batches) {
+            label += " (" + extra.n_batches + " batches)";
+        }
+        var elapsed = ev.stage_elapsed_s;
+        if (elapsed && elapsed >= 1) {
+            label += "  " + Math.round(elapsed) + "s";
+        }
+        return label;
+    }
     var duelSec = document.getElementById("duel-section");
     var duelLabel = document.getElementById("duel-label");
     var duelBar = document.getElementById("duel-bar");
@@ -738,26 +704,31 @@ function render(d) {
     var duelWr = document.getElementById("duel-wr");
     if (ev) {
         duelSec.classList.remove("duel-idle");
-        if (ev.loading) {
-            var loadingName = ev.challenger_repo || short(ev.hotkey, 12);
-            if (ev.challenger_repo) {
-                duelLabel.innerHTML = '<a href="https://huggingface.co/' + ev.challenger_repo + '" target="_blank" style="color:var(--ink)">' + loadingName + '</a>';
-            } else {
-                duelLabel.textContent = loadingName;
-            }
+        var duelName = ev.challenger_repo || short(ev.hotkey, 12);
+        if (ev.challenger_repo) {
+            duelLabel.innerHTML = '<a href="https://huggingface.co/' + ev.challenger_repo + '" target="_blank" style="color:var(--ink)">' + duelName + '</a>';
+        } else {
+            duelLabel.textContent = duelName;
+        }
+        var stageLabel = stageDescription(ev);
+        var inBootstrap = ev.progress > 0 && (!ev.stage || ev.stage === "bootstrap_running");
+        if (inBootstrap) {
+            var pct = ev.total > 0 ? Math.round((ev.progress / ev.total) * 100) : 0;
+            duelBar.style.width = pct + "%";
+            duelProgress.textContent = ev.progress + " / " + ev.total + "  (" + pct + "%)";
+            duelWr.textContent = "MU: " + (ev.mu_hat || 0).toFixed(6);
+        } else if (stageLabel) {
+            duelBar.style.width = "0%";
+            duelProgress.textContent = stageLabel + " \u2026";
+            duelWr.textContent = ev.mu_hat ? "MU: " + ev.mu_hat.toFixed(6) : "--";
+        } else if (ev.loading) {
             duelBar.style.width = "0%";
             duelProgress.textContent = "Loading model \u2026";
             duelWr.textContent = "--";
         } else {
-            var pct = ev.total > 0 ? Math.round((ev.progress / ev.total) * 100) : 0;
-            var duelName = ev.challenger_repo || short(ev.hotkey, 12);
-            if (ev.challenger_repo) {
-                duelLabel.innerHTML = '<a href="https://huggingface.co/' + ev.challenger_repo + '" target="_blank" style="color:var(--ink)">' + duelName + '</a>';
-            } else {
-                duelLabel.textContent = duelName;
-            }
-            duelBar.style.width = pct + "%";
-            duelProgress.textContent = ev.progress + " / " + ev.total + "  (" + pct + "%)";
+            var pct2 = ev.total > 0 ? Math.round((ev.progress / ev.total) * 100) : 0;
+            duelBar.style.width = pct2 + "%";
+            duelProgress.textContent = ev.progress + " / " + ev.total + "  (" + pct2 + "%)";
             duelWr.textContent = "MU: " + (ev.mu_hat || 0).toFixed(6);
         }
     } else {
@@ -802,37 +773,6 @@ function render(d) {
         lwEl.textContent = "NO DETHRONING YET";
     }
 
-    // --- Rolling Reign Window (last KING_CHAIN_DEPTH reigns) ---
-    var kcEl = document.getElementById("king-chain");
-    var kc = d.king_chain || [];
-    if (kc.length === 0) {
-        kcEl.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:16px">No reigns yet</td></tr>';
-    } else {
-        var weights = {};
-        (d.king_chain_weights || []).forEach(function(w) { weights[w.hotkey] = w; });
-        kcEl.innerHTML = kc.map(function(e, i) {
-            var w = weights[e.hotkey] || {};
-            var repo = e.hf_repo || "--";
-            var repoLink = e.hf_repo ? '<a href="https://huggingface.co/' + e.hf_repo + '" target="_blank" style="color:var(--ink)">' + repo + '</a>' : repo;
-            var hkLink = e.hotkey ? '<a href="https://taomarketcap.com/hotkey/' + e.hotkey + '/mining_hotkeys" target="_blank" style="color:var(--ink)">' + short(e.hotkey, 16) + '</a>' : '--';
-            var weightPct = (w.weight != null) ? (w.weight * 100).toFixed(1) + "%" : "--";
-            var alphaHr = (w.alpha_per_hour != null) ? w.alpha_per_hour.toFixed(3) : "--";
-            var usdHr = (w.usd_per_hour != null) ? "$" + w.usd_per_hour.toFixed(2) : "--";
-            var crowned = e.crowned_at ? e.crowned_at.slice(0, 16).replace("T", " ") + "Z" : "--";
-            return '<tr>' +
-                '<td>' + (i + 1) + '</td>' +
-                '<td>#' + (e.reign_number != null ? e.reign_number : "--") + '</td>' +
-                '<td>' + (e.uid != null ? e.uid : "--") + '</td>' +
-                '<td>' + hkLink + '</td>' +
-                '<td>' + repoLink + '</td>' +
-                '<td>' + weightPct + '</td>' +
-                '<td>' + alphaHr + '</td>' +
-                '<td>' + usdHr + '</td>' +
-                '<td>' + crowned + '</td>' +
-                '</tr>';
-        }).join("");
-    }
-
     // --- 2. Queue ---
     var qEl = document.getElementById("queue");
     var q = d.queue || [];
@@ -861,13 +801,6 @@ function render(d) {
     } else {
         hb.innerHTML = history.map(function(h) {
             var isErr = h.verdict === "error";
-            // Probe-rejected challengers never reach the bootstrap test, so
-            // mu_hat/lcb/avg_*_loss are all 0 by default. Detect this so we
-            // don't render a bogus "KING wins 0.000000" row.
-            var isProbeReject = !isErr && !h.accepted && !!h.rejection_reason;
-            // Skip rendering bootstrap stats for any verdict that didn't
-            // actually run a bootstrap test (errors + probe-fails).
-            var hasStats = !isErr && !isProbeReject;
             var kl = h.avg_king_loss || 0;
             var cl = h.avg_challenger_loss || 0;
             var repo = h.challenger_repo || "--";
@@ -886,198 +819,27 @@ function render(d) {
                 tip = tip.replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
                 var label = errInfo ? errInfo.title.toUpperCase() : "ERROR";
                 verdictCell = '<td title="' + tip + '" style="color:#c22;cursor:help">' + label + '</td>';
-            } else if (isProbeReject) {
-                var rrTip = String(h.rejection_reason || "untrainable")
-                    .replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-                verdictCell = '<td title="' + rrTip + '" style="color:#c22;cursor:help">UNTRAINABLE</td>';
             } else {
                 verdictCell = '<td>' + (h.accepted ? "CHALLENGER" : "KING") + '</td>';
             }
 
             var ago = timeAgo(h.timestamp);
             var fullTs = h.timestamp ? new Date(h.timestamp).toUTCString() : "";
-            if (hasStats && h.wall_time_s) ago += " (" + h.wall_time_s.toFixed(0) + "s)";
+            if (!isErr && h.wall_time_s) ago += " (" + h.wall_time_s.toFixed(0) + "s)";
 
             return '<tr>' +
                 '<td>' + uid + '</td>' +
                 '<td>' + repoLink + '</td>' +
                 '<td>' + (h.hotkey ? '<a href="https://taomarketcap.com/hotkey/' + h.hotkey + '/mining_hotkeys" target="_blank" style="color:var(--ink)">' + short(h.hotkey, 16) + '</a>' : '--') + '</td>' +
                 verdictCell +
-                '<td>' + (hasStats ? (h.mu_hat || 0).toFixed(6) : "--") + '</td>' +
-                '<td>' + (hasStats ? (h.lcb || 0).toFixed(6) : "--") + '</td>' +
-                '<td>' + (hasStats ? kl.toFixed(4) : "--") + '</td>' +
-                '<td>' + (hasStats ? cl.toFixed(4) : "--") + '</td>' +
+                '<td>' + (isErr ? "--" : (h.mu_hat || 0).toFixed(6)) + '</td>' +
+                '<td>' + (isErr ? "--" : (h.lcb || 0).toFixed(6)) + '</td>' +
+                '<td>' + (isErr ? "--" : kl.toFixed(4)) + '</td>' +
+                '<td>' + (isErr ? "--" : cl.toFixed(4)) + '</td>' +
                 '<td title="' + fullTs + '">' + ago + '</td>' +
                 '</tr>';
         }).join("");
     }
-}
-
-function fmtPct(v) {
-    if (v == null || isNaN(v)) return "--";
-    return (v * 100).toFixed(1);
-}
-
-function deltaCell(curr, prev) {
-    if (curr == null) return "--";
-    var s = fmtPct(curr);
-    if (prev != null && !isNaN(prev)) {
-        var d = curr - prev;
-        if (Math.abs(d) >= 0.001) {
-            var cls = d > 0 ? "bench-delta-up" : "bench-delta-dn";
-            var arrow = d > 0 ? "+" : "";
-            s += '<span class="' + cls + '">' + arrow + (d * 100).toFixed(1) + '</span>';
-        }
-    }
-    return s;
-}
-
-function buildSparkline(values, refs) {
-    var W = 80, H = 22, P = 1;
-    if (!values || values.length === 0) {
-        return '<svg class="bench-spark" viewBox="0 0 ' + W + ' ' + H + '"></svg>';
-    }
-    var lo = 0, hi = 1;
-    if (refs && refs.length) {
-        for (var r = 0; r < refs.length; r++) {
-            if (refs[r] != null) {
-                if (refs[r] < lo) lo = refs[r];
-                if (refs[r] > hi) hi = refs[r];
-            }
-        }
-    }
-    for (var i = 0; i < values.length; i++) {
-        if (values[i] == null) continue;
-        if (values[i] < lo) lo = values[i];
-        if (values[i] > hi) hi = values[i];
-    }
-    var span = Math.max(0.05, hi - lo);
-    lo = Math.max(0, lo - span * 0.1);
-    hi = Math.min(1, hi + span * 0.1);
-    span = hi - lo || 1;
-
-    var cs = getComputedStyle(document.documentElement);
-    var ink = cs.getPropertyValue('--ink').trim();
-    var muted = cs.getPropertyValue('--ink-muted').trim();
-
-    function toX(i) {
-        return values.length > 1
-            ? P + (i / (values.length - 1)) * (W - 2 * P)
-            : W / 2;
-    }
-    function toY(v) { return P + (1 - (v - lo) / span) * (H - 2 * P); }
-
-    var svg = '<svg class="bench-spark" viewBox="0 0 ' + W + ' ' + H + '">';
-
-    if (refs && _benchShowRef) {
-        for (var ri = 0; ri < refs.length; ri++) {
-            var rv = refs[ri];
-            if (rv == null) continue;
-            var ry = toY(rv);
-            svg += '<line x1="0" y1="' + ry.toFixed(1) + '" x2="' + W + '" y2="' + ry.toFixed(1) +
-                '" stroke="' + muted + '" stroke-width="0.5" stroke-dasharray="2 2" opacity="0.55"/>';
-        }
-    }
-
-    var pts = [];
-    for (var j = 0; j < values.length; j++) {
-        if (values[j] == null) continue;
-        pts.push(toX(j).toFixed(1) + "," + toY(values[j]).toFixed(1));
-    }
-    if (pts.length > 0) {
-        svg += '<polyline points="' + pts.join(" ") + '" fill="none" stroke="' + ink +
-            '" stroke-width="1.2" stroke-linejoin="round"/>';
-    }
-
-    if (values.length > 0 && values[values.length - 1] != null) {
-        svg += '<circle cx="' + toX(values.length - 1).toFixed(1) +
-            '" cy="' + toY(values[values.length - 1]).toFixed(1) +
-            '" r="1.6" fill="' + ink + '"/>';
-    }
-    svg += '</svg>';
-    return svg;
-}
-
-function renderBench(bd) {
-    var sparkRow = document.getElementById("bench-sparks");
-    var tbody = document.getElementById("bench");
-    if (!bd || !bd.history || bd.history.length === 0) {
-        if (sparkRow) {
-            for (var i = 0; i < BENCH_TASKS.length; i++) {
-                var th = sparkRow.querySelector('th[data-task="' + BENCH_TASKS[i] + '"]');
-                if (th) th.innerHTML = "";
-            }
-        }
-        if (tbody) {
-            tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:16px">No benchmark runs yet</td></tr>';
-        }
-        return;
-    }
-
-    // history is newest-first; sparkline wants oldest-first.
-    var hist = bd.history.slice().reverse();
-    var ref = bd.reference || [];
-
-    // Build per-task value series (chronological).
-    var seriesByTask = {};
-    BENCH_TASKS.forEach(function(t) {
-        seriesByTask[t] = hist.map(function(h) {
-            return (h.scores && h.scores[t] != null) ? h.scores[t] : null;
-        });
-    });
-
-    BENCH_TASKS.forEach(function(t) {
-        var th = sparkRow ? sparkRow.querySelector('th[data-task="' + t + '"]') : null;
-        if (!th) return;
-        var refs = ref.map(function(r) { return r.scores ? r.scores[t] : null; })
-                      .filter(function(v) { return v != null; });
-        th.innerHTML = buildSparkline(seriesByTask[t], refs);
-    });
-
-    var rows = [];
-
-    // Newest first; current king bolded.
-    for (var i = 0; i < bd.history.length; i++) {
-        var h = bd.history[i];
-        var prev = bd.history[i + 1];
-        var prevScores = (prev && prev.scores) ? prev.scores : {};
-        var repo = h.hf_repo || "--";
-        var repoLink = h.hf_repo
-            ? '<a href="https://huggingface.co/' + repo + '" target="_blank" style="color:var(--ink)">' + repo + '</a>'
-            : repo;
-        var when = h.ts ? timeAgo(h.ts) : "--";
-        var rowClass = (i === 0) ? "bench-current-row" : "";
-        var cells = [
-            '<td>#' + (h.reign_number != null ? h.reign_number : "--") + '</td>',
-            '<td>' + repoLink + '</td>'
-        ];
-        for (var t = 0; t < BENCH_TASKS.length; t++) {
-            var task = BENCH_TASKS[t];
-            var v = h.scores ? h.scores[task] : null;
-            var pv = prevScores[task];
-            cells.push('<td>' + deltaCell(v, pv) + '</td>');
-        }
-        cells.push('<td title="' + (h.ts || "") + '">' + when + '</td>');
-        rows.push('<tr class="' + rowClass + '">' + cells.join("") + '</tr>');
-    }
-
-    if (_benchShowRef && ref.length) {
-        for (var r = 0; r < ref.length; r++) {
-            var ri = ref[r];
-            var refCells = [
-                '<td>--</td>',
-                '<td>' + ri.name + ' <span style="opacity:0.6">(' + ri.size + ', ' + ri.tokens + ')</span></td>'
-            ];
-            for (var t = 0; t < BENCH_TASKS.length; t++) {
-                var rv = ri.scores ? ri.scores[BENCH_TASKS[t]] : null;
-                refCells.push('<td>' + (rv != null ? fmtPct(rv) : "--") + '</td>');
-            }
-            refCells.push('<td>paper</td>');
-            rows.push('<tr class="bench-ref-row">' + refCells.join("") + '</tr>');
-        }
-    }
-
-    tbody.innerHTML = rows.join("");
 }
 
 function loadCachedEndpoint() {
@@ -1144,71 +906,7 @@ async function poll() {
     } catch (e) {}
 }
 
-function loadCachedBenchEndpoint() {
-    try {
-        var raw = localStorage.getItem(BENCH_ENDPOINT_CACHE_KEY);
-        if (!raw) return null;
-        var rec = JSON.parse(raw);
-        if (!rec || !rec.url || !rec.ts) return null;
-        if (BENCH_ENDPOINTS.indexOf(rec.url) === -1) return null;
-        if (Date.now() - rec.ts > ENDPOINT_CACHE_TTL_MS) return null;
-        return rec.url;
-    } catch (e) { return null; }
-}
-
-function saveCachedBenchEndpoint(url) {
-    try {
-        localStorage.setItem(BENCH_ENDPOINT_CACHE_KEY, JSON.stringify({ url: url, ts: Date.now() }));
-    } catch (e) {}
-}
-
-async function raceBenchEndpoints(buster) {
-    var ctrls = BENCH_ENDPOINTS.map(function() { return new AbortController(); });
-    var failures = 0;
-    return new Promise(function(resolve, reject) {
-        BENCH_ENDPOINTS.forEach(function(url, i) {
-            fetch(url + "?t=" + buster, { signal: ctrls[i].signal })
-                .then(function(r) {
-                    if (!r.ok) throw new Error("HTTP " + r.status);
-                    return r.json().then(function(data) { return { url: url, data: data, idx: i }; });
-                })
-                .then(function(win) {
-                    for (var j = 0; j < ctrls.length; j++) if (j !== win.idx) ctrls[j].abort();
-                    resolve(win);
-                })
-                .catch(function(e) {
-                    failures++;
-                    if (failures === BENCH_ENDPOINTS.length) reject(e);
-                });
-        });
-    });
-}
-
-async function pollBench() {
-    try {
-        var buster = Date.now();
-        if (BENCH_URL) {
-            try {
-                var r = await fetch(BENCH_URL + "?t=" + buster);
-                if (r.ok) { _lastBench = await r.json(); renderBench(_lastBench); return; }
-                throw new Error("HTTP " + r.status);
-            } catch (e) {
-                BENCH_URL = null;
-                try { localStorage.removeItem(BENCH_ENDPOINT_CACHE_KEY); } catch (_) {}
-            }
-        }
-        var win = await raceBenchEndpoints(buster);
-        BENCH_URL = win.url;
-        saveCachedBenchEndpoint(win.url);
-        _lastBench = win.data;
-        renderBench(_lastBench);
-    } catch (e) {
-        renderBench(null);
-    }
-}
-
 DATA_URL = loadCachedEndpoint();
-BENCH_URL = loadCachedBenchEndpoint();
 
 (function initToggle() {
     var btn = document.getElementById("theme-toggle");
@@ -1222,7 +920,6 @@ BENCH_URL = loadCachedBenchEndpoint();
         localStorage.setItem("theme", document.documentElement.dataset.theme);
         updateLabel();
         if (_lastData) render(_lastData);
-        if (_lastBench) renderBench(_lastBench);
     });
 })();
 
@@ -1247,21 +944,8 @@ BENCH_URL = loadCachedBenchEndpoint();
     });
 })();
 
-(function initBenchToggle() {
-    var cb = document.getElementById("bench-show-ref");
-    if (!cb) return;
-    cb.checked = _benchShowRef;
-    cb.addEventListener("change", function() {
-        _benchShowRef = cb.checked;
-        localStorage.setItem("benchShowRef", _benchShowRef ? "1" : "0");
-        if (_lastBench) renderBench(_lastBench);
-    });
-})();
-
 poll();
-pollBench();
 setInterval(poll, POLL_MS);
-setInterval(pollBench, BENCH_POLL_MS);
 </script>
 </body>
 </html>

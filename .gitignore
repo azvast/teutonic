@@ -20,15 +20,25 @@ env/
 *.pth
 *.ckpt
 
-# IDE
+# IDE / editor / agent
+.cursor/
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# OS
+# OS / logs / runtimes
 .DS_Store
 Thumbs.db
 wandb/
 logs/
+*.log
+node_modules/
+
+# Local working state (operator-only, never push)
+.backups/
+memory/
+recent-chat.json
+teutonic_test/
+hf_cache/

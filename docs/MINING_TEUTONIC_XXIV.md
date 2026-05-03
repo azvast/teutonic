@@ -22,10 +22,10 @@ challenger from HF, runs a paired cross-entropy test against the king on a
 random Hippius shard, and crowns the challenger if its bootstrap LCB on the
 per-token NLL improvement clears `delta = 1/N`. Winner takes 100% of SN3
 emission until dethroned. Full mechanism in
-[`teutonic/DESIGN.md`](DESIGN.md).
+[`DESIGN.md`](DESIGN.md).
 
 The architecture lock is enforced by `validate_challenger_config` in
-[`teutonic/validator.py`](validator.py): your challenger's `config.json`
+[`validator.py`](validator.py): your challenger's `config.json`
 must match the king on every key in `CONFIG_MATCH_KEYS` (vocab, dims, MoE
 shape, looped depth, latent-memory shape, RoPE, …) and **must not** ship
 any `*.py` files or set `auto_map`. Vendored modeling code only.
@@ -137,7 +137,7 @@ export HF_TOKEN=hf_...                 # write access to your HF org
 export BT_WALLET_NAME=mywallet         # registered on SN3
 export BT_WALLET_HOTKEY=default
 
-python teutonic/miner.py \
+python miner.py \
     --hf-account myaccount \
     --suffix 5DhAqMpd-noise-01 \
     --noise 1e-4
@@ -154,7 +154,7 @@ Under the hood `miner.py`:
 5. Submits the on-chain reveal commitment.
 
 You can watch the validator pick it up at
-[`https://s3.hippius.com/teutonic-sn3/dashboard.json`](https://s3.hippius.com/teutonic-sn3/dashboard.json).
+[`https://teutonic.ai/dashboard.json`](https://teutonic.ai/dashboard.json).
 
 ---
 
@@ -166,7 +166,7 @@ Right now the king is uniform over 262144 tokens (ln(262144) ≈ 12.48), so
 the first real training run will dethrone.
 
 A reasonable starting point uses
-[`teutonic/scripts/mining/train_challenger.py`](scripts/mining/train_challenger.py)
+[`scripts/mining/train_challenger.py`](scripts/mining/train_challenger.py)
 which:
 
 1. Reads the king repo + revision from the live dashboard.
@@ -179,7 +179,7 @@ which:
    before burning a HF push and chain reveal.
 
 ```bash
-torchrun --nproc-per-node=8 teutonic/scripts/mining/train_challenger.py \
+torchrun --nproc-per-node=8 scripts/mining/train_challenger.py \
     --upload-repo myaccount/Teutonic-XXIV-5DhAqMpd-v1 \
     --noise-only false \
     --max-iters 3
@@ -230,7 +230,8 @@ Verdicts you might see in `dashboard.json` under `history[*]`:
 ## 7. Useful links
 
 - King model: <https://huggingface.co/unconst/Teutonic-XXIV>
-- Live dashboard: <https://s3.hippius.com/teutonic-sn3/dashboard.json>
+- Live dashboard: <https://teutonic.ai>
+- Live JSON: <https://teutonic.ai/dashboard.json>
 - Source: <https://github.com/unarbos/teutonic>
 - Discord: `γ・τeuτonic・3` (ARbos answers technical questions there)
 - SILX Quasar docs: <https://huggingface.co/silx-ai/Quasar-3B-A1B-Preview>

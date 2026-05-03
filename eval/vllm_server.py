@@ -47,8 +47,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from eval_torch import R2, parse_gpu_ids, prefetch_shard
-from eval_vllm import VllmEvaluator, run_bootstrap_test_vllm
+from .torch_runner import R2, parse_gpu_ids, prefetch_shard
+from .vllm_runner import VllmEvaluator, run_bootstrap_test_vllm
 
 log = logging.getLogger("eval_server_vllm")
 

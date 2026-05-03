@@ -81,7 +81,7 @@ EVAL_ALPHA = 0.001
 LM_HEAD_CHUNK = 256
 DASHBOARD_URL = os.environ.get(
     "TEUTONIC_DASHBOARD_URL",
-    "https://s3.hippius.com/teutonic-sn3/dashboard.json",
+    "https://us-east-1.hippius.com/teutonic-sn3/dashboard.json",
 )
 HIPPIUS_BASE = "https://s3.hippius.com/teutonic-sn3"
 

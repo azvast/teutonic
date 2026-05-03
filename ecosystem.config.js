@@ -11,8 +11,8 @@ function dopplerPrd(key) {
 module.exports = {
   apps: [{
     name: "teutonic-eval-tunnel",
-    script: "/home/const/workspace/teutonic/tunnel.sh",
-    cwd: "/home/const/workspace/teutonic",
+    script: "./tunnel.sh",
+    cwd: "/home/const/workspace",
     autorestart: true,
     restart_delay: 5000,
     max_restarts: 1000,
@@ -20,12 +20,9 @@ module.exports = {
   }, {
     name: "teutonic-validator",
     script: "validator.py",
-    // --no-seen: only evaluate genuinely new (unseen) hotkeys; idle when
-    // queue is empty rather than replenishing with re-eval candidates.
-    // Set 2026-04-26 per operator request.
-    args: "--no-seen",
+    args: "",
     interpreter: "/home/const/workspace/.venv/bin/python",
-    cwd: "/home/const/workspace/teutonic",
+    cwd: "/home/const/workspace",
     env: {
       TEUTONIC_EVAL_SERVER: "http://localhost:9000",
       TEUTONIC_SEED_REPO: "unconst/Teutonic-XXIV",
@@ -45,37 +42,22 @@ module.exports = {
       TEUTONIC_DS_ACCESS_KEY: doppler("HIPPIUS_ACCESS_KEY"),
       TEUTONIC_DS_SECRET_KEY: doppler("HIPPIUS_SECRET_KEY"),
       TMC_API_KEY: doppler("TMC_API_KEY"),
-      // Discord notifications disabled per operator request. Re-enable by
-      // restoring DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID from Doppler.
-      DISCORD_BOT_TOKEN: "",
-      DISCORD_CHANNEL_ID: "",
-      // Disable hf-xet downloader (it has aborted the validator twice during
-      // dethrone-target king downloads on 2026-04-26). validator.py also sets
-      // this defensively before importing huggingface_hub, but having it in
-      // the env makes it explicit for any subprocess we spawn too.
-      HF_HUB_DISABLE_XET: "1",
-      // Each Teutonic-VIII eval is ~2.4x larger than Teutonic-III's ~250s,
-      // i.e. ~600s of bootstrap + setup + busy-wait for the eval-server lock.
-      // A single tick can legitimately take 10-20 minutes when the server is
-      // saturated; bumped from 1800 -> 2700 to give 8B evals headroom.
-      TEUTONIC_TICK_RESTART_AFTER: "2700",
+      DISCORD_BOT_TOKEN: doppler("DISCORD_BOT_TOKEN"),
+      DISCORD_CHANNEL_ID: doppler("DISCORD_CHANNEL_ID"),
+      // Each Teutonic-XXIV eval takes ~250s of bootstrap + setup + busy-wait
+      // for the eval-server lock. A single tick can legitimately take
+      // 7-15 minutes when the server is saturated; default 600s was tripping
+      // the watchdog on every successful eval.
+      TEUTONIC_TICK_RESTART_AFTER: "1800",
       TEUTONIC_MAX_CONSECUTIVE_TICK_ERRORS: "20",
-      // The eval server stays silent on the SSE stream for the entire model
-      // download + load (no events emitted until bootstrap starts). For 8B
-      // models that gap is ~5-7 min wall, which trips the default 420s
-      // STREAM_IDLE_TIMEOUT and makes the validator throw away verdicts that
-      // would otherwise be valid (observed for vera6/Teutonic-VIII-v03 on
-      // 2026-04-28: server delivered mu_hat=5.28 LCB=5.27 but validator had
-      // already given up). 900s gives full margin even with cold HF caches.
-      TEUTONIC_STREAM_IDLE_TIMEOUT: "900",
+      // Defense-in-depth for the eval-stream idle watchdog. The eval_server
+      // now emits SSE heartbeat events during king/challenger load so this
+      // should never trip in normal operation; the wider envelope is just
+      // insurance against slow CDN downloads of an uncached challenger.
       TEUTONIC_STREAM_IDLE_WARN_AFTER: "300",
+      TEUTONIC_STREAM_IDLE_TIMEOUT: "900",
     },
-    // Bumped from 10 → 1000 after 2026-04-26 incident: PM2 gave up on the
-    // validator at restart #15 and the subnet ran without a validator for
-    // ~21 minutes. This counter resets only when the process stays up for
-    // min_uptime (default 1s), which is generous; the real safety net is
-    // the rest of our error handling.
-    max_restarts: 1000,
+    max_restarts: 10,
     restart_delay: 5000,
     autorestart: true,
     log_date_format: "YYYY-MM-DD HH:mm:ss",

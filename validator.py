@@ -779,9 +779,8 @@ def _seed_king_hash(repo: str, revision: str) -> str:
     the huggingface downloader cannot take the whole validator with it (see
     2026-04-26 incidents where xet aborts SIGKILLed the parent mid-dethrone).
 
-    Falls back to the literal string "seed" if the subprocess fails — the live
-    state can be patched later with scripts/patch_seed_king_hash.py, or by the
-    placeholder-recompute path in State.load().
+    Falls back to the literal string "seed" if the subprocess fails — the
+    placeholder-recompute path in State.load() will fix it on the next start.
     """
     import subprocess
     timeout_s = int(os.environ.get("TEUTONIC_KING_HASH_TIMEOUT_S", "1200"))
@@ -2014,6 +2013,9 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
         "challenge_id": cid, "challenger_repo": hf_repo, "hotkey": hotkey,
         "progress": 0, "total": EVAL_N, "mu_hat": 0,
         "avg_king_loss": 0, "avg_challenger_loss": 0,
+        "stage": "dispatching",
+        "stage_started_at": _now(),
+        "stage_elapsed_s": 0,
         "started_at": _now(),
     }
     state.flush_dashboard(force=True)
@@ -2038,6 +2040,12 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
         for attempt in range(max_busy_retries):
             state.set_phase("eval_dispatch_wait", challenge_id=cid,
                             notes=f"dispatch attempt {attempt + 1}/{max_busy_retries}")
+            state.current_eval["stage"] = "waiting_for_slot"
+            state.current_eval["stage_started_at"] = _now()
+            state.current_eval["stage_extra"] = {
+                "attempt": attempt + 1, "max_attempts": max_busy_retries,
+            }
+            state.flush_dashboard(force=True)
             resp = await client.post(f"{EVAL_SERVER_URL}/eval", json=eval_payload)
             if resp.status_code != 409:
                 break
@@ -2110,7 +2118,30 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
                         "mu_hat": d.get("mu_hat", 0),
                         "avg_king_loss": d.get("avg_king_loss", 0),
                         "avg_challenger_loss": d.get("avg_challenger_loss", 0),
+                        "stage": "bootstrap_running",
+                        "stage_started_at": _now(),
+                        "stage_elapsed_s": 0,
                     })
+                    state.flush_dashboard()
+
+                elif event["type"] == "stage":
+                    d = event["data"]
+                    stage_name = d.get("name", "?")
+                    extra = {k: v for k, v in d.items() if k not in ("name", "ts")}
+                    state.current_eval["stage"] = stage_name
+                    state.current_eval["stage_started_at"] = _now()
+                    state.current_eval["stage_elapsed_s"] = 0
+                    state.current_eval["stage_extra"] = extra
+                    state.set_phase(f"eval_{stage_name}", challenge_id=cid,
+                                    eval_id=eval_id, notes=stage_name)
+                    state.note_progress(notes=f"stage {stage_name}")
+                    state.flush_dashboard(force=True)
+
+                elif event["type"] == "heartbeat":
+                    d = event["data"]
+                    state.current_eval["stage"] = d.get("stage", state.current_eval.get("stage", "?"))
+                    state.current_eval["stage_elapsed_s"] = d.get("elapsed_s", 0)
+                    state.note_progress(notes=f"stage {d.get('stage','?')} {d.get('elapsed_s',0):.0f}s")
                     state.flush_dashboard()
 
                 elif event["type"] == "verdict":
@@ -2327,7 +2358,9 @@ async def main():
                     "hotkey": entry.get("hotkey", ""),
                     "progress": 0, "total": EVAL_N, "mu_hat": 0,
                     "avg_king_loss": 0, "avg_challenger_loss": 0,
-                    "loading": True,
+                    "stage": "queued",
+                    "stage_started_at": _now(),
+                    "stage_elapsed_s": 0,
                     "started_at": _now(),
                 }
                 state.flush_dashboard()

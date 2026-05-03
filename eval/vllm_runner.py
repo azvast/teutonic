@@ -33,7 +33,7 @@ from typing import Any
 
 import numpy as np
 
-from eval_torch import (
+from .torch_runner import (
     download_shard,
     extract_sequences,
     get_shard_info,

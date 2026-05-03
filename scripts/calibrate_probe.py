@@ -42,7 +42,7 @@ if _pre_args.grad_norm_max is not None:
 if _pre_args.param_group_grad_max is not None:
     os.environ["TEUTONIC_FINETUNE_PARAM_GROUP_GRAD_MAX"] = str(_pre_args.param_group_grad_max)
 
-from eval_torch import (  # noqa: E402
+from eval.torch_runner import (  # noqa: E402
     load_model, trainability_probe,
     FINETUNE_NORM_WEIGHT_MAX, FINETUNE_GRAD_NORM_MAX,
     FINETUNE_PARAM_GROUP_GRAD_MAX,

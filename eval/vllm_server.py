@@ -26,8 +26,8 @@ Env vars:
     TEUTONIC_PROBE_ENABLED        "1" to run HF trainability probe at load
     HF_TOKEN, TEUTONIC_R2_*       same as eval_server.py
 
-Run:
-    uvicorn eval_server_vllm:app --host 127.0.0.1 --port 9001
+Run (from repo root):
+    uvicorn eval.vllm_server:app --host 127.0.0.1 --port 9001
 """
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from .torch_runner import R2, parse_gpu_ids, prefetch_shard
+from .torch_runner import R2, parse_gpu_ids, download_shard
 from .vllm_runner import VllmEvaluator, run_bootstrap_test_vllm
 
 log = logging.getLogger("eval_server_vllm")
@@ -360,7 +360,7 @@ def _run_eval(eval_id: str, req: EvalRequest):
     try:
         if req.shard_key:
             try:
-                prefetch_shard(_r2, req.shard_key)
+                download_shard(_r2, req.shard_key)
             except Exception:
                 log.warning("shard prefetch kickoff failed (non-fatal)", exc_info=True)
 
@@ -588,5 +588,5 @@ if __name__ == "__main__":
     host = os.environ.get("EVAL_HOST", "127.0.0.1")
     port = int(os.environ.get("EVAL_PORT", "9001"))
     uvicorn.run(
-        "eval_server_vllm:app", host=host, port=port, log_level="info",
+        "eval.vllm_server:app", host=host, port=port, log_level="info",
     )

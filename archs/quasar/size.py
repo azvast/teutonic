@@ -2,26 +2,23 @@
 """Quasar config sizer. Builds QuasarConfig + QuasarForCausalLM on the meta
 device and reports total / active parameter counts. Iterate with --hidden /
 --n-layers / --num-experts / --top-k / --routed-expert-size / --shared-expert-size
-until the printed numbers land near 8B active / 24B total.
+until the printed numbers land near your target.
 
 Usage:
     source /home/const/workspace/.venv/bin/activate
-    python teutonic/scripts/size_quasar.py \
+    python -m archs.quasar.size \
         --hidden 4096 --n-layers 32 --num-experts 80 --top-k 10 \
         --routed-expert-size 2560 --shared-expert-size 4096 --d-ff 11008
 """
 import argparse
-import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-import torch
 from accelerate import init_empty_weights
 
-import teutonic.quasar  # registers QuasarConfig with AutoConfig
-from teutonic.quasar import QuasarConfig, QuasarForCausalLM
+from archs.quasar import QuasarConfig, QuasarForCausalLM
 
 
 def build_config(args) -> QuasarConfig:

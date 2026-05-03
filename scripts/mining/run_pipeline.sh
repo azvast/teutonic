@@ -9,11 +9,15 @@
 # 6. Write a status report to .arbos/outbox/.
 #
 # Usage:
-#   ./run_pipeline.sh start [--hotkey h0] [--upload-repo unconst/Teutonic-VIII-5DhAqMpd-h0]
+#   ./run_pipeline.sh start [--hotkey h0] [--upload-repo <namespace>/<chain.name>-<coldkey-prefix>-<tag>]
 #   ./run_pipeline.sh tail
 #   ./run_pipeline.sh status
 #   ./run_pipeline.sh fetch        # pull verdict only
 #   ./run_pipeline.sh submit       # submit reveal locally using fetched verdict
+#
+# Chain identity (name, seed repo) is read from chain.toml at the repo root.
+# UPLOAD_REPO must match the active chain's repo_pattern (default
+# `^[^/]+/<chain.name>-.+$`).
 #
 # REQUIRED — coldkey prefix in HF repo name (since 2026-04-29):
 #   Your UPLOAD_REPO must contain the first 8 ss58 chars of YOUR coldkey
@@ -21,13 +25,20 @@
 #   basename). Without that, the validator will reject your eval with
 #   `coldkey_required` — anti-impersonation gate. Find your coldkey ss58
 #   with `btcli wallet list` (column "ss58" under your coldkey block).
-#   Example: if your coldkey is `5DhAqMpd...`, valid UPLOAD_REPO names
-#   include `myaccount/Teutonic-VIII-5DhAqMpd-v3` or
-#   `someaccount-5DhAqMpd/Teutonic-VIII-mymodel`.
+#   Example: if your coldkey is `5DhAqMpd...` and the active chain is
+#   Teutonic-XXIV, valid UPLOAD_REPO names include
+#   `myaccount/Teutonic-XXIV-5DhAqMpd-v3` or
+#   `someaccount-5DhAqMpd/Teutonic-XXIV-mymodel`.
 set -euo pipefail
 
 cd "$(dirname "$0")/../../.."
 ROOT="$(pwd)"
+# The chain.toml + chain_config.py live at the teutonic repo root. The legacy
+# pipeline assumes the repo is checked out as a `teutonic/` subdir of $ROOT;
+# resolve that explicitly so CHAIN_NAME_DEFAULT works regardless of whether
+# the repo lives at $ROOT or $ROOT/teutonic.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TEUTONIC_REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 REMOTE_HOST="wrk-nlapfgb9asmx@ssh.deployments.targon.com"
 REMOTE_DIR="/root/teutonic-mining"
 SESSION="teutonic-miner"
@@ -35,9 +46,20 @@ VERDICT_REMOTE="$REMOTE_DIR/work/verdict.json"
 VERDICT_LOCAL="$ROOT/reports/teutonic-mining/verdict.json"
 LOG_REMOTE="$REMOTE_DIR/work/train.log"
 HOTKEY="${HOTKEY:-h0}"
-# Default placeholder; override with UPLOAD_REPO=<account>/Teutonic-VIII-<your-coldkey-prefix>-<tag>
+# Resolve the active chain name from chain.toml so the default UPLOAD_REPO
+# matches whatever king is live; override with
+# UPLOAD_REPO=<account>/<chain.name>-<your-coldkey-prefix>-<tag>
 # (must contain the first 8 chars of your coldkey ss58 — see header).
-UPLOAD_REPO="${UPLOAD_REPO:-unconst/Teutonic-VIII-h0}"
+CHAIN_NAME_DEFAULT="$(REPO_ROOT="$TEUTONIC_REPO_ROOT" python3 -c '
+import os, sys
+sys.path.insert(0, os.environ["REPO_ROOT"])
+try:
+  import chain_config
+  print(chain_config.NAME)
+except Exception:
+  print("Teutonic")
+')"
+UPLOAD_REPO="${UPLOAD_REPO:-unconst/${CHAIN_NAME_DEFAULT}-h0}"
 
 ssh_run() { ssh -o ConnectTimeout=15 -o StrictHostKeyChecking=no "$REMOTE_HOST" "$@"; }
 

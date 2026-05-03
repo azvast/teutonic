@@ -48,7 +48,7 @@ sequenceDiagram
 
     Miner->>HF: download king at pinned revision
     Miner->>Miner: perturb / train -> challenger
-    Miner->>HF: upload unconst/Teutonic-I-<suffix>
+    Miner->>HF: upload <namespace>/<chain.name>-<suffix>
     Miner->>Chain: set_reveal_commitment("king16:repo:hash", reveal in 3 blocks)
     Validator->>Chain: poll get_all_revealed_commitments(NETUID=3)
     Validator->>HF: pin challenger commit SHA, fetch config.json + norm stats
@@ -138,8 +138,9 @@ From [miner.py](../miner.py):
    `vocab_size, hidden_size, num_hidden_layers, num_attention_heads,
    num_key_value_heads, head_dim, intermediate_size, model_type` and that the
    `architectures` field matches. The validator re-checks this server-side.
-6. Push to `unconst/Teutonic-I-<suffix>` (the regex
-   `^[^/]+/Teutonic-I-.+$` is enforced by both miner and validator).
+6. Push to `<seed_namespace>/<chain.name>-<suffix>` (the regex
+   `^[^/]+/<chain.name>-.+$` is enforced by both miner and validator;
+   chain identity comes from [`chain.toml`](../chain.toml)).
 7. Submit a reveal commitment whose payload is exactly:
 
    ```
@@ -326,9 +327,9 @@ the original `eval_penalized.py` implementation if revisited.
   R2 history writes (`append_jsonl`), and dashboard flushes log a warning on
   failure but never break the loop.
 - **Architecture/config drift.** `validate_challenger_config` enforces an
-  exact match on `architectures` and on the eight config keys in
-  `CONFIG_MATCH_KEYS`. This is what locks the network to a single model
-  family ("Teutonic-I").
+  exact match on `architectures` and on the union of the generic structural
+  keys plus `[arch].extra_lock_keys` from [`chain.toml`](../chain.toml).
+  This is what locks the network to a single model family per chain.
 
 ---
 

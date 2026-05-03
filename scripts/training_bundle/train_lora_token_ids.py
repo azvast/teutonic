@@ -80,7 +80,7 @@ def main():
     )
     model.config.use_cache = False
 
-    # Quasar (Teutonic-XXIV) module names: attn uses q_proj/k_proj/v_proj/o_proj
+    # Quasar module names: attn uses q_proj/k_proj/v_proj/o_proj
     # like Qwen3, but FFN paths split into the dense SwiGLU (ffn.gate / ffn.up
     # / ffn.down) and BigMac MoE (shared_experts.{i}.{gate,up,down},
     # w_down_proj, w_up_proj). LoRA on `experts_w12` / `experts_w3` is not

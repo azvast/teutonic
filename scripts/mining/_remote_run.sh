@@ -13,7 +13,7 @@ export HF_TOKEN="$(cat .hf_token)"
 exec ./venv/bin/python -u train_challenger.py \
   --work /root/teutonic-mining/work \
   --bundle /root/teutonic-mining/bundle \
-  --upload-repo "${UPLOAD_REPO:-unconst/Teutonic-VIII-h0}" \
+  --upload-repo "${UPLOAD_REPO:?UPLOAD_REPO must be set (matching the active chain.toml [chain].name)}" \
   --report-out /root/teutonic-mining/work/verdict.json \
   --hf-token "$HF_TOKEN" \
   --n-shards 2 \

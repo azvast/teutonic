@@ -22,18 +22,19 @@ and be invoked there. It does NOT touch bittensor — that step is handled
 by submit_challenger.py on the templar host where the wallet lives.
 
 REQUIRED — coldkey prefix in --upload-repo (since 2026-04-29):
-  The Teutonic-XXIV validator rejects any HF repo whose name doesn't
-  contain the first 8 ss58 chars of the miner's coldkey (case-insensitive
-  substring, in either the HF account or the model basename). This is
-  an anti-impersonation gate — only the legit coldkey owner can publish
-  a repo whose name embeds *their* coldkey. Imposters who lift somebody
+  The validator rejects any HF repo whose name doesn't contain the first
+  8 ss58 chars of the miner's coldkey (case-insensitive substring, in
+  either the HF account or the model basename). This is an
+  anti-impersonation gate — only the legit coldkey owner can publish a
+  repo whose name embeds *their* coldkey. Imposters who lift somebody
   else's URL end up advertising the victim's coldkey on chain.
 
   This script doesn't have wallet access so it can't enforce locally —
   the orchestrator (run_pipeline.sh) and the on-chain submitter
   (submit_challenger.py) both check before they burn HF / TAO. Pass an
-  --upload-repo whose full id contains your coldkey prefix, e.g.
-      myaccount/Teutonic-XXIV-5DhAqMpd-v3
+  --upload-repo matching the active chain (chain.toml -> [chain].name)
+  with your coldkey prefix embedded, e.g.
+      myaccount/<chain.name>-5DhAqMpd-v3
 """
 from __future__ import annotations
 
@@ -59,12 +60,17 @@ from huggingface_hub import HfApi, snapshot_download
 from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Mining harness lives at teutonic/scripts/mining/; bootstrap workspace root
-# onto sys.path so `import teutonic.quasar` registers the Quasar arch.
-_workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-if _workspace_root not in sys.path:
-    sys.path.insert(0, _workspace_root)
-import teutonic.quasar  # noqa: F401  registers Quasar with AutoModelForCausalLM
+# Mining harness lives at scripts/mining/; bootstrap repo root onto sys.path
+# so the active arch (chain.toml -> [arch].module) registers with HF Auto*.
+# When deployed to the GPU box (run_pipeline.sh tar-pushes only this script),
+# the user must `pip install -e .` the teutonic repo there so chain_config /
+# archs are importable.
+_repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+import chain_config  # noqa: E402
+
+chain_config.load_arch()
 
 logging.basicConfig(
     level=logging.INFO,

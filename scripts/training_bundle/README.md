@@ -44,7 +44,7 @@ All sequences should ideally already be length 2048.
 
 ```bash
 python teutonic/scripts/training_bundle/score_samples.py \
-  --model unconst/Teutonic-I \
+  --model "$(python -c 'import chain_config; print(chain_config.SEED_REPO)')" \
   --shard /path/to/shard.npy \
   --output scored.jsonl \
   --max-samples 5000
@@ -63,7 +63,7 @@ python teutonic/scripts/training_bundle/build_curriculum.py \
 
 ```bash
 torchrun --nproc_per_node=8 teutonic/scripts/training_bundle/train_lora_token_ids.py \
-  --base-model unconst/Teutonic-I \
+  --base-model "$(python -c 'import chain_config; print(chain_config.SEED_REPO)')" \
   --train-data train.jsonl \
   --val-data val.jsonl \
   --output-dir outputs/teutonic-lora \
@@ -83,7 +83,7 @@ torchrun --nproc_per_node=8 teutonic/scripts/training_bundle/train_lora_token_id
 
 ```bash
 python teutonic/scripts/training_bundle/merge_lora.py \
-  --base-model unconst/Teutonic-I \
+  --base-model "$(python -c 'import chain_config; print(chain_config.SEED_REPO)')" \
   --adapter-dir outputs/teutonic-lora/best_adapter \
   --output-dir outputs/teutonic-merged
 ```

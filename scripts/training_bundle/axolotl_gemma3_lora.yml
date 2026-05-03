@@ -1,4 +1,4 @@
-base_model: unconst/Teutonic-I
+base_model: unconst/Teutonic-XXIV
 model_type: AutoModelForCausalLM
 tokenizer_type: AutoTokenizer
 is_pretraining: true

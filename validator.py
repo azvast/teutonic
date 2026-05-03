@@ -34,19 +34,22 @@ import numpy as np
 from botocore.config import Config as BotoConfig
 from huggingface_hub import HfApi
 
-# pm2 starts validator.py with cwd=/home/const/workspace/teutonic so the
-# default sys.path[0] is the teutonic dir, not the workspace root. Add the
-# workspace root explicitly so `import teutonic.quasar` resolves.
-_workspace_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _workspace_root not in sys.path:
-    sys.path.insert(0, _workspace_root)
+# Make the repo root importable regardless of cwd / how the script is invoked
+# (PM2 runs from the repo root; ad-hoc ssh-and-run from any cwd should also
+# work). chain_config + the vendored archs/ tree sit next to validator.py.
+_repo_root = os.path.dirname(os.path.abspath(__file__))
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
 
-# Register the vendored Quasar arch with AutoConfig / AutoModelForCausalLM so
-# any downstream HF dispatch (config inspection, model loading) resolves
-# Teutonic-XXIV checkpoints without trust_remote_code. The seed checkpoint
-# strips auto_map and we deny *.py uploads in validate_challenger_config; this
-# import is what makes that policy actually loadable.
-import teutonic.quasar  # noqa: F401
+# Register the active vendored arch with AutoConfig / AutoModelForCausalLM so
+# any downstream HF dispatch (config inspection, model loading) resolves the
+# king checkpoint without trust_remote_code. The seed checkpoint strips
+# auto_map and we deny *.py uploads in validate_challenger_config; loading the
+# arch here is what makes that policy actually workable. The arch module is
+# selected by chain.toml -> [arch].module.
+import chain_config  # noqa: E402
+
+chain_config.load_arch()
 
 # ---------------------------------------------------------------------------
 # Config
@@ -68,7 +71,7 @@ HEALTHCHECK_INTERVAL = int(os.environ.get("TEUTONIC_HEALTHCHECK_INTERVAL", "60")
 STATE_FLUSH_INTERVAL = int(os.environ.get("TEUTONIC_STATE_FLUSH_INTERVAL", "60"))
 MAX_CONSECUTIVE_TICK_ERRORS = int(os.environ.get("TEUTONIC_MAX_CONSECUTIVE_TICK_ERRORS", "10"))
 NETWORK = os.environ.get("TEUTONIC_NETWORK", "finney")
-SEED_REPO = os.environ.get("TEUTONIC_SEED_REPO", "unconst/Teutonic-XXIV")
+SEED_REPO = os.environ.get("TEUTONIC_SEED_REPO", chain_config.SEED_REPO)
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 EVAL_SERVER_URL = os.environ.get("TEUTONIC_EVAL_SERVER", "http://localhost:9000")
 WALLET_NAME = os.environ.get("BT_WALLET_NAME", "teutonic")
@@ -94,7 +97,7 @@ TMC_API_KEY = os.environ.get("TMC_API_KEY", "")
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")
 
-REPO_PATTERN = r"^[^/]+/Teutonic-XXIV-.+$"
+REPO_PATTERN = os.environ.get("TEUTONIC_REPO_PATTERN", chain_config.REPO_PATTERN)
 
 # Anti-impersonation: miners must include the first N ss58 chars of their
 # coldkey somewhere in their HF repo name. Two miners trying to claim the
@@ -495,23 +498,18 @@ def validate_challenger_config(hf_repo: str, challenger_revision: str,
     if king_arch and chall_arch and king_arch != chall_arch:
         return f"architecture mismatch: king={king_arch} challenger={chall_arch}"
 
-    # Structural lock. Includes Quasar-specific dials so a challenger cannot
-    # silently change the looped/MoE/memory shape and slip past dim matching.
-    # The Quasar-style aliases (d_model, n_layers, n_heads, d_ff) are kept
-    # alongside the HF-canonical names because QuasarConfig maintains both.
-    for key in ("vocab_size", "hidden_size", "num_hidden_layers",
-                "num_attention_heads", "num_key_value_heads", "head_dim",
-                "intermediate_size", "model_type",
-                # Quasar-only structural fields (see teutonic/quasar/configuration_quasar.py).
-                "d_model", "n_layers", "n_heads", "d_ff",
-                "quasar_layers", "gated_layers", "use_gla_first",
-                "dense_input_layers", "moe_type",
-                "num_routed_experts", "num_shared_experts", "top_k",
-                "routed_expert_size", "shared_expert_size", "bigmac_r",
-                "memory_slots", "memory_dim",
-                "num_loops", "use_looped_injection",
-                "tie_word_embeddings", "rope_theta", "max_position_embeddings",
-                "max_seq_len"):
+    # Structural lock. Generic structural keys plus the active arch's extra
+    # lock keys (declared in chain.toml -> [arch].extra_lock_keys) so a
+    # challenger cannot silently change MoE/memory/loop shape and slip past
+    # dim matching.
+    _generic_lock = (
+        "vocab_size", "hidden_size", "num_hidden_layers",
+        "num_attention_heads", "num_key_value_heads", "head_dim",
+        "intermediate_size", "model_type",
+        "tie_word_embeddings", "rope_theta", "max_position_embeddings",
+        "max_seq_len",
+    )
+    for key in _generic_lock + chain_config.EXTRA_LOCK_KEYS:
         king_val = king_cfg.get(key)
         chall_val = challenger_cfg.get(key)
         if king_val is not None and chall_val is not None and king_val != chall_val:
@@ -1490,6 +1488,10 @@ class State:
                 })
             payload = {
                 "updated_at": _now(),
+                "chain": {
+                    "name": chain_config.NAME,
+                    "seed_repo": chain_config.SEED_REPO,
+                },
                 "king": self.king,
                 "king_chain": king_chain,
                 "king_chain_weights": king_chain_weights,
@@ -2262,7 +2264,7 @@ async def main():
     state.refresh_uid_map(subtensor, NETUID)
     state.flush_dashboard(force=True)
 
-    html_path = os.path.join(os.path.dirname(__file__) or ".", "index.html")
+    html_path = os.path.join(os.path.dirname(__file__) or ".", "website", "index.html")
     if os.path.exists(html_path):
         with open(html_path, "rb") as f:
             html_bytes = f.read()

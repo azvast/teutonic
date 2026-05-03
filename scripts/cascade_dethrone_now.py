@@ -21,9 +21,12 @@ import httpx
 from botocore.config import Config as BotoConfig
 from huggingface_hub import HfApi
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import chain_config  # noqa: E402
+
 EVAL_SERVER = os.environ.get("TEUTONIC_EVAL_SERVER", "http://localhost:9000")
 PROBE_TIMEOUT_S = int(os.environ.get("TEUTONIC_PROBE_TIMEOUT_S", "600"))
-SEED_REPO = os.environ.get("TEUTONIC_SEED_REPO", "unconst/Teutonic-VIII")
+SEED_REPO = os.environ.get("TEUTONIC_SEED_REPO", chain_config.SEED_REPO)
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
 R2_ENDPOINT = os.environ["TEUTONIC_R2_ENDPOINT"]

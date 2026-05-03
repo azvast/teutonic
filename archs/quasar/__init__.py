@@ -1,12 +1,15 @@
-"""Vendored Quasar architecture for Teutonic-IX.
+"""Vendored Quasar architecture (SILX-AI hybrid MoE).
 
 Importing this package registers QuasarConfig and QuasarForCausalLM with the
 HuggingFace Auto* APIs. Once imported, AutoModelForCausalLM.from_pretrained
-loads any Teutonic-IX checkpoint without trust_remote_code.
+loads any Quasar checkpoint without trust_remote_code.
 
-The plan is enforced upstream (validator rejects challenger uploads that ship
-*.py or set auto_map). The seed checkpoint also strips auto_map before push so
-no client of this package is ever asked to execute remote code.
+The validator rejects challenger uploads that ship *.py or set auto_map; the
+seed checkpoint also strips auto_map before push so no client of this package
+is ever asked to execute remote code.
+
+This package is one of potentially many under `archs/`; the active arch is
+selected by `chain.toml -> [arch].module`.
 """
 
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM

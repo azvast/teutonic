@@ -31,7 +31,7 @@ Env vars:
 ## Files touched
 
 - [../validator.py](../validator.py) — add `king_history` to `State`, append/trim on dethrone, derive weights inside `maybe_set_weights`, expose in dashboard payload.
-- [../index.html](../index.html) — new "Weight Distribution" section.
+- [../website/index.html](../website/index.html) — new "Weight Distribution" section.
 
 ## Step 1 — Add window + helpers to `State`
 
@@ -189,7 +189,7 @@ payload["king_history"] = {
 }
 ```
 
-## Step 6 — Website: Weight Distribution section in `index.html`
+## Step 6 — Website: Weight Distribution section in `website/index.html`
 
 Insert after the "Last Winner" section:
 
@@ -234,7 +234,7 @@ if (ws.length === 0) {
 }
 ```
 
-The dashboard `index.html` is uploaded to Hippius by `main()` on every startup (validator.py lines 1509-1514), so the new HTML deploys automatically on `pm2 restart`.
+The dashboard `website/index.html` is uploaded to Hippius by `main()` on every startup, so the new HTML deploys automatically on `pm2 restart`.
 
 ## Step 7 — Restart
 
@@ -275,5 +275,5 @@ With `N=16, k=1`: max raw value is `exp(0) = 1`, min is `exp(-15) ≈ 3e-7`. Sum
 - [ ] Append to `king_history` after `state.set_king` in `process_challenge`
 - [ ] Swap `topk_for_weight_set` for `king_history_weights` in `maybe_set_weights`
 - [ ] Add `king_history` block to dashboard payload
-- [ ] Add Weight Distribution section + bar renderer to `../index.html`
+- [ ] Add Weight Distribution section + bar renderer to `../website/index.html`
 - [ ] `pm2 restart teutonic-validator` and confirm logs + dashboard

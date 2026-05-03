@@ -1,8 +1,4 @@
-# Mining Teutonic-XXIV (Quasar 8B-active / 24B-total MoE)
-
-The Teutonic SN3 king is now `unconst/Teutonic-XXIV`, a freshly-initialised
-SILX-AI Quasar hybrid MoE: ~8B active per token, ~24B total parameters,
-RoPE θ=1e6, vocab 262144 (same Hippius shards as before — no retokenization).
+# Mining the active king
 
 This guide tells you how to:
 
@@ -12,6 +8,15 @@ This guide tells you how to:
 
 If you only want to play with random noise, jump to **Quick start (noise
 miner)**. If you want to actually dethrone the king, see **Real training**.
+
+> The active chain (king name, seed repo, repo-name regex, vendored
+> architecture) is declared in [`chain.toml`](../chain.toml) at the repo
+> root. Throughout this guide `<chain.name>` and `<seed_repo>` mean
+> whatever `[chain].name` and `[chain].seed_repo` are set to. At the time
+> of writing the active chain is **Teutonic-XXIV** (`unconst/Teutonic-XXIV`),
+> a freshly-initialised SILX-AI Quasar hybrid MoE: ~8B active per token,
+> ~24B total parameters, RoPE θ=1e6, vocab 262144. Arch-specific numbers
+> below assume Quasar; check `chain.toml` if it has been swapped.
 
 ---
 
@@ -25,10 +30,12 @@ emission until dethroned. Full mechanism in
 [`DESIGN.md`](DESIGN.md).
 
 The architecture lock is enforced by `validate_challenger_config` in
-[`validator.py`](validator.py): your challenger's `config.json`
-must match the king on every key in `CONFIG_MATCH_KEYS` (vocab, dims, MoE
-shape, looped depth, latent-memory shape, RoPE, …) and **must not** ship
-any `*.py` files or set `auto_map`. Vendored modeling code only.
+[`validator.py`](../validator.py): your challenger's `config.json`
+must match the king on every key in the generic structural set (vocab,
+dims, RoPE, …) plus `[arch].extra_lock_keys` from `chain.toml` (for the
+current Quasar chain that includes MoE shape, looped depth, latent-memory
+shape, …) and **must not** ship any `*.py` files or set `auto_map`.
+Vendored modeling code only.
 
 ---
 
@@ -49,7 +56,7 @@ pip install transformers accelerate safetensors huggingface_hub bittensor numpy
 pip install "flash-linear-attention @ git+https://github.com/SILX-LABS/quasar-flash-linear-attention.git@84ad1cc5a7428609d7e0e56d4041a775cd19b7bb"
 ```
 
-Clone the validator/miner code so you have the vendored Quasar package
+Clone the validator/miner code so you have the vendored arch package
 locally:
 
 ```bash
@@ -62,9 +69,10 @@ Sanity-check the model loads without `trust_remote_code`:
 ```bash
 python -c "
 import sys; sys.path.insert(0, '.')
-import teutonic.quasar
+import chain_config
+chain_config.load_arch()  # registers the active arch with HF Auto*
 from transformers import AutoModelForCausalLM
-m = AutoModelForCausalLM.from_pretrained('unconst/Teutonic-XXIV', torch_dtype='bfloat16', device_map={'': 'cuda:0'})
+m = AutoModelForCausalLM.from_pretrained(chain_config.SEED_REPO, torch_dtype='bfloat16', device_map={'': 'cuda:0'})
 print('loaded', sum(p.numel() for p in m.parameters())/1e9, 'B params')
 "
 ```
@@ -76,7 +84,10 @@ expected (FA2 / SDPA upstream do not yet support QuasarForCausalLM).
 
 ## 2. Architecture you must match exactly
 
-The king config is locked at:
+The king's `config.json` is the source of truth; the lock keys are the
+union of the generic structural set in `validator.py` plus
+`[arch].extra_lock_keys` in `chain.toml`. For the current Quasar king the
+locked values are:
 
 | field | value |
 |---|---|
@@ -105,18 +116,21 @@ If any of these drift, the validator rejects with `"<key> mismatch"`.
 
 If your repo contains `*.py` or your config has `auto_map`, the validator
 rejects with `"repo ships *.py files"` or `"auto_map present in
-config.json"`. The vendored `teutonic/quasar/` module is the only path the
-network accepts — your weights must load via plain
-`AutoModelForCausalLM.from_pretrained(...)` after `import teutonic.quasar`.
+config.json"`. The vendored `archs/<chain.toml [arch].module>` package in
+this repo is the only path the network accepts — your weights must load
+via plain `AutoModelForCausalLM.from_pretrained(...)` after
+`chain_config.load_arch()`.
 
 ---
 
 ## 3. Repo naming and anti-impersonation
 
-Your HF repo MUST match `^[^/]+/Teutonic-XXIV-.+$` AND embed the first
-8 ss58 chars of your coldkey somewhere in the full repo id (case
-insensitive, in either the namespace or the model basename). Examples for
-coldkey `5DhAqMpdABCDEFG…`:
+Your HF repo MUST match the chain's `repo_pattern`, which defaults to
+`^[^/]+/<chain.name>-.+$` (today: `^[^/]+/Teutonic-XXIV-.+$`). It must
+also embed the first 8 ss58 chars of your coldkey somewhere in the full
+repo id (case insensitive, in either the namespace or the model
+basename). Examples for coldkey `5DhAqMpdABCDEFG…` against the current
+chain:
 
 - ✅ `myaccount/Teutonic-XXIV-5DhAqMpd-v3`
 - ✅ `5DhAqMpd/Teutonic-XXIV-noise01`
@@ -138,7 +152,7 @@ export BT_WALLET_NAME=mywallet         # registered on SN3
 export BT_WALLET_HOTKEY=default
 
 python miner.py \
-    --hf-account myaccount \
+    --hotkey default \
     --suffix 5DhAqMpd-noise-01 \
     --noise 1e-4
 ```
@@ -150,11 +164,13 @@ Under the hood `miner.py`:
    skips SMEBU global bias / momentum / max_vio buffers and the latent
    memory state (perturbing those collapses routing or destroys memory).
 3. Runs the same `validate_local_config` checks the validator runs.
-4. Uploads to `myaccount/Teutonic-XXIV-5DhAqMpd-noise-01`.
+4. Uploads to `<seed_namespace>/<chain.name>-<suffix>` (today:
+   `unconst/Teutonic-XXIV-5DhAqMpd-noise-01`).
 5. Submits the on-chain reveal commitment.
 
 You can watch the validator pick it up at
 [`https://teutonic.ai/dashboard.json`](https://teutonic.ai/dashboard.json).
+The dashboard payload's `chain.name` field tells you which king is active.
 
 ---
 
@@ -162,11 +178,12 @@ You can watch the validator pick it up at
 
 You need to lower the king's per-token NLL by more than `delta` nats on a
 random unseen Hippius shard, with a one-sided 99.9% bootstrap LCB > delta.
-Right now the king is uniform over 262144 tokens (ln(262144) ≈ 12.48), so
-the first real training run will dethrone.
+At chain genesis the king is uniform over its vocabulary (for the current
+Quasar king, ln(262144) ≈ 12.48), so the first real training run will
+dethrone.
 
 A reasonable starting point uses
-[`scripts/mining/train_challenger.py`](scripts/mining/train_challenger.py)
+[`scripts/mining/train_challenger.py`](../scripts/mining/train_challenger.py)
 which:
 
 1. Reads the king repo + revision from the live dashboard.
@@ -229,9 +246,11 @@ Verdicts you might see in `dashboard.json` under `history[*]`:
 
 ## 7. Useful links
 
-- King model: <https://huggingface.co/unconst/Teutonic-XXIV>
+- King model: see [`chain.toml`](../chain.toml) `[chain].seed_repo` (today:
+  <https://huggingface.co/unconst/Teutonic-XXIV>).
 - Live dashboard: <https://teutonic.ai>
-- Live JSON: <https://teutonic.ai/dashboard.json>
+- Live JSON: <https://teutonic.ai/dashboard.json> (the active chain name
+  is published in the top-level `chain` field).
 - Source: <https://github.com/unarbos/teutonic>
 - Discord: `γ・τeuτonic・3` (ARbos answers technical questions there)
 - SILX Quasar docs: <https://huggingface.co/silx-ai/Quasar-3B-A1B-Preview>
@@ -241,8 +260,8 @@ Verdicts you might see in `dashboard.json` under `history[*]`:
 ## 8. FAQ
 
 **Q: Can I just upload my own MoE / dense / Mamba checkpoint?**
-A: No. The validator pins `model_type=quasar` and the full Quasar dim set.
-Cross-architecture submissions are rejected at config-match.
+A: No. The validator pins `model_type` and the active arch's full dim
+set. Cross-architecture submissions are rejected at config-match.
 
 **Q: Why isn't FlashAttention-2 used?**
 A: `QuasarForCausalLM` doesn't yet have an FA2 path in upstream

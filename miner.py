@@ -25,18 +25,22 @@ import torch
 from huggingface_hub import HfApi, snapshot_download
 from safetensors.torch import load_file, save_file
 
+# chain_config sits at the repo root; ensure it imports regardless of cwd.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import chain_config  # noqa: E402
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("miner")
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 DASHBOARD_URL = os.environ.get("TEUTONIC_DASHBOARD_URL",
     "https://us-east-1.hippius.com/teutonic-sn3/dashboard.json")
-SEED_REPO = os.environ.get("TEUTONIC_SEED_REPO", "unconst/Teutonic-XXIV")
+SEED_REPO = os.environ.get("TEUTONIC_SEED_REPO", chain_config.SEED_REPO)
 NETUID = int(os.environ.get("TEUTONIC_NETUID", "3"))
 NETWORK = os.environ.get("TEUTONIC_NETWORK", "finney")
 WALLET_NAME = os.environ.get("BT_WALLET_NAME", "teutonic")
 
-REPO_PATTERN = re.compile(r"^[^/]+/Teutonic-XXIV-.+$")
+REPO_PATTERN = re.compile(os.environ.get("TEUTONIC_REPO_PATTERN", chain_config.REPO_PATTERN))
 
 CONFIG_MATCH_KEYS = (
     "vocab_size", "hidden_size", "num_hidden_layers",
@@ -101,7 +105,8 @@ def main():
     args = parser.parse_args()
 
     suffix = args.suffix or args.hotkey
-    challenger_repo = f"unconst/Teutonic-XXIV-{suffix}"
+    namespace = chain_config.SEED_NAMESPACE or "unconst"
+    challenger_repo = f"{namespace}/{chain_config.NAME}-{suffix}"
 
     log.info("miner starting | hotkey=%s repo=%s noise=%.4f", args.hotkey, challenger_repo, args.noise)
 

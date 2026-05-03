@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -22,12 +23,26 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from queue import Queue, Empty
 
+# Make the repo root importable regardless of cwd / how this script is launched
+# (uvicorn from /, pm2, ad-hoc ssh-and-run).
+_repo_root = os.path.dirname(os.path.abspath(__file__))
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from eval.torch_runner import (
+# Register the active vendored arch with HF Auto* before any model load. Done
+# here in addition to inside eval/torch_runner.py so this server fails loudly
+# at startup if chain.toml / archs/<arch> are missing, rather than at first
+# eval. Idempotent.
+import chain_config  # noqa: E402
+
+chain_config.load_arch()
+
+from eval.torch_runner import (  # noqa: E402
     R2, MultiGPUEvaluator, run_bootstrap_test, parse_gpu_ids,
     trainability_probe,
 )

@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""Smoke test eval of Teutonic-XXIV without going through the prod eval server.
+"""Smoke test eval of the active king without going through the prod eval server.
 
-Validates: model loads at ~24B total / ~8B active, trainability probe passes,
-paired loss == 0 (king == challenger), no OOM at chosen batch size, throughput
-estimate.
+Validates: model loads, trainability probe passes, paired loss == 0 (king ==
+challenger), no OOM at chosen batch size, throughput estimate.
 
-Quasar specifics:
-- We pre-import teutonic.quasar so AutoModelForCausalLM resolves "quasar"
-  without trust_remote_code.
-- We default --batch-size to 64 (vs Teutonic-VIII's 128) because total
-  weights are ~3x larger; bump if VRAM headroom permits.
-- The MoE+latent-memory path only supports attn_implementation eager reliably;
-  load_model already falls back through flash_attention_2 -> sdpa -> eager.
+The default --repo is read from chain.toml ([chain].seed_repo). The active
+arch package is loaded via chain_config.load_arch() so AutoModelForCausalLM
+resolves the king without trust_remote_code.
 
-Usage on Targon (the GPU box):
-    bash -c '. ~/env.sh && /root/eval-venv/bin/python smoke_eval_teutonic_xxiv.py'
+Notes:
+- The MoE+latent-memory path only supports attn_implementation eager
+  reliably; load_model already falls back through flash_attention_2 -> sdpa
+  -> eager.
+- Tune --batch-size based on VRAM headroom (default 64).
+
+Usage on the GPU box:
+    bash -c '. ~/env.sh && /root/eval-venv/bin/python scripts/smoke_eval.py'
 """
 import argparse
 import json
@@ -30,28 +31,29 @@ logging.basicConfig(level=logging.INFO,
                     datefmt="%H:%M:%S")
 log = logging.getLogger("smoke")
 
-# Force the workspace's vendored eval_torch (with reset_state hooks) to win
-# over /root/eval_torch.py. The staging deploy places eval_torch.py next to
-# this script; we put the script dir at sys.path[0] AFTER any other inserts.
+# Force the in-repo eval/torch_runner.py (with reset_state hooks) to win
+# over any /root/eval_torch.py from a staging deploy.
 _script_dir = os.path.dirname(os.path.abspath(__file__))
-_repo_root = os.path.dirname(os.path.dirname(_script_dir))
+_repo_root = os.path.dirname(_script_dir)
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
-sys.path.insert(0, _script_dir)
 # A 50GB MoE seed needs more than the default 600s prefetch budget.
 os.environ.setdefault("HF_PREFETCH_TIMEOUT", "3600")
-import teutonic.quasar  # noqa: F401
+
+import chain_config
+
+chain_config.load_arch()
 
 from eval.torch_runner import (
     R2, MultiGPUEvaluator, run_bootstrap_test, parse_gpu_ids,
-    trainability_probe, download_shard, get_shard_info,
+    trainability_probe, download_shard,
 )
 from eval import torch_runner as _et
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo", default="unconst/Teutonic-XXIV")
+    ap.add_argument("--repo", default=chain_config.SEED_REPO)
     ap.add_argument("--eval-n", type=int, default=64)
     ap.add_argument("--batch-size", type=int,
                     default=int(os.environ.get("EVAL_BATCH_SIZE", "64")))
@@ -140,7 +142,7 @@ def main():
         alpha=0.001,
         seq_len=args.seq_len,
         batch_size=args.batch_size,
-        seed_str="smoke:teutonic-xxiv",
+        seed_str=f"smoke:{chain_config.NAME.lower()}",
         n_bootstrap=1000,
     )
     elapsed = time.time() - t0

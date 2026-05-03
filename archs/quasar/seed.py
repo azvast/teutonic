@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Seed unconst/Teutonic-XXIV — a freshly initialized Quasar hybrid MoE model
-sized at ~8B active / ~24B total parameters.
+"""Seed a freshly initialised Quasar hybrid MoE checkpoint.
 
 Architecture: SILX AI Quasar (silx-ai/Quasar-3B-A1B-Preview) — looped hybrid
 transformer with Quasar+GLA attention layers, persistent latent memory, and
-SMEBU BigMac MoE. The vendored modeling code lives in teutonic/quasar/ so we
+SMEBU BigMac MoE. The vendored modeling code lives in `archs/quasar/` so we
 do NOT use trust_remote_code anywhere; the seed config strips auto_map before
-push so consumers load via plain AutoModelForCausalLM after importing
-teutonic.quasar.
+push so consumers load via plain AutoModelForCausalLM after importing the
+arch package (handled by `chain_config.load_arch()`).
 
-Sizing (verified by teutonic/scripts/size_quasar.py):
+Sizing (verified by `archs/quasar/size.py`):
     d_model=4096, n_layers=32, n_heads=32, head_dim=128
     quasar_layers=4, gated_layers=2 (cycle), dense_input_layers=4
     num_routed_experts=56, top_k=8, routed_expert_size=1024 (effective; BigMac
@@ -17,14 +16,17 @@ Sizing (verified by teutonic/scripts/size_quasar.py):
     memory_slots=128, memory_dim=128, num_loops=1
     => 7.962B active / 24.873B total
 
-Tokenizer is reused from unconst/Teutonic-I (vocab=262144) so the existing
-Hippius dataset shards stay 1:1 valid (token IDs share the same vocab space).
+Default target repo + tokenizer come from chain.toml ([chain].seed_repo and
+[seed].tokenizer_repo). Override via TEUTONIC_SEED_REPO_OVERRIDE /
+TEUTONIC_SEED_TOKENIZER_OVERRIDE if you want to push elsewhere.
 
 Run on the GPU box (CPU init of 24B params takes ~12 min; on a B200 it is
 seconds via vectorized RNG):
     source /home/const/workspace/.venv/bin/activate
-    python teutonic/scripts/seed_teutonic_xxiv.py [--push] [--no-probe]
+    python scripts/seed.py [--push] [--no-probe]
 """
+from __future__ import annotations
+
 import argparse
 import json
 import logging
@@ -34,49 +36,54 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT))
 
 import torch
 from huggingface_hub import HfApi, snapshot_download
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-import teutonic.quasar  # noqa: F401  registers QuasarConfig with AutoConfig
-from teutonic.quasar import QuasarConfig
+import chain_config
+
+chain_config.load_arch()
+from archs.quasar import QuasarConfig
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s",
                     datefmt="%H:%M:%S")
-log = logging.getLogger("seed_teutonic_ix")
+log = logging.getLogger("seed")
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-TARGET_REPO = os.environ.get("TEUTONIC_XXIV_REPO", "unconst/Teutonic-XXIV")
-TOKENIZER_REPO = os.environ.get("TEUTONIC_XXIV_TOKENIZER", "unconst/Teutonic-I")
-OUT_DIR = os.environ.get("TEUTONIC_XXIV_DIR", "/tmp/teutonic-xxiv")
+TARGET_REPO = os.environ.get("TEUTONIC_SEED_REPO_OVERRIDE", chain_config.SEED_REPO)
+TOKENIZER_REPO = os.environ.get("TEUTONIC_SEED_TOKENIZER_OVERRIDE",
+                                chain_config.SEED_TOKENIZER_REPO or chain_config.SEED_REPO)
+OUT_DIR = os.environ.get("TEUTONIC_SEED_DIR",
+                         f"/tmp/{chain_config.NAME.lower()}")
 
-VOCAB_SIZE = int(os.environ.get("TEUTONIC_XXIV_VOCAB", "262144"))
-HIDDEN_SIZE = int(os.environ.get("TEUTONIC_XXIV_HIDDEN", "4096"))
-NUM_LAYERS = int(os.environ.get("TEUTONIC_XXIV_NUM_LAYERS", "32"))
-NUM_HEADS = int(os.environ.get("TEUTONIC_XXIV_HEADS", "32"))
-HEAD_DIM = int(os.environ.get("TEUTONIC_XXIV_HEAD_DIM", "128"))
-D_FF = int(os.environ.get("TEUTONIC_XXIV_D_FF", "11008"))
-QUASAR_LAYERS = int(os.environ.get("TEUTONIC_XXIV_QUASAR_LAYERS", "4"))
-GATED_LAYERS = int(os.environ.get("TEUTONIC_XXIV_GATED_LAYERS", "2"))
-DENSE_INPUT_LAYERS = int(os.environ.get("TEUTONIC_XXIV_DENSE_INPUT_LAYERS", "4"))
-NUM_ROUTED_EXPERTS = int(os.environ.get("TEUTONIC_XXIV_NUM_ROUTED_EXPERTS", "56"))
-NUM_SHARED_EXPERTS = int(os.environ.get("TEUTONIC_XXIV_NUM_SHARED_EXPERTS", "1"))
-TOP_K = int(os.environ.get("TEUTONIC_XXIV_TOP_K", "8"))
-ROUTED_EXPERT_SIZE = int(os.environ.get("TEUTONIC_XXIV_ROUTED_EXPERT_SIZE", "1024"))
-SHARED_EXPERT_SIZE = int(os.environ.get("TEUTONIC_XXIV_SHARED_EXPERT_SIZE", "2048"))
-BIGMAC_R = float(os.environ.get("TEUTONIC_XXIV_BIGMAC_R", "0.25"))
-MEMORY_SLOTS = int(os.environ.get("TEUTONIC_XXIV_MEMORY_SLOTS", "128"))
-MEMORY_DIM = int(os.environ.get("TEUTONIC_XXIV_MEMORY_DIM", "128"))
-NUM_LOOPS = int(os.environ.get("TEUTONIC_XXIV_NUM_LOOPS", "1"))
-MAX_SEQ_LEN = int(os.environ.get("TEUTONIC_XXIV_MAX_SEQ_LEN", "16384"))
-ROPE_THETA = float(os.environ.get("TEUTONIC_XXIV_ROPE_THETA", "1000000.0"))
+VOCAB_SIZE = int(os.environ.get("TEUTONIC_SEED_VOCAB", "262144"))
+HIDDEN_SIZE = int(os.environ.get("TEUTONIC_SEED_HIDDEN", "4096"))
+NUM_LAYERS = int(os.environ.get("TEUTONIC_SEED_NUM_LAYERS", "32"))
+NUM_HEADS = int(os.environ.get("TEUTONIC_SEED_HEADS", "32"))
+HEAD_DIM = int(os.environ.get("TEUTONIC_SEED_HEAD_DIM", "128"))
+D_FF = int(os.environ.get("TEUTONIC_SEED_D_FF", "11008"))
+QUASAR_LAYERS = int(os.environ.get("TEUTONIC_SEED_QUASAR_LAYERS", "4"))
+GATED_LAYERS = int(os.environ.get("TEUTONIC_SEED_GATED_LAYERS", "2"))
+DENSE_INPUT_LAYERS = int(os.environ.get("TEUTONIC_SEED_DENSE_INPUT_LAYERS", "4"))
+NUM_ROUTED_EXPERTS = int(os.environ.get("TEUTONIC_SEED_NUM_ROUTED_EXPERTS", "56"))
+NUM_SHARED_EXPERTS = int(os.environ.get("TEUTONIC_SEED_NUM_SHARED_EXPERTS", "1"))
+TOP_K = int(os.environ.get("TEUTONIC_SEED_TOP_K", "8"))
+ROUTED_EXPERT_SIZE = int(os.environ.get("TEUTONIC_SEED_ROUTED_EXPERT_SIZE", "1024"))
+SHARED_EXPERT_SIZE = int(os.environ.get("TEUTONIC_SEED_SHARED_EXPERT_SIZE", "2048"))
+BIGMAC_R = float(os.environ.get("TEUTONIC_SEED_BIGMAC_R", "0.25"))
+MEMORY_SLOTS = int(os.environ.get("TEUTONIC_SEED_MEMORY_SLOTS", "128"))
+MEMORY_DIM = int(os.environ.get("TEUTONIC_SEED_MEMORY_DIM", "128"))
+NUM_LOOPS = int(os.environ.get("TEUTONIC_SEED_NUM_LOOPS", "1"))
+MAX_SEQ_LEN = int(os.environ.get("TEUTONIC_SEED_MAX_SEQ_LEN", "16384"))
+ROPE_THETA = float(os.environ.get("TEUTONIC_SEED_ROPE_THETA", "1000000.0"))
 
 
 def build_config() -> QuasarConfig:
-    """Quasar 8B-active / ~24B-total config; vocab pinned to Teutonic-I (262144)."""
+    """Quasar 8B-active / ~24B-total config; tokenizer pinned to chain.toml seed.tokenizer_repo."""
     cfg = QuasarConfig(
         vocab_size=VOCAB_SIZE,
         d_model=HIDDEN_SIZE,
@@ -100,7 +107,7 @@ def build_config() -> QuasarConfig:
         bigmac_r=BIGMAC_R,
         num_loops=NUM_LOOPS,
         rope_theta=ROPE_THETA,
-        # Teutonic-I tokenizer is Gemma3-derived: pad=0, eos=1, bos=2.
+        # Default tokenizer is Gemma3-derived: pad=0, eos=1, bos=2.
         pad_token_id=0,
         eos_token_id=1,
         bos_token_id=2,
@@ -113,7 +120,7 @@ def build_config() -> QuasarConfig:
 def _strip_auto_map(out_dir: Path):
     """Remove auto_map from config.json so consumers never invoke remote code.
 
-    The vendored teutonic.quasar package handles loading via the standard
+    The vendored archs/quasar package handles loading via the standard
     AutoModelForCausalLM dispatch once imported; auto_map would cause HF to
     attempt a dynamic import of the original silx-ai modules.
     """
@@ -126,7 +133,7 @@ def _strip_auto_map(out_dir: Path):
 
 
 def _count_active(model, cfg: QuasarConfig) -> tuple[int, int]:
-    """Return (total, active_per_token) parameter counts. Mirrors size_quasar.py."""
+    """Return (total, active_per_token) parameter counts. Mirrors archs/quasar/size.py."""
     total = 0
     active = 0
     embed_seen = False
@@ -149,9 +156,10 @@ def _count_active(model, cfg: QuasarConfig) -> tuple[int, int]:
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=f"Seed the genesis king for chain {chain_config.NAME}")
     parser.add_argument("--push", action="store_true",
-                        help="upload to TARGET_REPO (private by default)")
+                        help=f"upload to {TARGET_REPO} (private by default)")
     parser.add_argument("--public", action="store_true",
                         help="when --push, create public (overrides default private)")
     parser.add_argument("--no-probe", action="store_true",
@@ -188,10 +196,10 @@ def main():
     log.info("model built: total=%.3fB / active=%.3fB params in %.1fs",
              total / 1e9, active / 1e9, time.time() - t0)
 
-    # The Quasar config exposes `top_k` for MoE expert selection. HF copies this
-    # onto generation_config, where it gets validated as a sampling top_k that
-    # requires do_sample=True. Strip the bogus generation-side top_k so
-    # save_pretrained does not refuse to write the generation_config.
+    # The Quasar config exposes `top_k` for MoE expert selection. HF copies
+    # this onto generation_config, where it gets validated as a sampling
+    # top_k that requires do_sample=True. Strip the bogus generation-side
+    # top_k so save_pretrained does not refuse to write generation_config.
     if model.generation_config is not None:
         model.generation_config.top_k = None
 
@@ -202,7 +210,7 @@ def main():
     log.info("stripped auto_map from config.json (no trust_remote_code path)")
 
     log.info("downloading tokenizer from %s", TOKENIZER_REPO)
-    tok_dir = Path("/tmp/teutonic-xxiv-tokenizer")
+    tok_dir = Path(f"{OUT_DIR}-tokenizer")
     if tok_dir.exists():
         shutil.rmtree(tok_dir)
     snapshot_download(
@@ -220,8 +228,7 @@ def main():
 
     if not args.no_probe:
         log.info("running trainability probe on %s", args.device)
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-        from eval_torch import trainability_probe
+        from eval.torch_runner import trainability_probe
         m = AutoModelForCausalLM.from_pretrained(
             out, dtype=torch.bfloat16, device_map={"": args.device},
             attn_implementation="eager",
@@ -250,13 +257,13 @@ def main():
             folder_path=str(out),
             repo_id=TARGET_REPO,
             commit_message=(
-                f"seed Teutonic-XXIV (Quasar n_layers={NUM_LAYERS} d_model={HIDDEN_SIZE} "
+                f"seed {chain_config.NAME} (Quasar n_layers={NUM_LAYERS} d_model={HIDDEN_SIZE} "
                 f"experts={NUM_ROUTED_EXPERTS}/top{TOP_K}, fresh init)"
             ),
             allow_patterns=[
                 "*.safetensors", "*.json", "tokenizer*", "special_tokens*",
             ],
-            # No *.py upload — vendored modeling code lives only in teutonic/quasar/.
+            # No *.py upload — vendored modeling code lives only in archs/quasar/.
         )
         log.info("uploaded.")
     else:

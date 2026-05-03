@@ -25,7 +25,9 @@ module.exports = {
     cwd: "/home/const/workspace",
     env: {
       TEUTONIC_EVAL_SERVER: "http://localhost:9000",
-      TEUTONIC_SEED_REPO: "unconst/Teutonic-XXIV",
+      // Active chain (name, seed_repo, repo_pattern, arch) is read from
+      // chain.toml at the repo root. Override here only for short-lived
+      // experiments — the static file is the source of truth.
       HF_TOKEN: dopplerPrd("HF_TOKEN"),
       TEUTONIC_NETUID: "3",
       TEUTONIC_NETWORK: "finney",
@@ -44,10 +46,10 @@ module.exports = {
       TMC_API_KEY: doppler("TMC_API_KEY"),
       DISCORD_BOT_TOKEN: doppler("DISCORD_BOT_TOKEN"),
       DISCORD_CHANNEL_ID: doppler("DISCORD_CHANNEL_ID"),
-      // Each Teutonic-XXIV eval takes ~250s of bootstrap + setup + busy-wait
-      // for the eval-server lock. A single tick can legitimately take
-      // 7-15 minutes when the server is saturated; default 600s was tripping
-      // the watchdog on every successful eval.
+      // Each eval takes ~250s of bootstrap + setup + busy-wait for the
+      // eval-server lock. A single tick can legitimately take 7-15 minutes
+      // when the server is saturated; default 600s was tripping the watchdog
+      // on every successful eval.
       TEUTONIC_TICK_RESTART_AFTER: "1800",
       TEUTONIC_MAX_CONSECUTIVE_TICK_ERRORS: "20",
       // Defense-in-depth for the eval-stream idle watchdog. The eval_server

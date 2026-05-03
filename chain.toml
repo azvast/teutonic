@@ -1,0 +1,19 @@
+[chain]
+name = "Teutonic-XXIV"
+seed_repo = "unconst/Teutonic-XXIV"
+# repo_pattern auto-derives to "^[^/]+/Teutonic-XXIV-.+$" if omitted
+
+[arch]
+module = "archs.quasar"
+extra_lock_keys = [
+  "d_model","n_layers","n_heads","d_ff",
+  "quasar_layers","gated_layers","use_gla_first",
+  "dense_input_layers","moe_type",
+  "num_routed_experts","num_shared_experts","top_k",
+  "routed_expert_size","shared_expert_size","bigmac_r",
+  "memory_slots","memory_dim",
+  "num_loops","use_looped_injection",
+]
+
+[seed]
+tokenizer_repo = "unconst/Teutonic-I"

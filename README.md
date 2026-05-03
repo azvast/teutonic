@@ -10,10 +10,12 @@ runs a paired-bootstrap cross-entropy duel against the reigning king on a
 held-out tokenized stream, and either accepts (challenger becomes the new king)
 or rejects. Winner takes 100% of SN3 emission until dethroned.
 
-The current king is `unconst/Teutonic-XXIV` — a freshly-initialised SILX-AI
-Quasar hybrid MoE (~8B active, ~24B total). See [`docs/MINING_TEUTONIC_XXIV.md`](docs/MINING_TEUTONIC_XXIV.md)
-for the live mining recipe. The full mechanism is documented in
-[`docs/DESIGN.md`](docs/DESIGN.md).
+The active king (chain name, seed HF repo, vendored architecture, config
+lock keys) is declared in [`chain.toml`](chain.toml). At time of writing
+that's `unconst/Teutonic-XXIV` — a freshly-initialised SILX-AI Quasar
+hybrid MoE (~8B active, ~24B total). See [`docs/MINING.md`](docs/MINING.md)
+for the live mining recipe and [`docs/DESIGN.md`](docs/DESIGN.md) for the
+full mechanism.
 
 ## Repo layout
 
@@ -23,11 +25,11 @@ for the live mining recipe. The full mechanism is documented in
 | [`miner.py`](miner.py) | Reference miner: clones the king, perturbs weights, uploads to HF, commits the reveal on-chain. |
 | [`eval_server.py`](eval_server.py) | Persistent FastAPI service wrapping the eval pipeline. Caches the king across duels. SSE-streams progress to the validator. |
 | [`eval/`](eval/) | Eval runners: [`torch_runner.py`](eval/torch_runner.py) (multi-GPU PyTorch paired-bootstrap CE), [`vllm_runner.py`](eval/vllm_runner.py) (vLLM evaluator), [`vllm_server.py`](eval/vllm_server.py) (vLLM-backed alternative eval server, not yet in production). |
-| [`quasar/`](quasar/) | Vendored Quasar architecture (config + modeling). Self-registers with HF Auto* on import so checkpoints load without `trust_remote_code`. |
-| [`scripts/`](scripts/) | Operator + miner tooling: bot, dashboard, mining harness, dataset reshard, Cloudflare publish, current-chain seed/smoke. |
+| [`chain.toml`](chain.toml), [`chain_config.py`](chain_config.py) | Single source of truth for the active king (name, seed repo, repo pattern, vendored arch module, arch-specific config-lock keys). All other code reads from here. |
+| [`archs/`](archs/) | Vendored architectures, one subdir per arch (currently [`archs/quasar/`](archs/quasar/)). Each self-registers with HF Auto* on import so checkpoints load without `trust_remote_code`. The active arch is selected by `chain.toml -> [arch].module`. |
+| [`scripts/`](scripts/) | Operator + miner tooling: bot, dashboard, mining harness, dataset reshard, Cloudflare publish, chain-agnostic [`seed.py`](scripts/seed.py) / [`smoke_eval.py`](scripts/smoke_eval.py). |
 | [`docs/`](docs/) | Design doc, scoring plan, current-chain mining guide. |
-| [`benchmarks/`](benchmarks/) | Captured benchmark snapshots (e.g. ifeval). |
-| [`index.html`](index.html), [`manifest.json`](manifest.json), `favicon.*` | Public dashboard assets. The validator uploads `index.html` to Hippius on every restart. |
+| [`website/`](website/) | Public dashboard assets (`index.html`, favicons). The validator uploads `index.html` to Hippius on every restart. |
 | [`ecosystem.config.js`](ecosystem.config.js) | PM2 process manifest for the eval-tunnel + validator. Reads secrets via Doppler. |
 | [`tunnel.sh`](tunnel.sh) | SSH port-forward to the GPU box hosting the eval server. |
 
@@ -72,8 +74,8 @@ the server itself.
 
 Don't follow the README — it's deliberately thin so it can't go stale. Read
 the live recipe at <https://teutonic.ai/mining> (also at
-[`docs/MINING_TEUTONIC_XXIV.md`](docs/MINING_TEUTONIC_XXIV.md)) and use
-[`scripts/mining/`](scripts/mining/) as a working harness.
+[`docs/MINING.md`](docs/MINING.md)) and use [`scripts/mining/`](scripts/mining/)
+as a working harness.
 
 ## Docs
 
@@ -82,8 +84,8 @@ the live recipe at <https://teutonic.ai/mining> (also at
   together.
 - [`docs/SCORING_PLAN.md`](docs/SCORING_PLAN.md) — exponential dethrone
   scoring rollout plan.
-- [`docs/MINING_TEUTONIC_XXIV.md`](docs/MINING_TEUTONIC_XXIV.md) — current
-  chain's mining contract and step-by-step recipe.
+- [`docs/MINING.md`](docs/MINING.md) — active chain's mining contract and
+  step-by-step recipe (chain identity comes from [`chain.toml`](chain.toml)).
 
 ## License
 

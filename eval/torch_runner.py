@@ -9,8 +9,8 @@ exceeds a configurable delta threshold.
 
 Usage:
     python -m eval.torch_runner \
-        --king unconst/Teutonic-I \
-        --challenger unconst/Teutonic-I \
+        --king <hf-namespace>/<chain.name> \
+        --challenger <hf-namespace>/<chain.name>-<suffix> \
         --n 100 --delta 0.01 --batch-size 64 --seq-len 2048 --gpus 0,1,2,3,4,5,6,7
 
 Env vars:
@@ -56,6 +56,21 @@ import torch
 import torch.nn.functional as F
 from botocore.config import Config as BotoConfig
 from transformers import AutoModelForCausalLM
+
+# Make the repo root importable regardless of cwd / how this module is loaded
+# (uvicorn from /, `python -m eval.torch_runner` from anywhere, ad-hoc scripts).
+# chain_config + the vendored archs/ tree live next to validator.py at the
+# repo root, two dirs up from this file (eval/torch_runner.py).
+_repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
+
+import chain_config  # noqa: E402
+
+# Register the active vendored arch with HF Auto* so AutoModelForCausalLM
+# below resolves the king/challenger checkpoints without trust_remote_code.
+# Idempotent — safe to import this module repeatedly (workers, scripts, etc.).
+chain_config.load_arch()
 
 log = logging.getLogger("eval_torch")
 

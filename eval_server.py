@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Eval server — persistent FastAPI service wrapping eval/torch_runner.py.
+"""Eval server — persistent FastAPI service wrapping eval_torch.py.
 
 Runs on the GPU box. Caches the king model across evals, reloads only when
 the repo changes. Streams progress via SSE.
@@ -7,7 +7,7 @@ the repo changes. Streams progress via SSE.
 Usage:
     uvicorn eval_server:app --host 127.0.0.1 --port 9000
 
-Env vars: same as eval/torch_runner.py (HF_TOKEN, TEUTONIC_R2_*)
+Env vars: same as eval_torch.py (HF_TOKEN, TEUTONIC_R2_*)
     EVAL_HOST   Bind address (default: 127.0.0.1, set to 0.0.0.0 only behind a firewall)
 """
 import asyncio
@@ -15,7 +15,6 @@ import json
 import logging
 import os
 import shutil
-import sys
 import threading
 import time
 import uuid
@@ -23,28 +22,17 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from queue import Queue, Empty
 
-# Make the repo root importable regardless of cwd / how this script is launched
-# (uvicorn from /, pm2, ad-hoc ssh-and-run).
-_repo_root = os.path.dirname(os.path.abspath(__file__))
-if _repo_root not in sys.path:
-    sys.path.insert(0, _repo_root)
-
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-# Register the active vendored arch with HF Auto* before any model load. Done
-# here in addition to inside eval/torch_runner.py so this server fails loudly
-# at startup if chain.toml / archs/<arch> are missing, rather than at first
-# eval. Idempotent.
 import chain_config  # noqa: E402
-
 chain_config.load_arch()
 
 from eval.torch_runner import (  # noqa: E402
     R2, MultiGPUEvaluator, run_bootstrap_test, parse_gpu_ids,
-    trainability_probe,
+    trainability_probe, load_model,
 )
 
 log = logging.getLogger("eval_server")
@@ -62,16 +50,123 @@ _king_revision: str | None = None
 _eval_lock = threading.Lock()
 _evals: dict[str, dict] = {}
 
+# Self-kill plumbing — see _is_cuda_fatal / _schedule_self_kill below.
+# Set once a fatal-CUDA exit has been scheduled so we never schedule twice.
+_self_kill_scheduled = threading.Event()
+
+# Set whenever /eval or /probe is doing real work that competes with HF
+# downloads (challenger fetch, king load, weight prefetch). Background
+# /preload threads check this and defer until cleared so speculative
+# downloads don't starve the in-flight eval's challenger fetch through
+# the same HF CDN. Cleared in _run_eval's finally and in probe_endpoint's
+# finally. Safe with the new self-kill: if an eval poisons CUDA and dies,
+# the supervisor restarts the process which resets this event.
+_gpu_busy = threading.Event()
+
 DEFAULT_BATCH_SIZE = int(os.environ.get("EVAL_BATCH_SIZE", "256"))
 DEFAULT_EVAL_N = int(os.environ.get("EVAL_N", "10000"))
 DEFAULT_ALPHA = float(os.environ.get("EVAL_ALPHA", "0.001"))
 DEFAULT_SEQ_LEN = int(os.environ.get("EVAL_SEQ_LEN", "2048"))
-DEFAULT_DELTA = float(os.environ.get("EVAL_DELTA", "0.01"))
 DEFAULT_BOOTSTRAP_B = int(os.environ.get("EVAL_BOOTSTRAP_B", "10000"))
 
 PROBE_ENABLED = os.environ.get("TEUTONIC_PROBE_ENABLED", "1") == "1"
 
 EVAL_MAX_RUNTIME_S = int(os.environ.get("EVAL_MAX_RUNTIME_S", "1800"))
+
+
+# ---------------------------------------------------------------------------
+# Fatal-CUDA self-kill
+# ---------------------------------------------------------------------------
+# Once a CUDA context corruption (illegal memory access / device-side assert
+# / misaligned address / etc.) hits any thread on this process, the VRAM
+# allocator and every cuStream are unsafe — every subsequent .from_pretrained
+# / .forward / .empty_cache will keep raising. Historically (2026-05-03 14:08
+# - 16:50 UTC) this poisoned the box for ~2.5 h: 10 evals in a row failed
+# with "could not load model with any attention implementation" while the
+# server stayed alive but degraded.
+#
+# The only safe recovery is to exit the process so the supervisor (see
+# eval_server_loop.sh) brings it back with a fresh CUDA context. We give a
+# brief delay so the in-flight SSE error event reaches the validator, then
+# os._exit (NOT sys.exit, NOT regular exit) to skip atexit hooks that would
+# touch the corrupted GPU state and hang.
+_CUDA_FATAL_TOKENS = (
+    "an illegal memory access",
+    "cudaErrorIllegalAddress",
+    "device-side assert",
+    "CUDA error: misaligned address",
+    "CUDA error: unspecified launch failure",
+    "CUDA error: an illegal instruction",
+    "CUBLAS_STATUS_EXECUTION_FAILED",
+    "CUBLAS_STATUS_NOT_INITIALIZED",
+    "cuDNN error: CUDNN_STATUS_EXECUTION_FAILED",
+    "Bus error",
+    "Segmentation fault",
+)
+
+CUDA_FATAL_EXIT_DELAY_S = float(os.environ.get("CUDA_FATAL_EXIT_DELAY_S", "3"))
+CUDA_FATAL_EXIT_CODE = int(os.environ.get("CUDA_FATAL_EXIT_CODE", "75"))
+
+# How aggressively /preload yields to in-flight /eval or /probe.
+PRELOAD_DEFER_POLL_S = float(os.environ.get("PRELOAD_DEFER_POLL_S", "2"))
+# Hard ceiling on how long a preload may wait for the GPU to free up
+# before it just goes ahead anyway. Should be longer than EVAL_MAX_RUNTIME_S
+# because the watchdog should always hit first; this is just a safety net
+# against a bug that wedges _gpu_busy permanently.
+PRELOAD_MAX_DEFER_S = float(os.environ.get("PRELOAD_MAX_DEFER_S",
+                                            str(EVAL_MAX_RUNTIME_S + 300)))
+
+
+def _is_cuda_fatal(exc_msg: str) -> bool:
+    s = str(exc_msg or "")
+    return any(tok in s for tok in _CUDA_FATAL_TOKENS)
+
+
+def _schedule_self_kill(reason: str, delay_s: float | None = None) -> None:
+    """Schedule a hard exit because CUDA state is unrecoverable. Idempotent."""
+    if _self_kill_scheduled.is_set():
+        return
+    _self_kill_scheduled.set()
+    delay = float(delay_s if delay_s is not None else CUDA_FATAL_EXIT_DELAY_S)
+    log.error("FATAL CUDA STATE: %s — exiting in %.1fs (code=%d) for "
+              "supervisor restart", reason, delay, CUDA_FATAL_EXIT_CODE)
+
+    def _die():
+        try:
+            time.sleep(delay)
+        except Exception:
+            pass
+        try:
+            log.error("self-killing now (cuda-fatal)")
+        except Exception:
+            pass
+        os._exit(CUDA_FATAL_EXIT_CODE)
+
+    threading.Thread(target=_die, daemon=True,
+                     name="cuda-fatal-self-kill").start()
+
+
+def _install_thread_excepthook() -> None:
+    """Catch CUDA-fatal exceptions that escape our try/except blocks
+    (e.g. from a daemon thread inside MultiGPUEvaluator). Without this hook,
+    such exceptions just print a traceback and the process keeps running
+    with corrupted CUDA state."""
+    prior = threading.excepthook
+
+    def _hook(args):
+        try:
+            msg = f"{args.exc_type.__name__}: {args.exc_value}"
+            if _is_cuda_fatal(msg):
+                _schedule_self_kill(
+                    f"uncaught in thread {getattr(args.thread, 'name', '?')}: {msg}"
+                )
+        finally:
+            prior(args)
+
+    threading.excepthook = _hook
+
+
+_install_thread_excepthook()
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +184,15 @@ async def lifespan(app: FastAPI):
     _gpu_ids = parse_gpu_ids(os.environ.get("EVAL_GPUS", "auto"))
     log.info("eval server starting with GPUs: %s", _gpu_ids)
     _r2 = R2()
-    _cleanup_hf_cache()
+    # NOTE: don't cleanup on startup — the cache may hold the current king from
+    # a previous run, and re-downloading 16GB takes ~3min. After-eval cleanup
+    # (in run_eval) keeps disk usage bounded between evals.
+    if os.environ.get("EVAL_CLEANUP_ON_STARTUP", "0") == "1":
+        _cleanup_hf_cache()
+    # Start the background disk-stats refresher and prime the snapshot so
+    # the first /health call is fast (rather than blocking on a synchronous
+    # 600 GB scan_cache_dir from inside the request handler).
+    _ensure_disk_stats_thread()
     yield
     log.info("eval server shutting down")
     if _king_evaluator:
@@ -103,6 +206,11 @@ app = FastAPI(lifespan=lifespan)
 # Models
 # ---------------------------------------------------------------------------
 
+class ProbeRequest(BaseModel):
+    repo: str
+    revision: str = ""
+
+
 class EvalRequest(BaseModel):
     king_repo: str
     challenger_repo: str
@@ -114,7 +222,6 @@ class EvalRequest(BaseModel):
     challenger_revision: str = ""
     eval_n: int = DEFAULT_EVAL_N
     alpha: float = DEFAULT_ALPHA
-    delta: float = DEFAULT_DELTA
     seq_len: int = DEFAULT_SEQ_LEN
     batch_size: int = DEFAULT_BATCH_SIZE
     n_bootstrap: int = DEFAULT_BOOTSTRAP_B
@@ -125,30 +232,25 @@ class EvalRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _ensure_king(repo: str, king_hash: str = "", revision: str = "",
-                 on_stage=None):
+                 on_phase=None):
     """Load or reuse king evaluator. Reloads if repo, revision, or king_hash changed.
 
     On a fresh load, runs the trainability probe on the king. A king that fails
     the probe is a violation of an invariant (the king got there by winning an
     eval, which already required passing the probe), so we refuse to load it
     and raise — operator must intervene.
+
+    `on_phase`, if provided, is invoked with a phase dict before/after each
+    per-GPU load and around the trainability probe. Used to emit SSE
+    heartbeats so the validator's stream-idle watchdog stays satisfied
+    during the multi-minute king-reload that follows a coronation.
     """
     global _king_evaluator, _king_repo, _king_hash, _king_revision
-
-    def _stage(name, **extra):
-        if on_stage:
-            try:
-                on_stage(name, **extra)
-            except Exception:
-                pass
-
     if (_king_evaluator and _king_repo == repo
             and (not revision or _king_revision == revision)
             and (not king_hash or _king_hash == king_hash)):
         log.info("reusing cached king evaluator for %s (rev=%s)",
                  repo, (_king_revision or "?")[:12])
-        _stage("king_load_cached", repo=repo,
-               revision=(_king_revision or "?")[:12])
         return _king_evaluator
 
     needs_reload = _king_evaluator is not None
@@ -156,36 +258,40 @@ def _ensure_king(repo: str, king_hash: str = "", revision: str = "",
         log.info("king changed (%s rev=%s -> %s rev=%s), reloading",
                  _king_repo, (_king_revision or "?")[:12],
                  repo, revision[:12] if revision else "?")
-        _stage("king_reload", from_repo=_king_repo, to_repo=repo,
-               from_revision=(_king_revision or "?")[:12],
-               to_revision=(revision[:12] if revision else "?"))
         _king_evaluator.shutdown()
         _king_evaluator = None
         torch.cuda.empty_cache()
 
     mid = len(_gpu_ids) // 2
     king_gpus = _gpu_ids[:mid] or _gpu_ids[:1]
-    _stage("king_load_start", repo=repo,
-           revision=(revision[:12] if revision else None),
-           gpus=king_gpus)
     new_king = MultiGPUEvaluator(repo, king_gpus, label="king",
                                   force_download=False,
                                   revision=revision or None,
-                                  on_stage=on_stage)
-    _stage("king_load_done", repo=repo, gpus=king_gpus)
+                                  on_phase=on_phase)
 
     if PROBE_ENABLED:
+        if on_phase:
+            try:
+                on_phase({"phase": "king_probe_start", "repo": repo})
+            except Exception:
+                log.warning("on_phase callback raised (non-fatal)", exc_info=True)
         king_model = new_king.models[new_king.gpu_ids[0]]
-        _stage("king_probe_start", repo=repo)
         t0 = time.time()
         probe = trainability_probe(king_model)
-        _stage("king_probe_done", repo=repo, ok=bool(probe.get("ok")),
-               elapsed_s=round(time.time() - t0, 1))
-        log.info("king trainability probe for %s: ok=%s before=%.4f "
-                 "after=%.4f delta=%.4f (%.1fs)",
+        log.info("king trainability probe for %s: ok=%s "
+                 "max_ratio=%.3f max_grad=%.2e min_before=%.4f "
+                 "max_after=%.4f norm_quant=%s seeds=%d steps=%d (%.1fs)",
                  repo, probe["ok"],
-                 probe["loss_before"], probe["loss_after"], probe["delta"],
+                 probe.get("max_ratio", float("nan")),
+                 probe.get("max_grad_norm", float("nan")),
+                 probe.get("min_loss_before", float("nan")),
+                 probe.get("max_loss_after", float("nan")),
+                 probe.get("norm_quantization"),
+                 probe.get("n_seeds", 0),
+                 probe.get("n_steps_per_seed", 0),
                  time.time() - t0)
+        for w in probe.get("warnings", []) or []:
+            log.warning("king %s probe warning: %s", repo, w)
         if not probe["ok"]:
             log.error("KING TRAINABILITY PROBE FAILED for %s: %s. "
                       "Refusing to load this king. Operator intervention required.",
@@ -205,26 +311,13 @@ def _ensure_king(repo: str, king_hash: str = "", revision: str = "",
     return _king_evaluator
 
 
-def _load_challenger(repo: str, revision: str = "", on_stage=None):
+def _load_challenger(repo: str, revision: str = "", on_phase=None):
     """Load challenger on the second half of GPUs."""
     mid = len(_gpu_ids) // 2
     chall_gpus = _gpu_ids[mid:] or _gpu_ids[:1]
-    if on_stage:
-        try:
-            on_stage("challenger_load_start", repo=repo,
-                     revision=(revision[:12] if revision else None),
-                     gpus=chall_gpus)
-        except Exception:
-            pass
-    ev = MultiGPUEvaluator(repo, chall_gpus, label="challenger",
-                            revision=revision or None,
-                            on_stage=on_stage)
-    if on_stage:
-        try:
-            on_stage("challenger_load_done", repo=repo, gpus=chall_gpus)
-        except Exception:
-            pass
-    return ev
+    return MultiGPUEvaluator(repo, chall_gpus, label="challenger",
+                              revision=revision or None,
+                              on_phase=on_phase)
 
 
 # ---------------------------------------------------------------------------
@@ -234,40 +327,70 @@ def _load_challenger(repo: str, revision: str = "", on_stage=None):
 MAX_EVALS_KEPT = 50
 EVAL_MAX_AGE_S = 3600
 
+CACHE_HIGH_WATERMARK_GB = float(os.environ.get("HF_CACHE_HIGH_WATERMARK_GB", "200"))
+
+
 def _cleanup_hf_cache():
-    """Delete HF cached models that aren't the current king."""
+    """Delete HF cached models, keeping the current king and recently
+    preloaded challengers. Only acts above CACHE_HIGH_WATERMARK_GB so that
+    speculative /preload downloads aren't immediately wiped between evals.
+    """
     try:
         from huggingface_hub import scan_cache_dir
         cache_info = scan_cache_dir()
 
+        cache_gb = cache_info.size_on_disk / 1e9
+        if cache_gb < CACHE_HIGH_WATERMARK_GB:
+            log.debug("hf cache cleanup skipped: %.1f GB < watermark %.1f GB",
+                      cache_gb, CACHE_HIGH_WATERMARK_GB)
+            return
+
         keep_repo = _king_repo
         keep_rev = _king_revision
+        # Anything preloaded within the last PRELOAD_KEEP_S seconds should
+        # survive cleanup, otherwise we wipe the speculative download for
+        # the next eval. Older entries fall out of the keep window so the
+        # set doesn't grow unboundedly across long-running servers.
+        now = time.time()
+        with _preload_lock:
+            preload_repos: set[str] = {
+                repo for (repo, _rev), ts in _preload_seen.items()
+                if now - ts < PRELOAD_KEEP_S
+            }
         hashes_to_delete = []
 
+        # Sort revisions by last_modified (oldest first). We delete oldest
+        # until we're back under the watermark. Note: huggingface_hub's
+        # CachedRevisionInfo exposes `last_modified`, not `last_accessed`
+        # — using the wrong name silently broke this whole function and
+        # let the cache fill /tmp to 100% on 2026-04-29 before we noticed.
+        all_revs = []
         for repo_info in cache_info.repos:
-            repo_id = repo_info.repo_id
-            if repo_id == keep_repo:
-                for rev_info in repo_info.revisions:
-                    if keep_rev and rev_info.commit_hash == keep_rev:
-                        continue
-                    hashes_to_delete.append(rev_info.commit_hash)
-                    log.info("marking for deletion: %s rev %s (%.1f MB)",
-                             repo_id, rev_info.commit_hash[:12],
-                             rev_info.size_on_disk / 1e6)
-            else:
-                for rev_info in repo_info.revisions:
-                    hashes_to_delete.append(rev_info.commit_hash)
-                    log.info("marking for deletion: %s rev %s (%.1f MB)",
-                             repo_id, rev_info.commit_hash[:12],
-                             rev_info.size_on_disk / 1e6)
+            for rev_info in repo_info.revisions:
+                all_revs.append((rev_info.last_modified, repo_info.repo_id, rev_info))
+        all_revs.sort()
+
+        running_total = cache_info.size_on_disk
+        for _last, repo_id, rev_info in all_revs:
+            if running_total / 1e9 < CACHE_HIGH_WATERMARK_GB * 0.7:
+                break  # leave 30 percent headroom below watermark
+            if repo_id == keep_repo and (not keep_rev or rev_info.commit_hash == keep_rev):
+                continue
+            short = (rev_info.commit_hash or "")[:12]
+            if repo_id in preload_repos:
+                continue
+            hashes_to_delete.append(rev_info.commit_hash)
+            running_total -= rev_info.size_on_disk
+            log.info("marking for deletion: %s rev %s (%.1f MB)",
+                     repo_id, short, rev_info.size_on_disk / 1e6)
 
         if not hashes_to_delete:
-            log.info("hf cache cleanup: nothing to delete")
+            log.info("hf cache cleanup: above watermark but nothing eligible to delete")
             return
 
         strategy = cache_info.delete_revisions(*hashes_to_delete)
-        log.info("hf cache cleanup: deleting %d revisions, freeing %.1f MB",
-                 len(hashes_to_delete), strategy.expected_freed_size / 1e6)
+        log.info("hf cache cleanup: deleting %d revisions, freeing %.1f MB (cache was %.1f GB)",
+                 len(hashes_to_delete), strategy.expected_freed_size / 1e6, cache_gb)
         strategy.execute()
         log.info("hf cache cleanup: done")
 
@@ -306,8 +429,20 @@ def _prune_evals():
         log.warning("eval pruning failed", exc_info=True)
 
 
-def _get_disk_stats():
-    """Return disk usage stats for the health endpoint."""
+# Disk-stats snapshot, refreshed by a dedicated background thread.
+# scan_cache_dir() walks ~600 GB of cache and can take 15-30 s under
+# heavy IO; on top of that, the default asyncio executor is shared with
+# the long-running /probe and /eval blocking tasks, so even
+# `loop.run_in_executor(None, _get_disk_stats)` would queue behind them
+# during an eval and miss the /health timeout. Running the refresh on
+# its own thread decouples /health latency from anything the eval does.
+_DISK_STATS_REFRESH_S = float(os.environ.get("DISK_STATS_REFRESH_S", "30"))
+_disk_stats_snapshot: dict = {}
+_disk_stats_thread_started = False
+_disk_stats_thread_lock = threading.Lock()
+
+
+def _refresh_disk_stats_once():
     stats = {}
     try:
         usage = shutil.disk_usage("/")
@@ -327,85 +462,124 @@ def _get_disk_stats():
     return stats
 
 
+def _disk_stats_loop():
+    global _disk_stats_snapshot
+    while True:
+        try:
+            _disk_stats_snapshot = _refresh_disk_stats_once()
+        except Exception:
+            log.warning("disk-stats refresh raised", exc_info=True)
+        time.sleep(_DISK_STATS_REFRESH_S)
+
+
+def _ensure_disk_stats_thread():
+    """Start the background disk-stats refresher. Does NOT block on the
+    first prime — that runs in the same background thread, so lifespan()
+    finishes fast (boot in ~10 s instead of ~90 s waiting on a 600 GB
+    scan_cache_dir). /health responses during the first ~30-60 s will
+    lack the disk_*/hf_cache_* fields, which is fine — the surrounding
+    `status: ok` is enough for liveness/readiness checks.
+
+    We need the boot to be under the validator's retry budget
+    (3 retries × 30 s = 90 s) so a watchdog-triggered self-kill
+    doesn't cause the validator to drop in-flight evals."""
+    global _disk_stats_thread_started
+    with _disk_stats_thread_lock:
+        if _disk_stats_thread_started:
+            return
+        threading.Thread(target=_disk_stats_loop, daemon=True,
+                         name="disk-stats-refresher").start()
+        _disk_stats_thread_started = True
+
+
+def _get_disk_stats():
+    """Return cached disk usage stats. Non-blocking after first call."""
+    _ensure_disk_stats_thread()
+    return dict(_disk_stats_snapshot)
+
+
 # ---------------------------------------------------------------------------
 # Eval runner (runs in a thread)
 # ---------------------------------------------------------------------------
 
-HEARTBEAT_INTERVAL_S = float(os.environ.get("EVAL_HEARTBEAT_INTERVAL_S", "5"))
-
-
 def _run_eval(eval_id: str, req: EvalRequest):
     record = _evals[eval_id]
     record["state"] = "running"
+    _gpu_busy.set()
     event_q: Queue = record["events"]
 
-    stage_state = {"name": "starting", "started_at": time.time()}
-
-    def _emit_stage(name, **extra):
-        stage_state["name"] = name
-        stage_state["started_at"] = time.time()
+    # Heartbeat callback: turn load-phase signals from MultiGPUEvaluator and
+    # the probes into SSE `progress` events. The validator's idle watchdog
+    # resets on every yielded line, so any phase event prevents the silent
+    # multi-minute gap (king reload + challenger load + probe + first batch)
+    # from tripping STREAM_IDLE_TIMEOUT and orphaning the eval.
+    def _on_phase(info):
         try:
-            event_q.put({
-                "type": "stage",
-                "data": {"name": name, "ts": time.time(), **extra},
-            })
+            event_q.put({"type": "progress", "data": info})
         except Exception:
-            log.warning("eval %s: failed to emit stage %s", eval_id, name,
-                        exc_info=True)
+            log.warning("failed to enqueue heartbeat event (non-fatal)", exc_info=True)
 
-    heartbeat_stop = threading.Event()
+    # Periodic ticker: catches phases that don't naturally subdivide. The
+    # cold-cache HF download inside load_model._prefetch_repo can take
+    # 5-10 min and emits no per-GPU phase events of its own, so without
+    # this ticker the validator's idle watchdog can still trip during a
+    # one-off cold challenger fetch. Cancelled in `finally:`.
+    _heartbeat_stop = threading.Event()
 
-    def _heartbeat():
-        # Periodic pulse so the SSE stream never sits silent during a long
-        # blocking step (HF download, model load, shard download). Without this
-        # the validator's stream-idle watchdog can fire and the dashboard sits
-        # frozen on the initial stub for minutes at a time.
-        while not heartbeat_stop.is_set():
-            if heartbeat_stop.wait(HEARTBEAT_INTERVAL_S):
-                return
+    def _heartbeat_loop():
+        while not _heartbeat_stop.wait(30.0):
             try:
-                event_q.put({
-                    "type": "heartbeat",
-                    "data": {
-                        "stage": stage_state["name"],
-                        "elapsed_s": round(time.time() - stage_state["started_at"], 1),
-                    },
-                })
+                event_q.put({"type": "progress", "data": {"phase": "heartbeat"}})
             except Exception:
-                pass
+                log.warning("heartbeat ticker enqueue failed (non-fatal)", exc_info=True)
 
-    heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True,
-                                        name=f"eval-heartbeat-{eval_id}")
-    heartbeat_thread.start()
+    _heartbeat_thread = threading.Thread(target=_heartbeat_loop,
+                                          name=f"heartbeat-{eval_id[:8]}",
+                                          daemon=True)
+    _heartbeat_thread.start()
 
     try:
-        _emit_stage("eval_start", challenge_id=req.shard_key)
+        # Kick off shard download in the background so it overlaps with king
+        # reload + challenger load + probe. Saves ~30s/eval once the shard
+        # cache is cold for that key.
+        if req.shard_key:
+            try:
+                from eval.torch_runner import prefetch_shard
+                prefetch_shard(_r2, req.shard_key)
+            except Exception:
+                log.warning("shard prefetch kickoff failed (non-fatal)", exc_info=True)
+
         king_eval = _ensure_king(req.king_repo, req.king_hash, req.king_revision,
-                                 on_stage=_emit_stage)
+                                 on_phase=_on_phase)
 
         same_model = (req.king_repo == req.challenger_repo
                       and req.king_revision == req.challenger_revision)
         if same_model:
-            _emit_stage("challenger_same_as_king", repo=req.challenger_repo)
             challenger_eval = king_eval
         else:
-            challenger_eval = _load_challenger(req.challenger_repo,
-                                               req.challenger_revision,
-                                               on_stage=_emit_stage)
+            challenger_eval = _load_challenger(req.challenger_repo, req.challenger_revision,
+                                               on_phase=_on_phase)
 
         if not same_model and PROBE_ENABLED:
+            _on_phase({"phase": "challenger_probe_start", "repo": req.challenger_repo})
             chall_model = challenger_eval.models[challenger_eval.gpu_ids[0]]
-            _emit_stage("challenger_probe_start", repo=req.challenger_repo)
             t0 = time.time()
             probe = trainability_probe(chall_model)
-            _emit_stage("challenger_probe_done", repo=req.challenger_repo,
-                        ok=bool(probe.get("ok")),
-                        elapsed_s=round(time.time() - t0, 1))
-            log.info("trainability probe for %s: ok=%s before=%.4f after=%.4f "
-                     "delta=%.4f (%.1fs)",
+            log.info("trainability probe for %s: ok=%s "
+                     "max_ratio=%.3f max_grad=%.2e min_before=%.4f "
+                     "max_after=%.4f norm_quant=%s seeds=%d steps=%d (%.1fs)",
                      req.challenger_repo, probe["ok"],
-                     probe["loss_before"], probe["loss_after"], probe["delta"],
+                     probe.get("max_ratio", float("nan")),
+                     probe.get("max_grad_norm", float("nan")),
+                     probe.get("min_loss_before", float("nan")),
+                     probe.get("max_loss_after", float("nan")),
+                     probe.get("norm_quantization"),
+                     probe.get("n_seeds", 0),
+                     probe.get("n_steps_per_seed", 0),
                      time.time() - t0)
+            for w in probe.get("warnings", []) or []:
+                log.warning("challenger %s probe warning: %s",
+                            req.challenger_repo, w)
             if not probe["ok"]:
                 log.warning("trainability probe REJECTED %s: %s",
                             req.challenger_repo, probe["reason"])
@@ -422,6 +596,14 @@ def _run_eval(eval_id: str, req: EvalRequest):
                         "loss_before": probe["loss_before"],
                         "loss_after": probe["loss_after"],
                         "delta": probe["delta"],
+                        "max_ratio": probe.get("max_ratio"),
+                        "max_grad_norm": probe.get("max_grad_norm"),
+                        "min_loss_before": probe.get("min_loss_before"),
+                        "max_loss_after": probe.get("max_loss_after"),
+                        "n_seeds": probe.get("n_seeds"),
+                        "n_steps_per_seed": probe.get("n_steps_per_seed"),
+                        "norm_quantization": probe.get("norm_quantization"),
+                        "warnings": probe.get("warnings", []),
                     },
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
@@ -438,11 +620,10 @@ def _run_eval(eval_id: str, req: EvalRequest):
 
         verdict = run_bootstrap_test(
             king_eval, challenger_eval,
-            _r2, req.shard_key, req.eval_n, req.alpha, req.delta,
+            _r2, req.shard_key, req.eval_n, req.alpha,
             req.seq_len, req.batch_size, seed_str,
             n_bootstrap=req.n_bootstrap,
             on_progress=_on_progress,
-            on_stage=_emit_stage,
         )
 
         if not same_model:
@@ -459,9 +640,12 @@ def _run_eval(eval_id: str, req: EvalRequest):
         record["state"] = "failed"
         record["error"] = str(e)
         event_q.put({"type": "error", "data": {"error": str(e)}})
+        if _is_cuda_fatal(str(e)):
+            _schedule_self_kill(f"in eval {eval_id}: {type(e).__name__}: {e}")
 
     finally:
-        heartbeat_stop.set()
+        _heartbeat_stop.set()
+        _gpu_busy.clear()
         try:
             _eval_lock.release()
         except RuntimeError:
@@ -482,23 +666,37 @@ def _run_eval(eval_id: str, req: EvalRequest):
 
 @app.get("/health")
 async def health():
+    # _get_disk_stats() reads a snapshot updated by a dedicated
+    # background thread — never blocks the event loop, never queues
+    # behind a long-running /probe or /eval in the executor pool.
     return {
-        "status": "ok",
+        "status": "exiting" if _self_kill_scheduled.is_set() else "ok",
         "gpus": len(_gpu_ids),
         "gpu_ids": _gpu_ids,
         "king_loaded": _king_repo,
         "active_evals": len(_evals),
+        "self_kill_scheduled": _self_kill_scheduled.is_set(),
+        "gpu_busy": _gpu_busy.is_set(),
         **_get_disk_stats(),
     }
 
 
 def _watchdog(eval_id: str, deadline: float):
-    """Force-fail an eval that overruns EVAL_MAX_RUNTIME_S.
+    """Force-fail an eval that overruns EVAL_MAX_RUNTIME_S, then trigger
+    a supervisor-managed restart so the next eval gets clean GPU state.
 
-    The wedged worker thread is *not* killed (Python lacks safe thread
-    cancellation), but we mark the record failed and force-release the
-    eval lock so the validator can dispatch a fresh eval. The next call
-    to _ensure_king will reset GPU state.
+    The wedged worker thread is *not* killed by Python (no safe thread
+    cancellation), so it keeps holding GPU allocations until it naturally
+    finishes. Observed 2026-05-04 00:46-00:49 UTC: the previous-watchdog'd
+    worker for taoism99/...-3a51b842 was still on batch 14/20 when we
+    released the lock; the validator immediately dispatched the retry,
+    which OOM'd during the trainability probe (GPU 4 only had 485 MiB
+    free) and got falsely rejected as "untrainable" — a unfair outcome
+    for the miner.
+    
+    Recovery is to self-kill (os._exit + supervisor restart). That brings
+    up a fresh process in ~100 s with clean GPU state. The validator's
+    retry loop handles the brief unavailability cleanly.
     """
     while time.time() < deadline:
         time.sleep(30)
@@ -508,7 +706,7 @@ def _watchdog(eval_id: str, deadline: float):
     rec = _evals.get(eval_id)
     if rec is None or rec.get("state") in ("completed", "failed"):
         return
-    log.error("watchdog: eval %s exceeded %ds, force-failing and releasing lock",
+    log.error("watchdog: eval %s exceeded %ds, force-failing and triggering self-kill",
               eval_id, EVAL_MAX_RUNTIME_S)
     rec["state"] = "failed"
     rec["error"] = f"watchdog timeout after {EVAL_MAX_RUNTIME_S}s"
@@ -521,10 +719,214 @@ def _watchdog(eval_id: str, deadline: float):
         _eval_lock.release()
     except RuntimeError:
         pass
+    # Trigger a supervisor restart. The wedged worker keeps holding
+    # GPU allocations; without a process restart the next eval can OOM.
+    _schedule_self_kill(
+        f"watchdog: eval {eval_id} exceeded {EVAL_MAX_RUNTIME_S}s; "
+        f"restarting to release leaked GPU memory from wedged worker"
+    )
+
+
+def _run_probe_blocking(repo: str, revision: str) -> dict:
+    """Load `repo`@`revision` on a single GPU, run the trainability probe,
+    free everything, return the probe verdict.
+
+    Does NOT touch the cached king evaluator. Caller must hold `_eval_lock`
+    (so this can't collide with a live eval that would compete for VRAM).
+    """
+    if not _gpu_ids:
+        raise RuntimeError("no GPUs available on eval server")
+
+    probe_gpu = _gpu_ids[-1]
+    device = f"cuda:{probe_gpu}"
+    log.info("probe: loading %s@%s on %s", repo, (revision or "HEAD")[:12], device)
+    t0 = time.time()
+    model = None
+    try:
+        model = load_model(repo, device, label=f"probe-{repo}",
+                           force_download=False,
+                           revision=revision or None)
+        load_s = time.time() - t0
+        t1 = time.time()
+        verdict = trainability_probe(model)
+        probe_s = time.time() - t1
+        log.info("probe: %s ok=%s max_ratio=%.3f max_grad=%.2e "
+                 "norm_quant=%s (load=%.1fs probe=%.1fs)",
+                 repo, verdict["ok"],
+                 verdict.get("max_ratio", float("nan")),
+                 verdict.get("max_grad_norm", float("nan")),
+                 verdict.get("norm_quantization"),
+                 load_s, probe_s)
+        for w in verdict.get("warnings", []) or []:
+            log.warning("probe %s warning: %s", repo, w)
+        verdict["timing"] = {
+            "load_s": round(load_s, 2),
+            "probe_s": round(probe_s, 2),
+            "total_s": round(time.time() - t0, 2),
+        }
+        verdict["repo"] = repo
+        verdict["revision"] = revision
+        return verdict
+    finally:
+        if model is not None:
+            del model
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+# Track in-flight preloads so /preload is idempotent (multiple validator
+# nudges for the same repo coalesce to one background download).
+_preload_threads: dict[str, threading.Thread] = {}
+_preload_lock = threading.Lock()
+# (repo, revision) -> wall-clock timestamp the preload was issued. Used by
+# _cleanup_hf_cache to keep speculative downloads alive long enough to be
+# consumed by the next /eval call. Entries older than PRELOAD_KEEP_S are
+# eligible for cleanup (treated as stale).
+_preload_seen: dict[tuple[str, str], float] = {}
+PRELOAD_KEEP_S = float(os.environ.get("HF_PRELOAD_KEEP_S", "1800"))
+
+# Cap on how many preload network downloads may run concurrently. Per-IP
+# xet-bridge throttling on this box caps single-shard at ~255 MB/s and shares
+# that cap across concurrent connections; running multiple preloads in
+# parallel divides bandwidth and inflates p50 time-to-ready. Default 1
+# (strict serialisation); override via env if a faster box ever justifies it.
+PRELOAD_PARALLELISM = max(1, int(os.environ.get("PRELOAD_PARALLELISM", "1")))
+_preload_network_sem = threading.Semaphore(PRELOAD_PARALLELISM)
+
+
+class PreloadRequest(BaseModel):
+    repo: str
+    revision: str = ""
+
+
+@app.post("/preload")
+async def preload_endpoint(req: PreloadRequest):
+    """Speculatively download a model to the HF cache, in the background.
+
+    Used by the validator to warm the next-in-queue challenger while the
+    current eval is busy on the GPUs. No GPU work, no eval lock contention —
+    just hits the network. Idempotent per (repo, revision).
+    """
+    if not req.repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+    key = f"{req.repo}@{(req.revision or 'main')[:12]}"
+    with _preload_lock:
+        existing = _preload_threads.get(key)
+        if existing and existing.is_alive():
+            _preload_seen[(req.repo, req.revision or "")] = time.time()
+            return {"status": "already_running", "key": key}
+
+        from eval.torch_runner import _prefetch_repo
+
+        def _do():
+            t0 = time.time()
+            # Yield bandwidth to any in-flight /eval or /probe. The
+            # eval is itself downloading the actual challenger from the
+            # same HF CDN; with HF_HUB_ENABLE_HF_TRANSFER=1's 16 parallel
+            # streams, a concurrent preload can starve the eval enough
+            # to hit EVAL_MAX_RUNTIME_S (observed 2026-05-03 20:03 UTC:
+            # eval-0150 dropped to ~6 MB/s for its challenger fetch
+            # while a preload monopolised xet-bridge bandwidth, and was
+            # within minutes of timing out).
+            #
+            # We poll _gpu_busy with a small interval. PRELOAD_MAX_DEFER_S
+            # is a backstop in case _gpu_busy is left set by a bug — under
+            # normal operation EVAL_MAX_RUNTIME_S will hit first and the
+            # eval's finally: clears _gpu_busy.
+            wait_t0 = time.time()
+            warned = False
+            while _gpu_busy.is_set():
+                if not warned:
+                    log.info("preload deferring: gpu busy with eval/probe (%s)",
+                             key)
+                    warned = True
+                if time.time() - wait_t0 > PRELOAD_MAX_DEFER_S:
+                    log.warning(
+                        "preload %s: max defer %ds exceeded, proceeding "
+                        "even though gpu_busy is still set", key,
+                        int(PRELOAD_MAX_DEFER_S))
+                    break
+                time.sleep(PRELOAD_DEFER_POLL_S)
+            wait_s = time.time() - wait_t0
+            if warned:
+                log.info("preload %s: resuming after %.1fs deferral",
+                         key, wait_s)
+
+            # Serialise the actual network download so concurrent preloads
+            # don't share/throttle the per-IP xet-bridge bandwidth cap.
+            sem_t0 = time.time()
+            acquired = _preload_network_sem.acquire(timeout=PRELOAD_MAX_DEFER_S)
+            sem_wait_s = time.time() - sem_t0
+            if not acquired:
+                log.warning(
+                    "preload %s: waited %.1fs for network slot (parallelism=%d), "
+                    "proceeding anyway", key, sem_wait_s, PRELOAD_PARALLELISM)
+            elif sem_wait_s > 1.0:
+                log.info("preload %s: acquired network slot after %.1fs",
+                         key, sem_wait_s)
+
+            try:
+                _prefetch_repo(req.repo, revision=req.revision or None,
+                               timeout=int(os.environ.get("HF_PREFETCH_TIMEOUT", "600")))
+                log.info("preload complete: %s (defer=%.1fs net_wait=%.1fs total=%.1fs)",
+                         key, wait_s, sem_wait_s, time.time() - t0)
+            except Exception as e:
+                log.warning("preload failed for %s: %s", key, e)
+            finally:
+                if acquired:
+                    _preload_network_sem.release()
+
+        t = threading.Thread(target=_do, daemon=True, name=f"preload-{req.repo[:32]}")
+        t.start()
+        _preload_threads[key] = t
+        _preload_seen[(req.repo, req.revision or "")] = time.time()
+    return {"status": "started", "key": key}
+
+
+@app.post("/probe")
+async def probe_endpoint(req: ProbeRequest):
+    """Out-of-band trainability probe on an arbitrary repo+revision.
+
+    Used by the validator to periodically reprobe the incumbent king
+    (see audit_incumbent_king in validator.py) without going through a
+    full eval. Acquires `_eval_lock` so it can't race with an in-flight
+    /eval call competing for the same GPUs.
+    """
+    if not req.repo:
+        raise HTTPException(status_code=400, detail="repo is required")
+    if _self_kill_scheduled.is_set():
+        raise HTTPException(status_code=503, detail="eval server is restarting")
+    acquired = _eval_lock.acquire(blocking=False)
+    if not acquired:
+        raise HTTPException(status_code=409, detail="an eval is already running")
+    _gpu_busy.set()
+    try:
+        loop = asyncio.get_running_loop()
+        verdict = await loop.run_in_executor(
+            None, _run_probe_blocking, req.repo, req.revision,
+        )
+        return verdict
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.exception("probe failed for %s", req.repo)
+        if _is_cuda_fatal(str(exc)):
+            _schedule_self_kill(f"in probe {req.repo}: {type(exc).__name__}: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        _gpu_busy.clear()
+        try:
+            _eval_lock.release()
+        except RuntimeError:
+            pass
 
 
 @app.post("/eval")
 async def start_eval(req: EvalRequest):
+    if _self_kill_scheduled.is_set():
+        raise HTTPException(status_code=503, detail="eval server is restarting")
     acquired = _eval_lock.acquire(blocking=False)
     if not acquired:
         raise HTTPException(status_code=409, detail="an eval is already running")

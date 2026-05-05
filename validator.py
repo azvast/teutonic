@@ -331,7 +331,8 @@ class R2:
             exc,
         )
 
-    def _put_dashboard_bytes(self, key, body, content_type):
+    def _put_dashboard_bytes(self, key, body, content_type, cache_control=None):
+        extra = {"CacheControl": cache_control} if cache_control else {}
         if self._hippius_available():
             try:
                 self._hippius.put_object(
@@ -339,6 +340,7 @@ class R2:
                     Key=key,
                     Body=body,
                     ContentType=content_type,
+                    **extra,
                 )
                 return
             except Exception as exc:
@@ -350,6 +352,7 @@ class R2:
                 Key=key,
                 Body=body,
                 ContentType=content_type,
+                **extra,
             )
         except Exception:
             log.warning("dashboard fallback put failed for %s (non-fatal)", key, exc_info=True)
@@ -358,8 +361,8 @@ class R2:
         body = json.dumps(data, default=str).encode()
         self._put_dashboard_bytes(key, body, "application/json")
 
-    def put_dashboard_raw(self, key, body, content_type):
-        self._put_dashboard_bytes(key, body, content_type)
+    def put_dashboard_raw(self, key, body, content_type, cache_control=None):
+        self._put_dashboard_bytes(key, body, content_type, cache_control=cache_control)
 
     def put(self, key, data):
         try:
@@ -2269,8 +2272,21 @@ async def main():
     if os.path.exists(html_path):
         with open(html_path, "rb") as f:
             html_bytes = f.read()
-        r2.put_dashboard_raw("index.html", html_bytes, "text/html")
-        log.info("uploaded dashboard to Hippius")
+        # Stamp a build id derived from the source bytes so long-lived browser
+        # tabs can detect a deploy and reload themselves (see checkVersion in
+        # website/index.html). The placeholder must be replaced before upload
+        # or no version check ever fires.
+        build_id = hashlib.sha256(html_bytes).hexdigest()[:12]
+        html_bytes = html_bytes.replace(b"__BUILD_ID__", build_id.encode())
+        # no-cache forces browsers to revalidate every load via ETag, so a
+        # deploy lands on the next refresh instead of after max-age expires.
+        r2.put_dashboard_raw(
+            "index.html",
+            html_bytes,
+            "text/html; charset=utf-8",
+            cache_control="no-cache, must-revalidate",
+        )
+        log.info("uploaded dashboard to Hippius (build=%s)", build_id)
 
     if not state.king:
         seed_revision = ""

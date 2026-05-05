@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache, must-revalidate">
+<meta name="build" content="__BUILD_ID__">
 <title>Teuton</title>
 <link rel="icon" type="image/x-icon" href="favicon.ico">
 <link rel="icon" type="image/png" href="favicon.png">
@@ -113,6 +115,7 @@ body {
 .scroll-box::-webkit-scrollbar { width: 4px; }
 .scroll-box::-webkit-scrollbar-thumb { background: var(--ink); }
 .scroll-queue { max-height: 200px; }
+.scroll-king-chain { max-height: 240px; }
 .scroll-hist { max-height: 60vh; }
 
 table {
@@ -303,8 +306,28 @@ th:last-child, td:last-child { text-align: right; }
     </div>
 
     <div>
-        <div class="section-label">Last Winner</div>
+        <div class="section-label">King</div>
         <div id="last-winner" style="font-size:12px;line-height:1.8;min-height:48px;display:flex;flex-wrap:wrap;gap:0 16px;">--</div>
+    </div>
+
+    <div>
+        <div class="section-label">Reigns</div>
+        <div class="scroll-box scroll-king-chain">
+            <table>
+                <thead><tr>
+                    <th>#</th>
+                    <th>Reign</th>
+                    <th>UID</th>
+                    <th>Hotkey</th>
+                    <th>Repo</th>
+                    <th>Weight</th>
+                    <th>&alpha; / hr</th>
+                    <th>$ / hr</th>
+                    <th>Crowned</th>
+                </tr></thead>
+                <tbody id="king-chain"></tbody>
+            </table>
+        </div>
     </div>
 
     <div>
@@ -324,7 +347,7 @@ th:last-child, td:last-child { text-align: right; }
     </div>
 
     <div>
-        <div class="section-label">Duel History</div>
+        <div class="section-label">History</div>
         <div class="scroll-box scroll-hist">
             <table>
                 <thead><tr>
@@ -351,8 +374,15 @@ var DATA_ENDPOINTS = [
     "https://eu-central-1.hippius.com/teutonic-sn3/dashboard.json",
     "https://s3.hippius.com/teutonic-sn3/dashboard.json"
 ];
+var HTML_ENDPOINTS = [
+    "https://us-east-1.hippius.com/teutonic-sn3/index.html",
+    "https://eu-central-1.hippius.com/teutonic-sn3/index.html",
+    "https://s3.hippius.com/teutonic-sn3/index.html"
+];
 var DATA_URL = DATA_ENDPOINTS[0];
 var POLL_MS = 5000;
+var VERSION_CHECK_MS = 60000;
+var BUILD_ID = "__BUILD_ID__";
 var ENDPOINT_CACHE_KEY = "dashboardEndpoint";
 var ENDPOINT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 var _lastData = null;
@@ -495,11 +525,13 @@ function render(d) {
     var hist = (d.history || []).slice().reverse();
     var ev = d.current_eval;
 
-    // --- 1. Chart (king + challenger, perplexity or loss) ---
+    // --- Chart (king + challenger, perplexity or loss) ---
     var isPpl = _chartMode === "ppl";
     document.getElementById("chart-label").textContent = isPpl ? "Perplexity" : "Loss";
     document.getElementById("chart-mode-toggle").textContent = isPpl ? "Loss" : "Perplexity";
 
+    // Always work in loss-space for stable scaling (perplexity = exp(loss) explodes
+    // for early-training values). Convert to perplexity only at display time.
     var kingVals = [], challVals = [];
     for (var i = 0; i < hist.length; i++) {
         if (hist[i].verdict === "error") continue;
@@ -507,16 +539,17 @@ function render(d) {
         var cl = hist[i].avg_challenger_loss || 0;
         if (kl || cl) {
             var kv = kl || cl, cv = cl || kl;
-            kingVals.push(isPpl ? Math.exp(kv) : kv);
-            challVals.push(isPpl ? Math.exp(cv) : cv);
+            kingVals.push(kv);
+            challVals.push(cv);
         }
     }
     if (ev && ev.avg_king_loss) {
         var ekv = ev.avg_king_loss;
         var ecv = ev.avg_challenger_loss || ev.avg_king_loss;
-        kingVals.push(isPpl ? Math.exp(ekv) : ekv);
-        challVals.push(isPpl ? Math.exp(ecv) : ecv);
+        kingVals.push(ekv);
+        challVals.push(ecv);
     }
+    function dispVal(v) { return isPpl ? Math.exp(v) : v; }
     var nPts = kingVals.length;
 
     var smoothVal = parseFloat(document.getElementById("smooth-slider").value);
@@ -562,7 +595,6 @@ function render(d) {
         var cap = p95 + iqr * 1.5;
         if (maxL > cap && cap > minL) maxL = cap;
     }
-    if (isPpl && maxL > 20) maxL = 20;
     var padV = (maxL - minL) * 0.08 || 0.5;
     minL -= padV; maxL += padV;
 
@@ -581,7 +613,7 @@ function render(d) {
         var val = minL + (maxL - minL) * (t / nTicks);
         var yy = toY(val);
         svg += '<line x1="' + (ML - 5*dpr) + '" y1="' + yy + '" x2="' + ML + '" y2="' + yy + '" stroke="' + inkC + '" stroke-width="' + lw + '"/>';
-        svg += '<text x="' + (ML - 8*dpr) + '" y="' + (yy + fs*0.35) + '" text-anchor="end" ' + font + '>' + val.toFixed(2) + '</text>';
+        svg += '<text x="' + (ML - 8*dpr) + '" y="' + (yy + fs*0.35) + '" text-anchor="end" ' + font + '>' + dispVal(val).toFixed(2) + '</text>';
         if (t > 0 && t < nTicks) {
             svg += '<line x1="' + ML + '" y1="' + yy + '" x2="' + (ML + pw) + '" y2="' + yy + '" stroke="' + inkC + '" stroke-width="' + (0.5*dpr) + '" stroke-dasharray="' + (3*dpr) + ' ' + (6*dpr) + '"/>';
         }
@@ -647,7 +679,7 @@ function render(d) {
     var latestK = kingVals[nPts - 1];
     var metaLabel = isPpl ? "KING PPL" : "KING LOSS";
     document.getElementById("chart-meta").innerHTML =
-        "<span>" + metaLabel + ": " + latestK.toFixed(4) + "</span><span>EVALS: " + nPts + "</span>";
+        "<span>" + metaLabel + ": " + dispVal(latestK).toFixed(4) + "</span><span>EVALS: " + nPts + "</span>";
 
     } // end chart data block
 
@@ -760,7 +792,7 @@ function render(d) {
         }
     }
 
-    // --- Last Winner ---
+    // --- King (most-recent winning challenger summary) ---
     var lwEl = document.getElementById("last-winner");
     var winner = null;
     for (var i = 0; i < (d.history || []).length; i++) {
@@ -780,7 +812,44 @@ function render(d) {
         lwEl.textContent = "NO DETHRONING YET";
     }
 
-    // --- 2. Queue ---
+    // --- Reigns (rolling king window) ---
+    // king_chain entries already include weight/alpha_per_hour/usd_per_hour
+    // straight from the validator; king_chain_weights is a fallback for older
+    // payloads where those fields lived in a separate block.
+    var kcEl = document.getElementById("king-chain");
+    var kc = d.king_chain || [];
+    if (kc.length === 0) {
+        kcEl.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:16px">No reigns yet</td></tr>';
+    } else {
+        var kcWeights = {};
+        (d.king_chain_weights || []).forEach(function(w) { kcWeights[w.hotkey] = w; });
+        kcEl.innerHTML = kc.map(function(e, i) {
+            var w = kcWeights[e.hotkey] || {};
+            var weightVal = e.weight != null ? e.weight : w.weight;
+            var alphaVal = e.alpha_per_hour != null ? e.alpha_per_hour : w.alpha_per_hour;
+            var usdVal = e.usd_per_hour != null ? e.usd_per_hour : w.usd_per_hour;
+            var repo = e.hf_repo || "--";
+            var repoLink = e.hf_repo ? '<a href="https://huggingface.co/' + e.hf_repo + '" target="_blank" style="color:var(--ink)">' + repo + '</a>' : repo;
+            var hkLink = e.hotkey ? '<a href="https://taomarketcap.com/hotkey/' + e.hotkey + '/mining_hotkeys" target="_blank" style="color:var(--ink)">' + short(e.hotkey, 16) + '</a>' : '--';
+            var weightPct = (weightVal != null) ? (weightVal * 100).toFixed(1) + "%" : "--";
+            var alphaHr = (alphaVal != null) ? alphaVal.toFixed(3) : "--";
+            var usdHr = (usdVal != null) ? "$" + usdVal.toFixed(2) : "--";
+            var crowned = e.crowned_at ? e.crowned_at.slice(0, 16).replace("T", " ") + "Z" : "--";
+            return '<tr>' +
+                '<td>' + (i + 1) + '</td>' +
+                '<td>#' + (e.reign_number != null ? e.reign_number : "--") + '</td>' +
+                '<td>' + (e.uid != null ? e.uid : "--") + '</td>' +
+                '<td>' + hkLink + '</td>' +
+                '<td>' + repoLink + '</td>' +
+                '<td>' + weightPct + '</td>' +
+                '<td>' + alphaHr + '</td>' +
+                '<td>' + usdHr + '</td>' +
+                '<td>' + crowned + '</td>' +
+                '</tr>';
+        }).join("");
+    }
+
+    // --- Queue ---
     var qEl = document.getElementById("queue");
     var q = d.queue || [];
     if (q.length === 0) {
@@ -800,7 +869,7 @@ function render(d) {
         }).join("");
     }
 
-    // --- 4. Duel History ---
+    // --- History (duel results) ---
     var hb = document.getElementById("hist");
     var history = d.history || [];
     if (history.length === 0) {
@@ -953,6 +1022,36 @@ DATA_URL = loadCachedEndpoint();
 
 poll();
 setInterval(poll, POLL_MS);
+
+// Self-heal: long-lived tabs (especially mobile Safari bfcache) can keep an
+// old DOM forever. Periodically fetch the live index.html and reload if its
+// build id no longer matches what we booted with. Reloads only when the tab
+// is visible to avoid surprising background tabs mid-scroll.
+async function checkVersion() {
+    if (!BUILD_ID || BUILD_ID.indexOf("__") === 0) return;
+    var urls = HTML_ENDPOINTS.slice();
+    var buster = "?vcheck=" + Date.now();
+    for (var i = 0; i < urls.length; i++) {
+        try {
+            var r = await fetch(urls[i] + buster, { cache: "no-store" });
+            if (!r.ok) continue;
+            var text = await r.text();
+            var m = text.match(/<meta\s+name=["']build["']\s+content=["']([^"']+)["']/i);
+            if (!m) return;
+            var live = m[1];
+            if (live && live !== BUILD_ID && live.indexOf("__") !== 0) {
+                if (!document.hidden) {
+                    location.reload();
+                }
+            }
+            return;
+        } catch (e) {}
+    }
+}
+setInterval(checkVersion, VERSION_CHECK_MS);
+document.addEventListener("visibilitychange", function() {
+    if (!document.hidden) checkVersion();
+});
 </script>
 </body>
 </html>

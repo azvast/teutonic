@@ -69,6 +69,12 @@ DEFAULT_ALPHA = float(os.environ.get("EVAL_ALPHA", "0.001"))
 DEFAULT_SEQ_LEN = int(os.environ.get("EVAL_SEQ_LEN", "2048"))
 DEFAULT_BOOTSTRAP_B = int(os.environ.get("EVAL_BOOTSTRAP_B", "10000"))
 
+# Server-side caps. The validator can request a larger eval_n / n_bootstrap
+# in its POST body; we clamp to these to keep per-eval wall time bounded
+# while clearing a backed-up duel queue. Restore via env if not needed.
+EVAL_N_CAP = int(os.environ.get("EVAL_N_CAP", "999999"))
+EVAL_BOOTSTRAP_B_CAP = int(os.environ.get("EVAL_BOOTSTRAP_B_CAP", "999999"))
+
 PROBE_ENABLED = os.environ.get("TEUTONIC_PROBE_ENABLED", "1") == "1"
 
 EVAL_MAX_RUNTIME_S = int(os.environ.get("EVAL_MAX_RUNTIME_S", "1800"))
@@ -618,11 +624,16 @@ def _run_eval(eval_id: str, req: EvalRequest):
             record["progress"] = info
             event_q.put({"type": "progress", "data": info})
 
+        eval_n_capped = min(req.eval_n, EVAL_N_CAP)
+        n_bootstrap_capped = min(req.n_bootstrap, EVAL_BOOTSTRAP_B_CAP)
+        if eval_n_capped < req.eval_n or n_bootstrap_capped < req.n_bootstrap:
+            log.info("eval %s: capped eval_n %d->%d n_bootstrap %d->%d",
+                     eval_id, req.eval_n, eval_n_capped, req.n_bootstrap, n_bootstrap_capped)
         verdict = run_bootstrap_test(
             king_eval, challenger_eval,
-            _r2, req.shard_key, req.eval_n, req.alpha,
+            _r2, req.shard_key, eval_n_capped, req.alpha,
             req.seq_len, req.batch_size, seed_str,
-            n_bootstrap=req.n_bootstrap,
+            n_bootstrap=n_bootstrap_capped,
             on_progress=_on_progress,
         )
 
@@ -835,24 +846,12 @@ async def preload_endpoint(req: PreloadRequest):
             # is a backstop in case _gpu_busy is left set by a bug — under
             # normal operation EVAL_MAX_RUNTIME_S will hit first and the
             # eval's finally: clears _gpu_busy.
-            wait_t0 = time.time()
-            warned = False
-            while _gpu_busy.is_set():
-                if not warned:
-                    log.info("preload deferring: gpu busy with eval/probe (%s)",
-                             key)
-                    warned = True
-                if time.time() - wait_t0 > PRELOAD_MAX_DEFER_S:
-                    log.warning(
-                        "preload %s: max defer %ds exceeded, proceeding "
-                        "even though gpu_busy is still set", key,
-                        int(PRELOAD_MAX_DEFER_S))
-                    break
-                time.sleep(PRELOAD_DEFER_POLL_S)
-            wait_s = time.time() - wait_t0
-            if warned:
-                log.info("preload %s: resuming after %.1fs deferral",
-                         key, wait_s)
+            # Previously we deferred preloads while gpu_busy was set ('yield
+            # bandwidth to in-flight eval'). In practice that pushed preloads
+            # past the next /eval boundary and made them useless. The
+            # PRELOAD_PARALLELISM semaphore below already keeps preload
+            # downloads from stomping each other.
+            wait_s = 0.0  # kept in log line below for backward-compat
 
             # Serialise the actual network download so concurrent preloads
             # don't share/throttle the per-IP xet-bridge bandwidth cap.

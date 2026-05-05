@@ -468,13 +468,22 @@ def _prefetch_repo(repo, revision=None, timeout=600):
 
     def _do():
         try:
-            result["path"] = snapshot_download(
-                repo_id=repo,
-                revision=revision or None,
-                token=os.environ.get("HF_TOKEN") or None,
-                allow_patterns=["*.json", "*.safetensors", "*.txt", "tokenizer*", "*.model"],
-                etag_timeout=int(os.environ.get("HF_HUB_ETAG_TIMEOUT", "30")),
-            )
+            for attempt in range(3):
+                try:
+                    result["path"] = snapshot_download(
+                        repo_id=repo,
+                        revision=revision or None,
+                        token=os.environ.get("HF_TOKEN") or None,
+                        allow_patterns=["*.json", "*.safetensors", "*.txt", "tokenizer*", "*.model"],
+                        etag_timeout=int(os.environ.get("HF_HUB_ETAG_TIMEOUT", "30")),
+                    )
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        raise
+                    backoff = 5 * (3 ** attempt)
+                    log.warning("prefetch attempt %d/3 failed for %s: %s; retrying in %ds (HF cache will resume)", attempt + 1, repo, e, backoff)
+                    time.sleep(backoff)
         except Exception as e:
             result["err"] = e
 

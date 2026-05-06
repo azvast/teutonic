@@ -1302,6 +1302,7 @@ class State:
             "challenge_id": verdict.get("challenge_id"),
             "hotkey": hotkey,
             "uid": self.uid_map.get(hotkey),
+            "coldkey": self.coldkey_for(hotkey),
             "challenger_repo": challenger_repo,
             "accepted": verdict.get("accepted", False),
             "verdict": verdict.get("verdict", "unknown"),
@@ -1320,10 +1321,12 @@ class State:
         self.r2.put("state/dashboard_history.json", {"history": self.history})
 
     def record_failure(self, entry, error_code, error_detail=""):
+        hk = entry.get("hotkey", "")
         self.history.insert(0, {
             "challenge_id": entry.get("challenge_id", "?"),
-            "hotkey": entry.get("hotkey", ""),
-            "uid": self.uid_map.get(entry.get("hotkey", "")),
+            "hotkey": hk,
+            "uid": self.uid_map.get(hk),
+            "coldkey": self.coldkey_for(hk) if hk else None,
             "challenger_repo": entry.get("hf_repo", ""),
             "accepted": False,
             "verdict": "error",
@@ -1403,17 +1406,22 @@ class State:
         return count
 
     def _with_fresh_uid(self, entry):
-        """Return a copy of `entry` whose `uid` is re-derived from the current
-        metagraph. Insert-time uids can go stale (deregistration, hotkey
-        re-registration under a new uid) and old payloads from before this
-        function existed had `uid="?"` for hotkeys that weren't in the map at
-        insert time. We project at flush time so the dashboard is always
-        consistent with the latest `refresh_uid_map` snapshot.
+        """Return a copy of `entry` whose `uid` and `coldkey` are re-derived
+        from the current metagraph. Insert-time uids can go stale (deregistration,
+        hotkey re-registration under a new uid) and old payloads from before
+        these fields existed had `uid="?"` / no coldkey at all. We project at
+        flush time so the dashboard is always consistent with the latest
+        `refresh_uid_map` snapshot, and so the dashboard hotkey -> coldkey
+        link always points at the *current* coldkey for a hotkey rather than
+        whatever coldkey was on file when the duel was recorded.
         """
         hk = entry.get("hotkey") if isinstance(entry, dict) else None
         if not hk:
             return entry
-        return {**entry, "uid": self.uid_map.get(hk)}
+        # Prefer freshly resolved coldkey; fall back to the persisted value
+        # only if the hotkey has been deregistered out of the metagraph.
+        ck = self.coldkey_for(hk) or entry.get("coldkey")
+        return {**entry, "uid": self.uid_map.get(hk), "coldkey": ck}
 
     def flush_dashboard(self, *, force: bool = False):
         # Dashboard flush is presentational: it MUST NEVER raise into the main
@@ -1458,6 +1466,7 @@ class State:
                 entry = {
                     "hotkey": hk,
                     "uid": self.uid_map.get(hk),
+                    "coldkey": self.coldkey_for(hk),
                     "weight": round(w, 6),
                     "weight_share": round(share, 6),
                     "emission_per_block": round(em_per_block, 9),
@@ -1476,6 +1485,7 @@ class State:
                 king_chain.append({
                     "hotkey": hk,
                     "uid": self.uid_map.get(hk),
+                    "coldkey": self.coldkey_for(hk),
                     "hf_repo": e.get("hf_repo"),
                     "king_revision": e.get("king_revision"),
                     "reign_number": e.get("reign_number"),
@@ -1505,6 +1515,7 @@ class State:
                 "score_window": self.score_window,
                 "queue": [{"challenge_id": e.get("challenge_id"), "hotkey": e.get("hotkey"),
                             "uid": self.uid_map.get(e.get("hotkey", "")),
+                            "coldkey": self.coldkey_for(e.get("hotkey", "")),
                             "hf_repo": e.get("hf_repo"), "queued_at": e.get("queued_at"),
                             "block": e.get("block"), "reeval": e.get("reeval", False)}
                            for e in self.queue],

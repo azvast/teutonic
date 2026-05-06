@@ -396,6 +396,20 @@ var _chartMode = localStorage.getItem("chartMode") || "ppl";
 
 function short(s, n) { return s ? s.slice(0, n || 12) + "\u2026" : "--"; }
 
+// Render a hotkey cell that links to the *coldkey* page on TaoMarketCap.
+// Coldkey owns the wallet and aggregates emissions, so a coldkey link is
+// the right pivot for "show me everything this miner has done". When the
+// hotkey has no coldkey on file (deregistered, or metagraph not synced
+// yet) we render the short hotkey as plain text -- still recognizable,
+// but no broken link out.
+function hotkeyCell(hotkey, coldkey) {
+    if (!hotkey) return "--";
+    var label = short(hotkey, 16);
+    if (!coldkey) return label;
+    return '<a href="https://taomarketcap.com/coldkey/' + encodeURIComponent(coldkey) +
+        '" target="_blank" style="color:var(--ink)">' + label + '</a>';
+}
+
 function timeAgo(iso) {
     if (!iso) return "--";
     var sec = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -830,7 +844,7 @@ function render(d) {
             var usdVal = e.usd_per_hour != null ? e.usd_per_hour : w.usd_per_hour;
             var repo = e.hf_repo || "--";
             var repoLink = e.hf_repo ? '<a href="https://huggingface.co/' + e.hf_repo + '" target="_blank" style="color:var(--ink)">' + repo + '</a>' : repo;
-            var hkLink = e.hotkey ? '<a href="https://taomarketcap.com/hotkey/' + e.hotkey + '/mining_hotkeys" target="_blank" style="color:var(--ink)">' + short(e.hotkey, 16) + '</a>' : '--';
+            var hkLink = hotkeyCell(e.hotkey, e.coldkey);
             var weightPct = (weightVal != null) ? (weightVal * 100).toFixed(1) + "%" : "--";
             var alphaHr = (alphaVal != null) ? alphaVal.toFixed(3) : "--";
             var usdHr = (usdVal != null) ? "$" + usdVal.toFixed(2) : "--";
@@ -862,7 +876,7 @@ function render(d) {
             return '<tr>' +
                 '<td>' + uid + '</td>' +
                 '<td>' + repoLink + '</td>' +
-                '<td>' + (e.hotkey ? '<a href="https://taomarketcap.com/hotkey/' + e.hotkey + '/mining_hotkeys" target="_blank" style="color:var(--ink)">' + short(e.hotkey, 16) + '</a>' : '--') + '</td>' +
+                '<td>' + hotkeyCell(e.hotkey, e.coldkey) + '</td>' +
                 '<td>' + (e.block ? '#' + e.block : '--') + '</td>' +
                 '<td>' + (e.reeval ? 'SEEN' : 'UNSEEN') + '</td>' +
                 '</tr>';
@@ -906,7 +920,7 @@ function render(d) {
             return '<tr>' +
                 '<td>' + uid + '</td>' +
                 '<td>' + repoLink + '</td>' +
-                '<td>' + (h.hotkey ? '<a href="https://taomarketcap.com/hotkey/' + h.hotkey + '/mining_hotkeys" target="_blank" style="color:var(--ink)">' + short(h.hotkey, 16) + '</a>' : '--') + '</td>' +
+                '<td>' + hotkeyCell(h.hotkey, h.coldkey) + '</td>' +
                 verdictCell +
                 '<td>' + (isErr ? "--" : (h.mu_hat || 0).toFixed(6)) + '</td>' +
                 '<td>' + (isErr ? "--" : (h.lcb || 0).toFixed(6)) + '</td>' +

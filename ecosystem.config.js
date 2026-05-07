@@ -47,18 +47,26 @@ module.exports = {
       TMC_API_KEY: doppler("TMC_API_KEY"),
       DISCORD_BOT_TOKEN: doppler("DISCORD_BOT_TOKEN"),
       DISCORD_CHANNEL_ID: doppler("DISCORD_CHANNEL_ID"),
-      // Each eval takes ~250s of bootstrap + setup + busy-wait for the
-      // eval-server lock. A single tick can legitimately take 7-15 minutes
-      // when the server is saturated; default 600s was tripping the watchdog
-      // on every successful eval.
-      TEUTONIC_TICK_RESTART_AFTER: "1800",
+      // LXXX 80B per-eval wall is ~10 min steady (153 GiB chall HF prefetch
+      // ~270s + sharded load ~22s + sharded probe ~4s + bootstrap ~330s at
+      // EVAL_N=5000 + cleanup ~15s) and ~14 min cold-page-cache (load grows
+      // to ~218s when chall safetensors aren't in OS page cache). The 3600s
+      // (1h) restart envelope gives ~4-5x safety margin. Pre-LXXX value was
+      // 1800s for the 24B Quasar chain at ~5 min/eval.
+      TEUTONIC_TICK_RESTART_AFTER: "3600",
       TEUTONIC_MAX_CONSECUTIVE_TICK_ERRORS: "20",
-      // Defense-in-depth for the eval-stream idle watchdog. The eval_server
-      // now emits SSE heartbeat events during king/challenger load so this
-      // should never trip in normal operation; the wider envelope is just
-      // insurance against slow CDN downloads of an uncached challenger.
-      TEUTONIC_STREAM_IDLE_WARN_AFTER: "300",
-      TEUTONIC_STREAM_IDLE_TIMEOUT: "900",
+      // Stream-idle watchdog envelope must accommodate the multi-minute
+      // chall HF prefetch + sharded model load. The eval_server emits SSE
+      // heartbeat events during these phases so this rarely actually fires
+      // in normal operation. Pre-LXXX values were 300/900s.
+      TEUTONIC_STREAM_IDLE_WARN_AFTER: "600",
+      TEUTONIC_STREAM_IDLE_TIMEOUT: "1800",
+      // 165 GiB seed-king HF download + sha256 takes ~25-30 min on this
+      // box's network; pre-LXXX default 1200s (20 min) timed out. Bump
+      // to 2400s (40 min) for headroom on the next coronation download
+      // and any out-of-cycle king-hash recompute (State.load placeholder
+      // path).
+      TEUTONIC_KING_HASH_TIMEOUT_S: "2400",
     },
     max_restarts: 10,
     restart_delay: 5000,

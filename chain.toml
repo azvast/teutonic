@@ -1,19 +1,39 @@
+# Teutonic-LXXX chain config (vanilla Qwen3-MoE 80B / 7.6B active).
+# Replaces the previous Teutonic-XXIV (Quasar 24B / 8B active) chain at the
+# 2026-05-07 cutover. Genesis seed is the random-init mock-king from the
+# sandbox soak — first competent training run dethrones easily.
 [chain]
-name = "Teutonic-XXIV"
-seed_repo = "unconst/Teutonic-XXIV"
-# repo_pattern auto-derives to "^[^/]+/Teutonic-XXIV-.+$" if omitted
+name = "Teutonic-LXXX"
+seed_repo = "unconst/Teutonic-LXXX-mock-king"
+# repo_pattern auto-derives to "^[^/]+/Teutonic-LXXX-.+$" if omitted —
+# matches both the seed (mock-king has the "mock-king" suffix after the
+# chain name) and any miner-submitted challenger.
 
 [arch]
-module = "archs.quasar"
+module = "archs.qwen3_moe"
+# Qwen3MoE-specific config keys that must match king<->challenger byte-for-byte.
+# Generic structural keys (vocab_size, hidden_size, num_hidden_layers,
+# num_attention_heads, num_key_value_heads, head_dim, intermediate_size,
+# model_type, tie_word_embeddings, rope_theta, max_position_embeddings,
+# max_seq_len) are already enforced by validator.py:_generic_lock.
 extra_lock_keys = [
-  "d_model","n_layers","n_heads","d_ff",
-  "quasar_layers","gated_layers","use_gla_first",
-  "dense_input_layers","moe_type",
-  "num_routed_experts","num_shared_experts","top_k",
-  "routed_expert_size","shared_expert_size","bigmac_r",
-  "memory_slots","memory_dim",
-  "num_loops","use_looped_injection",
+  "num_experts",
+  "num_experts_per_tok",
+  "moe_intermediate_size",
+  "decoder_sparse_step",
+  "norm_topk_prob",
+  "router_aux_loss_coef",
+  "mlp_only_layers",
+  # transformers 5.5+ flattens rope into a dict (e.g. {"rope_theta":1e6,"rope_type":"default"});
+  # the generic lock's "rope_theta" key is None on this transformers version
+  # so we lock the whole dict here for byte-for-byte parity king<->challenger.
+  "rope_parameters",
 ]
 
 [seed]
+# We deliberately reuse Teutonic-I (Gemma3-derived, vocab 262144) so the
+# live `dataset/v2/shards/...` shards work as-is — no v3 dataset rebuild
+# needed before cutover. The 80B Qwen3MoE arch was originally drafted
+# against the Qwen tokenizer (vocab 151936); switching to vocab 262144
+# adds ~451M params to the tied embed/lm_head (81.88B -> 82.33B total).
 tokenizer_repo = "unconst/Teutonic-I"

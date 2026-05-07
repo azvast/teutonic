@@ -777,13 +777,51 @@ def _seed_king_hash(repo: str, revision: str) -> str:
     """Compute sha256 over the king repo's safetensors so it matches the
     `king_hash` miners encode in their on-chain commits (see miner.sha256_dir).
 
-    Runs the download + hash in an isolated subprocess so a native crash in
-    the huggingface downloader cannot take the whole validator with it (see
-    2026-04-26 incidents where xet aborts SIGKILLed the parent mid-dethrone).
+    Two paths:
 
-    Falls back to the literal string "seed" if the subprocess fails — the
-    placeholder-recompute path in State.load() will fix it on the next start.
+    1. **Fast path** — ask the eval-server's `GET /hash` endpoint. The eval-
+       server has the repo cached (it just evaluated it), so this returns
+       in ~80 s on a hot disk-cache vs the slow path's ~5–15 min HF download.
+       Skipped if `TEUTONIC_EVAL_SERVER` is unset, the server is down, or
+       the server doesn't have the repo cached (HTTP 404).
+    2. **Slow path** — isolated subprocess that does `snapshot_download`
+       + sha256 locally. Insulated from native crashes in the HF downloader
+       (see 2026-04-26 xet-abort incidents that SIGKILLed the parent
+       mid-dethrone). Falls back to literal "seed" placeholder if the
+       subprocess fails; State.load()'s placeholder-recompute fixes it on
+       the next restart.
     """
+    eval_server = (os.environ.get("TEUTONIC_EVAL_SERVER") or "").rstrip("/")
+    if eval_server:
+        try:
+            r = httpx.get(
+                f"{eval_server}/hash",
+                params={"repo": repo, "revision": revision or ""},
+                timeout=httpx.Timeout(180.0),
+            )
+            if r.status_code == 200:
+                d = r.json()
+                digest = d.get("sha256") or ""
+                if digest:
+                    log.info("seed king_hash for %s@%s = %s "
+                             "(eval-server cache, %.1fs over %d files)",
+                             repo, (revision or "latest")[:12], digest[:16],
+                             d.get("elapsed_s", 0), d.get("n_files", 0))
+                    return digest
+                log.warning("eval-server /hash returned 200 but no sha256 "
+                            "for %s@%s, falling back to local download",
+                            repo, (revision or "latest")[:12])
+            elif r.status_code == 404:
+                log.info("eval-server /hash 404 for %s@%s "
+                         "(repo not cached on eval box, falling back to local download)",
+                         repo, (revision or "latest")[:12])
+            else:
+                log.warning("eval-server /hash returned HTTP %d for %s, "
+                            "falling back to local download", r.status_code, repo)
+        except Exception as e:
+            log.warning("eval-server /hash call failed (%s: %s), "
+                        "falling back to local download", type(e).__name__, e)
+
     import subprocess
     timeout_s = int(os.environ.get("TEUTONIC_KING_HASH_TIMEOUT_S", "1200"))
     try:

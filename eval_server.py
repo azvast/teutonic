@@ -692,6 +692,60 @@ def _run_eval(eval_id: str, req: EvalRequest):
 # Endpoints
 # ---------------------------------------------------------------------------
 
+@app.get("/hash")
+async def hash_endpoint(repo: str, revision: str = ""):
+    """sha256 over the cached safetensors of `repo`@`revision`.
+
+    Returns 404 if the repo isn't already in this server's local HF cache.
+
+    **Why this exists.** The validator's `_seed_king_hash` subprocess used
+    to re-download 165 GiB of safetensors to its own host every time a
+    coronation happened, just to compute the king-hash. But the eval-server
+    has the files on disk already (it just evaluated them). This endpoint
+    lets the validator fetch the digest directly via HTTP, saving ~5-15 min
+    per coronation.
+
+    Validator falls back to the local download path if this endpoint is
+    unreachable, slow, or returns 404. Hash bytes are identical between
+    paths — both stream `sha256` over the same safetensor blobs in
+    alphabetical filename order (huggingface_hub's local-snapshot layout
+    uses symlinks to `blobs/<sha>`, which `open()` follows transparently).
+    """
+    import hashlib
+    import glob
+    from huggingface_hub import snapshot_download
+    try:
+        local_dir = snapshot_download(
+            repo,
+            revision=revision or None,
+            local_files_only=True,
+            allow_patterns=["*.safetensors"],
+        )
+    except Exception as e:
+        raise HTTPException(status_code=404,
+                            detail=f"{repo}@{revision or 'HEAD'} not in cache: {type(e).__name__}")
+    files = sorted(glob.glob(os.path.join(local_dir, "*.safetensors")))
+    if not files:
+        raise HTTPException(status_code=404,
+                            detail=f"{repo}@{revision or 'HEAD'}: no safetensors in cached snapshot")
+    t0 = time.time()
+    h = hashlib.sha256()
+    for p in files:
+        with open(p, "rb") as f:
+            while chunk := f.read(1 << 20):
+                h.update(chunk)
+    digest = h.hexdigest()
+    log.info("hash: %s@%s -> %s over %d files in %.1fs",
+             repo, (revision or "HEAD")[:12], digest[:16], len(files), time.time() - t0)
+    return {
+        "sha256": digest,
+        "n_files": len(files),
+        "repo": repo,
+        "revision": revision,
+        "elapsed_s": round(time.time() - t0, 2),
+    }
+
+
 @app.get("/health")
 async def health():
     # _get_disk_stats() reads a snapshot updated by a dedicated

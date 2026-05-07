@@ -276,3 +276,79 @@ only, no pickle.
 **Q: How do I reset my submission if I made a mistake?**
 A: You can't dethrone yourself. Wait for the next reign and submit again.
 The validator de-dupes per-hotkey within a reign.
+
+---
+
+## Appendix A — Teutonic-LXXX (preview, NOT YET LIVE)
+
+> This appendix describes the next-generation chain (`Teutonic-LXXX`, ~80 B
+> total / ~7 B active vanilla Qwen3-MoE). It is **not yet live**: the
+> active chain remains `Teutonic-XXIV` (Quasar 24 B) per
+> [`chain.toml`](../chain.toml). Mining work for LXXX should NOT submit
+> against the live validator; the validator's repo regex still pins
+> `Teutonic-XXIV-*`. See [`docs/LXXX_RUNBOOK.md`](LXXX_RUNBOOK.md) for the
+> Phase-by-phase rollout.
+
+The cutover to `Teutonic-LXXX` will switch the chain identity in
+[`chain.toml`](../chain.toml) (or via `TEUTONIC_CHAIN_OVERRIDE=chain.lxxx.toml`
+during the soak). When that happens, the mining contract changes as
+follows:
+
+### A.1 Architecture you must match exactly (LXXX)
+
+`config.json` lock = generic structural keys + the LXXX `extra_lock_keys`
+in [`chain.lxxx.toml`](../chain.lxxx.toml):
+
+| field | value |
+|---|---|
+| `model_type` | `qwen3_moe` |
+| `architectures` | `["Qwen3MoeForCausalLM"]` |
+| `vocab_size` | `151936` (Qwen tokenizer) |
+| `hidden_size` | `4096` |
+| `num_hidden_layers` | `36` |
+| `num_attention_heads` / `num_key_value_heads` | `32` / `8` (GQA 4:1) |
+| `head_dim` | `128` |
+| `intermediate_size` | `11008` (used by any future dense layers) |
+| `num_experts` / `num_experts_per_tok` | `128` / `8` |
+| `moe_intermediate_size` | `1408` |
+| `decoder_sparse_step` | `1` (every layer is MoE) |
+| `norm_topk_prob` | `true` |
+| `router_aux_loss_coef` | `0.001` |
+| `mlp_only_layers` | `[]` |
+| `tie_word_embeddings` | `true` |
+| `rope_parameters` | `{"rope_theta": 1000000.0, "rope_type": "default"}` |
+| `max_position_embeddings` | `16384` |
+
+Vanilla `Qwen3MoeForCausalLM` ships in `transformers ≥ 4.51`; no
+`trust_remote_code`, no `auto_map`, no `*.py` files in the repo. Same
+defenses as the Quasar chain.
+
+### A.2 Minimum miner spec (LXXX)
+
+The base king is ~152 GiB bf16 on disk. Per-iteration compute:
+
+- ≥ 4× B200 (180 GiB) or ≥ 2× B300 (275 GiB) just to load the base in bf16
+- ≥ 256 GiB host RAM for safetensors I/O during perturbation / save
+- ≥ 1 TB free local SSD for king + challenger + a few HF cache copies
+- HF account with write quota for ~160 GiB challenger pushes (each)
+- Patience: a single push to HF takes 20-60 min at typical 50-150 MB/s
+
+Noise miner equivalent of [`miner.py:187-204`](../miner.py#L187-L204) for
+LXXX is in [`scripts/sandbox_perturb.py`](../scripts/sandbox_perturb.py)
+(uses the same per-tensor noise loop, no chain plumbing).
+
+### A.3 What dies, what stays the same
+
+Stays the same:
+- Reveal commitment payload format `<king_hash[:16]>:<challenger_repo>:<challenger_hash>`
+- Bootstrap LCB acceptance rule with `delta = 1/N`
+- Per-submission shard randomization via `blake2b(block_hash || hotkey)`
+- Coldkey-prefix repo gate (8-char ss58 prefix in repo namespace OR basename)
+- 5-king rolling payout
+
+Changes:
+- Repo regex switches from `^[^/]+/Teutonic-XXIV-.+$` to `^[^/]+/Teutonic-LXXX-.+$`
+- Tokenizer switches from Gemma3 (vocab 262144) to Qwen3 (vocab 151936); dataset shards rebuild as `dataset/v3/`
+- Quasar-specific notes are obsolete: no SMEBU, no latent memory, no `attn_implementation='eager'` requirement (FA2 / SDPA work natively for Qwen3MoE)
+- Per-eval wall grows from ~5 min to ~25-35 min (sharded 80B vs per-GPU 24B, 4× less parallelism); the validator's `TEUTONIC_TICK_RESTART_AFTER` budget grows from 1800 s to 3600 s to match
+

@@ -55,7 +55,7 @@ chain_config.load_arch()
 # Config
 # ---------------------------------------------------------------------------
 
-EVAL_N = 10_000
+EVAL_N = 5_000
 EVAL_ALPHA = 0.001
 SEQ_LEN = 2048
 POLL_INTERVAL = 30

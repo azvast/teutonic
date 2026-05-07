@@ -678,6 +678,19 @@ def _run_eval(eval_id: str, req: EvalRequest):
             _eval_lock.release()
         except RuntimeError:
             log.warning("eval %s: eval_lock was not held at release time", eval_id)
+        # Mark the just-evaluated challenger as "preloaded" so the cleanup
+        # below doesn't immediately evict it. Without this guard, the
+        # validator's coronation-side `_seed_king_hash` -> `GET /hash` race
+        # against this very cleanup: cleanup picks the chall as the largest
+        # eviction candidate, deletes its blobs, validator's /hash arrives
+        # ~1s later and gets a 404. Validator then falls back to its slow
+        # local download path (5-30 min). Keeping the chall in
+        # _preload_seen for PRELOAD_KEEP_S (30 min) bounds the race window.
+        try:
+            with _preload_lock:
+                _preload_seen[(req.challenger_repo, req.challenger_revision or "")] = time.time()
+        except Exception:
+            log.warning("eval %s: failed to mark chall as preloaded", eval_id, exc_info=True)
         try:
             _cleanup_hf_cache()
         except Exception:

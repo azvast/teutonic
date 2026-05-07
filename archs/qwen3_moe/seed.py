@@ -9,15 +9,14 @@ Sizing default (verified by `archs/qwen3_moe/size.py`):
     => 82.33B total / 7.59B active
 
 Default target repo + tokenizer come from chain.toml ([chain].seed_repo and
-[seed].tokenizer_repo) — for Teutonic-LXXX use TEUTONIC_CHAIN_OVERRIDE=
-chain.lxxx.toml so this script picks up the LXXX repo (`unconst/Teutonic-LXXX`)
-and the Teutonic-I tokenizer. Override push target via TEUTONIC_SEED_REPO_OVERRIDE
-(e.g. `unconst/Teutonic-LXXX-mock-king` for the sandbox soak).
+[seed].tokenizer_repo). On the live LXXX chain that's
+`unconst/Teutonic-LXXX-mock-king` + `unconst/Teutonic-I`. Override the push
+target via TEUTONIC_SEED_REPO_OVERRIDE if you want to seed a sibling repo
+(e.g. for a fresh genesis bake without overwriting the live king).
 
 Run on the GPU box (random init is fast — under a minute on one B300):
     source /workspace/teutonic/.venv/bin/activate
-    TEUTONIC_CHAIN_OVERRIDE=chain.lxxx.toml \
-    TEUTONIC_SEED_REPO_OVERRIDE=unconst/Teutonic-LXXX-mock-king \
+    TEUTONIC_SEED_REPO_OVERRIDE=unconst/Teutonic-LXXX-fresh \
     HF_HOME=/workspace/hf-cache \
     python scripts/seed.py --push --no-probe
 """

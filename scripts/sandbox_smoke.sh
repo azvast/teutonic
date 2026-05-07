@@ -41,7 +41,6 @@ tmux new -d -s eval "
   cd /root/teutonic
   source .venv/bin/activate
   source /root/.creds/hf_token.env
-  TEUTONIC_CHAIN_OVERRIDE=chain.lxxx.toml \
   TEUTONIC_SHARD_ACROSS_GPUS=1 \
   TEUTONIC_PROBE_ENABLED=0 \
   EVAL_N=$EVAL_N \

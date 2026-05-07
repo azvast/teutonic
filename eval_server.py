@@ -79,6 +79,13 @@ PROBE_ENABLED = os.environ.get("TEUTONIC_PROBE_ENABLED", "1") == "1"
 
 EVAL_MAX_RUNTIME_S = int(os.environ.get("EVAL_MAX_RUNTIME_S", "1800"))
 
+# Sharded mode: when set, build ONE replica per side via accelerate
+# device_map='auto' across that side's GPU subset, instead of one full replica
+# per GPU. Used by the LXXX 80B chain (152 GiB bf16 doesn't fit on a single
+# B200). Default off so the live Quasar 24B chain on the production eval pod
+# keeps its current per-GPU behavior unless explicitly opted in.
+SHARD_ACROSS_GPUS = os.environ.get("TEUTONIC_SHARD_ACROSS_GPUS", "0") == "1"
+
 
 # ---------------------------------------------------------------------------
 # Fatal-CUDA self-kill
@@ -273,7 +280,8 @@ def _ensure_king(repo: str, king_hash: str = "", revision: str = "",
     new_king = MultiGPUEvaluator(repo, king_gpus, label="king",
                                   force_download=False,
                                   revision=revision or None,
-                                  on_phase=on_phase)
+                                  on_phase=on_phase,
+                                  shard_across_gpus=SHARD_ACROSS_GPUS)
 
     if PROBE_ENABLED:
         if on_phase:
@@ -281,7 +289,10 @@ def _ensure_king(repo: str, king_hash: str = "", revision: str = "",
                 on_phase({"phase": "king_probe_start", "repo": repo})
             except Exception:
                 log.warning("on_phase callback raised (non-fatal)", exc_info=True)
-        king_model = new_king.models[new_king.gpu_ids[0]]
+        # In sharded mode there's one replica spanning all king_gpus; in
+        # per-GPU mode we probe the first replica. `primary_model` abstracts
+        # both.
+        king_model = new_king.primary_model
         t0 = time.time()
         probe = trainability_probe(king_model)
         log.info("king trainability probe for %s: ok=%s "
@@ -318,12 +329,16 @@ def _ensure_king(repo: str, king_hash: str = "", revision: str = "",
 
 
 def _load_challenger(repo: str, revision: str = "", on_phase=None):
-    """Load challenger on the second half of GPUs."""
+    """Load challenger on the second half of GPUs.
+
+    In sharded mode (TEUTONIC_SHARD_ACROSS_GPUS=1) the challenger occupies
+    the full second-half GPU set as one accelerate-sharded replica."""
     mid = len(_gpu_ids) // 2
     chall_gpus = _gpu_ids[mid:] or _gpu_ids[:1]
     return MultiGPUEvaluator(repo, chall_gpus, label="challenger",
                               revision=revision or None,
-                              on_phase=on_phase)
+                              on_phase=on_phase,
+                              shard_across_gpus=SHARD_ACROSS_GPUS)
 
 
 # ---------------------------------------------------------------------------
@@ -568,7 +583,9 @@ def _run_eval(eval_id: str, req: EvalRequest):
 
         if not same_model and PROBE_ENABLED:
             _on_phase({"phase": "challenger_probe_start", "repo": req.challenger_repo})
-            chall_model = challenger_eval.models[challenger_eval.gpu_ids[0]]
+            # In sharded mode there's one replica spanning all challenger GPUs;
+            # `primary_model` resolves correctly for both per-GPU and sharded.
+            chall_model = challenger_eval.primary_model
             t0 = time.time()
             probe = trainability_probe(chall_model)
             log.info("trainability probe for %s: ok=%s "
@@ -739,24 +756,77 @@ def _watchdog(eval_id: str, deadline: float):
 
 
 def _run_probe_blocking(repo: str, revision: str) -> dict:
-    """Load `repo`@`revision` on a single GPU, run the trainability probe,
-    free everything, return the probe verdict.
+    """Run the trainability probe on `repo`@`revision`, return the verdict.
 
-    Does NOT touch the cached king evaluator. Caller must hold `_eval_lock`
-    (so this can't collide with a live eval that would compete for VRAM).
+    Three modes (auto-selected):
+
+    1. **Cached king reuse** — if `repo` matches the currently-loaded
+       `_king_evaluator` (and revision matches if specified), reuse its
+       primary_model directly. This is the common case for the validator's
+       hourly `audit_incumbent_king`. trainability_probe restores p.grad
+       and named_buffers in its `finally` block, so the king replica is
+       byte-identical after probing.
+    2. **Sharded fresh load** — when `TEUTONIC_SHARD_ACROSS_GPUS=1` and the
+       model isn't the cached king, load a fresh sharded replica across all
+       `_gpu_ids` (the probe holds `_eval_lock`, so no /eval is concurrent
+       and we can use every GPU). Required for LXXX-scale models that don't
+       fit on one GPU.
+    3. **Single-GPU fresh load** — legacy path for chains where the model
+       fits on one GPU (e.g. Quasar 24B on a B200/B300).
+
+    Caller must hold `_eval_lock`.
     """
     if not _gpu_ids:
         raise RuntimeError("no GPUs available on eval server")
 
-    probe_gpu = _gpu_ids[-1]
-    device = f"cuda:{probe_gpu}"
-    log.info("probe: loading %s@%s on %s", repo, (revision or "HEAD")[:12], device)
+    global _king_evaluator, _king_repo, _king_revision
+
+    # Mode 1: reuse cached king replica when probing the incumbent.
+    if (_king_evaluator is not None
+            and _king_repo == repo
+            and (not revision or _king_revision == revision)):
+        log.info("probe: reusing cached king %s@%s (no reload)",
+                 repo, (revision or "HEAD")[:12])
+        t0 = time.time()
+        verdict = trainability_probe(_king_evaluator.primary_model)
+        probe_s = time.time() - t0
+        log.info("probe: %s ok=%s max_ratio=%.3f max_grad=%.2e "
+                 "norm_quant=%s (cached, probe=%.1fs)",
+                 repo, verdict["ok"],
+                 verdict.get("max_ratio", float("nan")),
+                 verdict.get("max_grad_norm", float("nan")),
+                 verdict.get("norm_quantization"),
+                 probe_s)
+        for w in verdict.get("warnings", []) or []:
+            log.warning("probe %s warning: %s", repo, w)
+        verdict["timing"] = {"load_s": 0.0, "probe_s": round(probe_s, 2),
+                             "total_s": round(probe_s, 2)}
+        verdict["repo"] = repo
+        verdict["revision"] = revision
+        verdict["cached"] = True
+        return verdict
+
+    # Mode 2 + 3: load fresh.
+    sharded = SHARD_ACROSS_GPUS and len(_gpu_ids) > 1
+    if sharded:
+        target = f"sharded({','.join(str(g) for g in _gpu_ids)})"
+        log.info("probe: loading %s@%s on %s", repo, (revision or "HEAD")[:12], target)
+    else:
+        probe_gpu = _gpu_ids[-1]
+        device = f"cuda:{probe_gpu}"
+        log.info("probe: loading %s@%s on %s", repo, (revision or "HEAD")[:12], device)
     t0 = time.time()
     model = None
     try:
-        model = load_model(repo, device, label=f"probe-{repo}",
-                           force_download=False,
-                           revision=revision or None)
+        if sharded:
+            model = load_model(repo, device=None, label=f"probe-{repo}",
+                               force_download=False,
+                               revision=revision or None,
+                               shard_across_gpus=_gpu_ids)
+        else:
+            model = load_model(repo, device, label=f"probe-{repo}",
+                               force_download=False,
+                               revision=revision or None)
         load_s = time.time() - t0
         t1 = time.time()
         verdict = trainability_probe(model)
@@ -777,6 +847,7 @@ def _run_probe_blocking(repo: str, revision: str) -> dict:
         }
         verdict["repo"] = repo
         verdict["revision"] = revision
+        verdict["cached"] = False
         return verdict
     finally:
         if model is not None:

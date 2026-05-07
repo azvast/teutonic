@@ -5,17 +5,28 @@ Reads `chain.toml` at the repo root and exposes constants used by
 (indirectly via dashboard.json). To swap the king to a new generation,
 edit `chain.toml` (and add `archs/<new>/` if the architecture changes);
 no code edits should be necessary.
+
+Override knob: `TEUTONIC_CHAIN_OVERRIDE` env var, when set, points at
+an alternate TOML (relative to repo root or absolute path). Used by the
+sandbox soak for `Teutonic-LXXX` so live `chain.toml` (Teutonic-XXIV)
+stays untouched until cutover.
 """
 from __future__ import annotations
 
 import importlib
+import os
 import pathlib
 import re
 import tomllib
 from types import ModuleType
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent
-_TOML_PATH = _REPO_ROOT / "chain.toml"
+_OVERRIDE = os.environ.get("TEUTONIC_CHAIN_OVERRIDE", "").strip()
+if _OVERRIDE:
+    _candidate = pathlib.Path(_OVERRIDE)
+    _TOML_PATH = _candidate if _candidate.is_absolute() else (_REPO_ROOT / _candidate)
+else:
+    _TOML_PATH = _REPO_ROOT / "chain.toml"
 
 with open(_TOML_PATH, "rb") as _f:
     _doc = tomllib.load(_f)

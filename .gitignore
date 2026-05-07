@@ -43,5 +43,12 @@ recent-chat.json
 teutonic_test/
 hf_cache/
 
+# Pre-cutover R2 state backups (contain validator state with hotkeys etc).
+backup-r2-state-*/
+*.toml.bak
+
+# Symlink dir from older deploy layout, not actual repo content.
+teutonic/
+
 # Hippius PoC bench harness writes per-run env files containing live secrets.
 scripts/experiments/hippius_poc/runs/*/remote.env

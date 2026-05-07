@@ -360,12 +360,32 @@ def extract_sequences(shard_data, data_offset, indices, seq_len):
 LM_HEAD_CHUNK = int(os.environ.get("TEUTONIC_LM_HEAD_CHUNK", "512"))
 
 @torch.no_grad()
+def _lm_head_device(model) -> torch.device:
+    """Where lm_head's weight lives. For tied-embedding models this equals
+    the embed_tokens device; for untied/sharded models this is wherever
+    accelerate placed the head."""
+    return next(model.lm_head.parameters()).device
+
+
+@torch.no_grad()
 def compute_batch_losses(model, token_batches, device, chunk_size=LM_HEAD_CHUNK):
     """Forward pass with chunked lm_head to avoid OOM on large vocabs.
 
     Instead of model(input_ids).logits which allocates [batch, seq, vocab],
     we get hidden states first then apply lm_head in small chunks along the
     sequence dimension. Peak VRAM drops ~7x for vocab_size=262144.
+
+    Works for both single-GPU models (`device` is "cuda:N") and accelerate-
+    sharded models (`device` is the input-embedding device). When sharded,
+    `last_hidden_state` may surface on a different GPU than `lm_head`; we
+    relocate it once outside the chunk loop so the chunked CE doesn't bounce
+    across devices.
+
+    The `@torch.no_grad()` is critical for sharded 80B models: without it
+    PyTorch keeps every layer's activations alive for backward, blowing
+    per-GPU memory by ~6x (~30 GiB/layer × 36 layers across 4 GPUs ≈ 1 TB).
+    `compute_paired_losses` already had this decorator; sharded paired runs
+    are now routed through this function so it needed parity.
     """
     input_ids = torch.tensor(token_batches, dtype=torch.long, device=device)
     # Quasar (and any future stateful arch) carries a persistent latent memory
@@ -376,14 +396,18 @@ def compute_batch_losses(model, token_batches, device, chunk_size=LM_HEAD_CHUNK)
         model.reset_state()
     hidden = model.model(input_ids).last_hidden_state
     lm_head = model.lm_head
+    head_dev = _lm_head_device(model)
+    if hidden.device != head_dev:
+        hidden = hidden.to(head_dev)
+    labels = input_ids if input_ids.device == head_dev else input_ids.to(head_dev)
 
-    n_positions = input_ids.size(1) - 1
-    total_loss = torch.zeros(len(token_batches), device=device)
+    n_positions = labels.size(1) - 1
+    total_loss = torch.zeros(len(token_batches), device=head_dev)
 
     for i in range(0, n_positions, chunk_size):
         end_pos = min(i + chunk_size, n_positions)
         chunk_logits = lm_head(hidden[:, i:end_pos, :])
-        chunk_labels = input_ids[:, i + 1 : end_pos + 1]
+        chunk_labels = labels[:, i + 1 : end_pos + 1]
         loss = F.cross_entropy(
             chunk_logits.reshape(-1, chunk_logits.size(-1)),
             chunk_labels.reshape(-1),
@@ -406,6 +430,11 @@ def compute_paired_losses(king_model, chall_model, token_batches,
     """Compute per-sequence mean cross-entropy for both models on the same tokens.
 
     Returns (king_losses, chall_losses) as lists of floats (nats/token).
+
+    Sharded-safe: if either model is split across multiple GPUs (accelerate
+    `device_map='auto'`), the input lives on the embed device but lm_head may
+    sit on a different shard; we relocate hidden + labels to lm_head's device
+    once outside the chunk loop instead of paying per-chunk transfers.
     """
     B = len(token_batches)
     input_ids_k = torch.tensor(token_batches, dtype=torch.long, device=king_device)
@@ -422,9 +451,18 @@ def compute_paired_losses(king_model, chall_model, token_batches,
     hidden_k = king_model.model(input_ids_k).last_hidden_state
     hidden_c = chall_model.model(input_ids_c).last_hidden_state
 
-    n_pos = input_ids_k.size(1) - 1
-    king_loss = torch.zeros(B, device=king_device)
-    chall_loss = torch.zeros(B, device=chall_device)
+    head_dev_k = _lm_head_device(king_model)
+    head_dev_c = _lm_head_device(chall_model)
+    if hidden_k.device != head_dev_k:
+        hidden_k = hidden_k.to(head_dev_k)
+    if hidden_c.device != head_dev_c:
+        hidden_c = hidden_c.to(head_dev_c)
+    labels_full_k = input_ids_k if input_ids_k.device == head_dev_k else input_ids_k.to(head_dev_k)
+    labels_full_c = input_ids_c if input_ids_c.device == head_dev_c else input_ids_c.to(head_dev_c)
+
+    n_pos = labels_full_k.size(1) - 1
+    king_loss = torch.zeros(B, device=head_dev_k)
+    chall_loss = torch.zeros(B, device=head_dev_c)
 
     for i in range(0, n_pos, chunk_size):
         end = min(i + chunk_size, n_pos)
@@ -432,8 +470,8 @@ def compute_paired_losses(king_model, chall_model, token_batches,
         logits_k = king_model.lm_head(hidden_k[:, i:end, :])
         logits_c = chall_model.lm_head(hidden_c[:, i:end, :])
 
-        labels_k = input_ids_k[:, i + 1 : end + 1]
-        labels_c = input_ids_c[:, i + 1 : end + 1]
+        labels_k = labels_full_k[:, i + 1 : end + 1]
+        labels_c = labels_full_c[:, i + 1 : end + 1]
         king_loss += F.cross_entropy(
             logits_k.reshape(-1, logits_k.size(-1)), labels_k.reshape(-1),
             reduction="none",
@@ -497,9 +535,53 @@ def _prefetch_repo(repo, revision=None, timeout=600):
     return result["path"]
 
 
-def load_model(repo, device, label="model", force_download=False, revision=None):
+def _build_sharded_device_map(gpu_ids: list[int],
+                              per_gpu_gib: int | None = None) -> dict:
+    """device_map for accelerate when sharding ONE replica across `gpu_ids`.
+
+    Caps every GPU not in `gpu_ids` to 0 GiB so accelerate refuses to spill
+    onto our partner replica's GPUs. Per-GPU budget defaults to a generous
+    240 GiB for B300 (275 GiB cards) — overridable via
+    TEUTONIC_SHARD_PER_GPU_GIB env knob (or per-call arg) for B200 / smaller.
+    """
+    if per_gpu_gib is None:
+        per_gpu_gib = int(os.environ.get("TEUTONIC_SHARD_PER_GPU_GIB", "240"))
+    n_visible = torch.cuda.device_count()
+    max_memory: dict = {}
+    for gid in range(n_visible):
+        if gid in gpu_ids:
+            max_memory[gid] = f"{per_gpu_gib}GiB"
+        else:
+            # Hard zero so the king's device_map can't accidentally land
+            # weights on the challenger's GPUs (or vice versa).
+            max_memory[gid] = "0GiB"
+    return max_memory
+
+
+def load_model(repo, device, label="model", force_download=False, revision=None,
+               shard_across_gpus: list[int] | None = None):
+    """Load a model, either onto a single GPU (legacy) or sharded across a
+    set of GPUs via accelerate's device_map='auto'.
+
+    Args:
+        repo:                HF repo id (or local path) to load
+        device:              for single-GPU mode, a string like "cuda:0".
+                             Ignored when shard_across_gpus is set.
+        label:               human-readable tag for log lines
+        force_download:      bypass HF cache
+        revision:            pinned commit SHA
+        shard_across_gpus:   if set, list of GPU indices to shard across.
+                             Builds one replica via device_map='auto' with
+                             max_memory caps that ban every other visible GPU.
+                             Used by the LXXX 80B chain (no model fits on one
+                             B200, must shard across 4 GPUs per replica).
+    """
+    if shard_across_gpus:
+        target = f"sharded({','.join(str(g) for g in shard_across_gpus)})"
+    else:
+        target = device
     log.info("loading %s from %s onto %s (force_download=%s, revision=%s)",
-             label, repo, device, force_download, revision[:12] if revision else None)
+             label, repo, target, force_download, revision[:12] if revision else None)
     t0 = time.time()
     # Pre-download with hard timeout so a stuck CDN doesn't hang the eval lock
     # for half an hour. Skip on force_download (let from_pretrained re-pull).
@@ -513,17 +595,23 @@ def load_model(repo, device, label="model", force_download=False, revision=None)
             raise
         except Exception as e:
             log.warning("%s prefetch failed (%s), letting from_pretrained retry", label, e)
+    if shard_across_gpus:
+        device_map_arg: dict | str = "auto"
+        max_memory = _build_sharded_device_map(shard_across_gpus)
+        load_kwargs = {"device_map": device_map_arg, "max_memory": max_memory}
+    else:
+        load_kwargs = {"device_map": {"": device}}
     for attn_impl in ("flash_attention_2", "sdpa", "eager"):
         try:
             model = AutoModelForCausalLM.from_pretrained(
                 repo,
                 torch_dtype=torch.bfloat16,
-                device_map={"": device},
                 attn_implementation=attn_impl,
                 token=os.environ.get("HF_TOKEN") or None,
                 force_download=force_download,
                 revision=revision or None,
                 use_safetensors=True,
+                **load_kwargs,
             )
             log.info("using attn_implementation=%s", attn_impl)
             break
@@ -534,7 +622,14 @@ def load_model(repo, device, label="model", force_download=False, revision=None)
     model.eval()
     elapsed = time.time() - t0
     params = sum(p.numel() for p in model.parameters()) / 1e9
-    log.info("%s loaded: %.1fB params in %.1fs", label, params, elapsed)
+    if shard_across_gpus and hasattr(model, "hf_device_map"):
+        # Compact summary: how many submodules per GPU
+        from collections import Counter
+        per_gpu = Counter(model.hf_device_map.values())
+        log.info("%s sharded: %.1fB params in %.1fs (modules/GPU: %s)",
+                 label, params, elapsed, dict(per_gpu))
+    else:
+        log.info("%s loaded: %.1fB params in %.1fs", label, params, elapsed)
     return model
 
 
@@ -834,6 +929,13 @@ def _probe_one_seed(model, seed: int, device, vocab_size: int) -> dict:
     try:
         out = model(inputs)
         logits = out.logits if hasattr(out, "logits") else out
+        # Sharded-safe: when accelerate has split the model across multiple
+        # GPUs, `logits` may surface on a different device than `targets`
+        # (which started on `device` = embed device). With tied embeddings
+        # they coincide; with untied or future variants they may not. Move
+        # targets to match.
+        if targets.device != logits.device:
+            targets = targets.to(logits.device)
         loss_t = F.cross_entropy(
             logits.float().reshape(-1, logits.size(-1)),
             targets.reshape(-1),
@@ -1000,36 +1102,76 @@ def trainability_probe(model) -> dict:
 # ---------------------------------------------------------------------------
 
 class MultiGPUEvaluator:
-    """Manages model replicas across GPUs and dispatches batches in parallel."""
+    """Manages model replicas across GPUs and dispatches batches in parallel.
+
+    Two modes:
+
+    1. **Per-GPU mode** (default, `shard_across_gpus=False`): one full replica
+       per entry in `gpu_ids`. Used for models that fit on one GPU
+       (e.g. Quasar 24B on a B200). Batches are dispatched in parallel across
+       replicas via the internal ThreadPoolExecutor.
+
+    2. **Sharded mode** (`shard_across_gpus=True`): one replica spanning ALL
+       GPUs in `gpu_ids` via accelerate's `device_map='auto'`. Used for
+       models that don't fit on one GPU (e.g. Qwen3MoE 80B → ~152 GiB bf16,
+       too big for a single B200). `compute_losses` and the paired path
+       become serial — there is only one replica, so batches go through it
+       end-to-end.
+
+    Loads are SERIAL (one GPU at a time) in per-GPU mode. An earlier attempt
+    to parallelize with ThreadPoolExecutor introduced silent dtype corruption:
+    when two threads ran transformers.from_pretrained() concurrently the
+    resulting models were left with mixed bf16/float32 Linear weights (notably
+    lm_head). Forward passes then died with
+    `RuntimeError: expected mat1 and mat2 to have the same dtype`.
+    """
+
+    # Sentinel device-id key for the single sharded replica in self.models.
+    SHARDED_KEY = "sharded"
 
     def __init__(self, repo, gpu_ids, label="model", force_download=False,
-                 revision=None, on_phase=None):
-        """Load `repo` onto every GPU in `gpu_ids`.
-
-        Loads are SERIAL (one GPU at a time). An earlier attempt to parallelize
-        with ThreadPoolExecutor introduced silent dtype corruption: when two
-        threads ran transformers.from_pretrained() concurrently the resulting
-        models were left with mixed bf16/float32 Linear weights (notably
-        lm_head). Forward passes then died with
-        `RuntimeError: expected mat1 and mat2 to have the same dtype`.
-        Almost certainly a race on torch.set_default_dtype() / accelerate's
-        init_empty_weights() inside transformers. The 84s -> 32s wall-time
-        win is not worth incorrectly rejecting valid miners.
-
-        `on_phase`, if provided, is invoked synchronously with a dict of
-        {phase, gpu, done, total} before/after each per-GPU load. Used by
-        eval_server to emit SSE heartbeats so the validator's stream-idle
-        watchdog doesn't fire during long king/challenger reloads.
-        """
+                 revision=None, on_phase=None, shard_across_gpus: bool = False):
         self.gpu_ids = gpu_ids
-        self.models = {}
-        self.devices = {}
+        self.shard_across_gpus = shard_across_gpus
+        self.models: dict = {}
+        self.devices: dict = {}
 
         if len(gpu_ids) == 0:
             raise ValueError("need at least one GPU")
 
-        n = len(gpu_ids)
+        if shard_across_gpus:
+            if on_phase:
+                try:
+                    on_phase({"phase": f"{label}_load_start",
+                              "gpu": gpu_ids, "done": 0, "total": 1,
+                              "repo": repo, "shard": True})
+                except Exception:
+                    log.warning("on_phase callback raised (non-fatal)",
+                                exc_info=True)
+            model = load_model(repo, device=None, label=f"{label}-shard",
+                               force_download=force_download,
+                               revision=revision,
+                               shard_across_gpus=gpu_ids)
+            # In sharded mode a "device" for input_ids is the device of the
+            # input embedding (where Accelerate places token IDs). lm_head's
+            # device matters for the loss compute (see compute_paired_losses).
+            in_device = self._infer_input_device(model, gpu_ids)
+            self.models[self.SHARDED_KEY] = model
+            self.devices[self.SHARDED_KEY] = in_device
+            self.pool = None  # sharded mode runs serially
+            if on_phase:
+                try:
+                    on_phase({"phase": f"{label}_load_done",
+                              "gpu": gpu_ids, "done": 1, "total": 1,
+                              "repo": repo, "shard": True})
+                except Exception:
+                    log.warning("on_phase callback raised (non-fatal)",
+                                exc_info=True)
+            log.info("%s evaluator ready (sharded): %d GPUs %s, input on %s",
+                     label, len(gpu_ids), gpu_ids, in_device)
+            return
 
+        n = len(gpu_ids)
         for i, gid in enumerate(gpu_ids):
             if on_phase:
                 try:
@@ -1052,12 +1194,44 @@ class MultiGPUEvaluator:
         self.pool = ThreadPoolExecutor(max_workers=n)
         log.info("%s evaluator ready: %d GPUs %s", label, n, gpu_ids)
 
+    @staticmethod
+    def _infer_input_device(model, gpu_ids: list[int]) -> str:
+        """Find where Accelerate placed `embed_tokens` — that's where input_ids
+        must land. Falls back to gpu_ids[0] if the device map is missing."""
+        try:
+            for name, dev in model.hf_device_map.items():
+                if "embed_tokens" in name:
+                    if isinstance(dev, int):
+                        return f"cuda:{dev}"
+                    return str(dev)
+        except Exception:
+            pass
+        return f"cuda:{gpu_ids[0]}"
+
+    @property
+    def primary_model(self):
+        """Return the first underlying model (for trainability probe etc.).
+        In sharded mode this is the single replica spanning all GPUs."""
+        if self.shard_across_gpus:
+            return self.models[self.SHARDED_KEY]
+        return self.models[self.gpu_ids[0]]
+
     def compute_losses(self, token_batches):
-        """Split token_batches across GPUs, compute in parallel, reassemble."""
-        n_gpus = len(self.gpu_ids)
+        """Compute per-sequence CE for `token_batches`.
+
+        Per-GPU mode: split across replicas, dispatch in parallel.
+        Sharded mode: run sequentially through the one replica.
+        """
         if not token_batches:
             return []
 
+        if self.shard_across_gpus:
+            return compute_batch_losses(
+                self.models[self.SHARDED_KEY], token_batches,
+                self.devices[self.SHARDED_KEY],
+            )
+
+        n_gpus = len(self.gpu_ids)
         per_gpu = [[] for _ in range(n_gpus)]
         idx_map = [[] for _ in range(n_gpus)]
         for i, batch in enumerate(token_batches):
@@ -1084,13 +1258,61 @@ class MultiGPUEvaluator:
         return results
 
     def shutdown(self):
-        self.pool.shutdown(wait=False)
+        if self.pool is not None:
+            self.pool.shutdown(wait=False)
 
 
 def compute_paired_multi_gpu(king_eval, chall_eval, token_batches):
-    """Pair king GPUs with challenger GPUs to compute losses in parallel."""
+    """Compute paired CE for `token_batches` across king and challenger.
+
+    Three modes (auto-detected from `MultiGPUEvaluator.shard_across_gpus`):
+
+    1. **Both sharded** — one batch through king's sharded replica, then the
+       same batch through challenger's sharded replica. Sequential because
+       each replica already saturates its 4-GPU shard; running them concurrent
+       would only help if king and challenger sat on disjoint GPU sets *and*
+       per-GPU compute weren't already the bottleneck. We launch both in
+       threads anyway since they DO sit on disjoint GPUs (king 0..3, chall
+       4..7) — kernels can overlap and the CPU-side cost of two independent
+       launches is negligible.
+    2. **Both per-GPU** — pair gid-by-gid as before, parallel via thread pool.
+    3. **Mixed** — error. We don't support a sharded king vs per-GPU chall
+       (or vice versa); the eval-server always builds them with the same
+       mode for the same chain.
+    """
     if not token_batches:
         return [], []
+
+    king_sharded = getattr(king_eval, "shard_across_gpus", False)
+    chall_sharded = getattr(chall_eval, "shard_across_gpus", False)
+
+    if king_sharded != chall_sharded:
+        raise RuntimeError(
+            "compute_paired_multi_gpu: king and challenger must share the same "
+            f"replica mode (king_sharded={king_sharded}, chall_sharded={chall_sharded})"
+        )
+
+    if king_sharded:
+        # Sharded mode: one replica per side. Use a 2-thread pool to overlap
+        # king and challenger forwards (they sit on disjoint GPU sets).
+        # `compute_paired_losses` walks both models inside one call, so we
+        # instead split into two compute_batch_losses calls (king + chall)
+        # so they can run concurrently across the disjoint GPU sets.
+        king_model = king_eval.models[king_eval.SHARDED_KEY]
+        chall_model = chall_eval.models[chall_eval.SHARDED_KEY]
+        king_dev = king_eval.devices[king_eval.SHARDED_KEY]
+        chall_dev = chall_eval.devices[chall_eval.SHARDED_KEY]
+        pool = ThreadPoolExecutor(max_workers=2)
+        try:
+            f_k = pool.submit(compute_batch_losses,
+                              king_model, token_batches, king_dev)
+            f_c = pool.submit(compute_batch_losses,
+                              chall_model, token_batches, chall_dev)
+            king_losses = f_k.result()
+            chall_losses = f_c.result()
+        finally:
+            pool.shutdown(wait=False)
+        return king_losses, chall_losses
 
     n_pairs = min(len(king_eval.gpu_ids), len(chall_eval.gpu_ids))
     per_pair = [[] for _ in range(n_pairs)]

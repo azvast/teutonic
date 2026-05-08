@@ -1049,88 +1049,33 @@ class PreloadRequest(BaseModel):
 
 @app.post("/preload")
 async def preload_endpoint(req: PreloadRequest):
-    """Speculatively download a model to the HF cache, in the background.
+    """No-op (kept for validator backward compat).
 
-    Used by the validator to warm the next-in-queue challenger while the
-    current eval is busy on the GPUs. No GPU work, no eval lock contention —
-    just hits the network. Idempotent per (repo, revision).
+    Speculative preload was disabled 2026-05-08 after repeatedly causing
+    ENOSPC mid-eval: a parallel background download of the next 165 GB
+    challenger races the current /eval's challenger load → the in-flight
+    `from_pretrained` mmap fails with [Errno 28] and surfaces as the
+    misleading "could not load model with any attention implementation"
+    error. On disk-tight pods (1.7 T overlay shared with other tenants,
+    ~538 GB usable on the new B200) there's simply not room for king +
+    in-flight challenger + speculative-next at once, and the cache
+    eviction can't safely remove the in-flight one.
+
+    The cost is per-eval wall time: instead of the next challenger being
+    pre-downloaded during the current eval (~5 min saved), /eval has to
+    download on demand (~7-10 min added). Net throughput drops from
+    ~6 evals/hour to ~4 evals/hour, but evals stop *failing*.
+
+    The endpoint still returns 200 OK so the validator's call site
+    (post-/eval-dispatch) doesn't need to change. We don't even mark
+    `_preload_seen` because nothing is actually preloaded.
     """
     if not req.repo:
         raise HTTPException(status_code=400, detail="repo is required")
     key = f"{req.repo}@{(req.revision or 'main')[:12]}"
-    with _preload_lock:
-        existing = _preload_threads.get(key)
-        if existing and existing.is_alive():
-            _preload_seen[(req.repo, req.revision or "")] = time.time()
-            return {"status": "already_running", "key": key}
-
-        from eval.torch_runner import _prefetch_repo
-
-        def _do():
-            t0 = time.time()
-            # Yield bandwidth to any in-flight /eval or /probe. The
-            # eval is itself downloading the actual challenger from the
-            # same HF CDN; with HF_HUB_ENABLE_HF_TRANSFER=1's 16 parallel
-            # streams, a concurrent preload can starve the eval enough
-            # to hit EVAL_MAX_RUNTIME_S (observed 2026-05-03 20:03 UTC:
-            # eval-0150 dropped to ~6 MB/s for its challenger fetch
-            # while a preload monopolised xet-bridge bandwidth, and was
-            # within minutes of timing out).
-            #
-            # We poll _gpu_busy with a small interval. PRELOAD_MAX_DEFER_S
-            # is a backstop in case _gpu_busy is left set by a bug — under
-            # normal operation EVAL_MAX_RUNTIME_S will hit first and the
-            # eval's finally: clears _gpu_busy.
-            # Previously we deferred preloads while gpu_busy was set ('yield
-            # bandwidth to in-flight eval'). In practice that pushed preloads
-            # past the next /eval boundary and made them useless. The
-            # PRELOAD_PARALLELISM semaphore below already keeps preload
-            # downloads from stomping each other.
-            wait_s = 0.0  # kept in log line below for backward-compat
-
-            # Serialise the actual network download so concurrent preloads
-            # don't share/throttle the per-IP xet-bridge bandwidth cap.
-            sem_t0 = time.time()
-            acquired = _preload_network_sem.acquire(timeout=PRELOAD_MAX_DEFER_S)
-            sem_wait_s = time.time() - sem_t0
-            if not acquired:
-                log.warning(
-                    "preload %s: waited %.1fs for network slot (parallelism=%d), "
-                    "proceeding anyway", key, sem_wait_s, PRELOAD_PARALLELISM)
-            elif sem_wait_s > 1.0:
-                log.info("preload %s: acquired network slot after %.1fs",
-                         key, sem_wait_s)
-
-            try:
-                # Proactive cache cleanup BEFORE we start writing 165 GB to
-                # disk. The post-eval cleanup (in _run_eval's finally block)
-                # only runs after the *previous* eval finishes, which can
-                # leave the disk too full to accept the next preload —
-                # observed live 2026-05-08 06:00 UTC where 3 challengers
-                # in cache wedged the disk at 100% and every preload
-                # failed with ENOSPC. Running cleanup here gives the new
-                # tiered eviction (see _cleanup_hf_cache docstring) a
-                # chance to evict the oldest preloaded challenger so the
-                # incoming download fits.
-                try:
-                    _cleanup_hf_cache()
-                except Exception:
-                    log.warning("preload %s: pre-download cleanup failed", key, exc_info=True)
-                _prefetch_repo(req.repo, revision=req.revision or None,
-                               timeout=int(os.environ.get("HF_PREFETCH_TIMEOUT", "600")))
-                log.info("preload complete: %s (defer=%.1fs net_wait=%.1fs total=%.1fs)",
-                         key, wait_s, sem_wait_s, time.time() - t0)
-            except Exception as e:
-                log.warning("preload failed for %s: %s", key, e)
-            finally:
-                if acquired:
-                    _preload_network_sem.release()
-
-        t = threading.Thread(target=_do, daemon=True, name=f"preload-{req.repo[:32]}")
-        t.start()
-        _preload_threads[key] = t
-        _preload_seen[(req.repo, req.revision or "")] = time.time()
-    return {"status": "started", "key": key}
+    log.debug("preload %s: disabled (no-op)", key)
+    return {"status": "disabled", "key": key,
+            "note": "preload disabled to avoid disk pressure mid-eval"}
 
 
 @app.post("/probe")

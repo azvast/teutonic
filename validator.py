@@ -995,6 +995,30 @@ class State:
             if self.completed_repos:
                 log.info("backfilled completed_repos from history+queue: %d repos",
                          len(self.completed_repos))
+
+        # One-shot drain: any queue item still flagged `reeval=True` is a
+        # leftover from the now-removed `replenish_reeval` path. Re-eval is
+        # permanently disabled (each hf_repo gets exactly one eval, ever);
+        # these entries would otherwise be processed on next dispatch and
+        # effectively re-evaluate models that already lost a duel — the same
+        # exploit kill-window we just closed. Their hf_repos are already in
+        # `completed_repos` (added at original enqueue or by the
+        # history+queue backfill above), so dropping them is safe — they
+        # won't sneak back via scan_reveals.
+        reeval_leftover = [e for e in self.queue if e.get("reeval")]
+        if reeval_leftover:
+            for e in reeval_leftover:
+                repo = e.get("hf_repo")
+                if repo:
+                    self.completed_repos.add(repo)
+            self.queue = [e for e in self.queue if not e.get("reeval")]
+            log.warning("dropped %d stale re-eval queue items (re-eval is disabled)",
+                        len(reeval_leftover))
+            try:
+                self.flush()
+            except Exception:
+                log.warning("post-purge flush failed (non-fatal)", exc_info=True)
+
         log.info("loaded state: king=%s queue=%d seen=%d completed=%d",
                  self.king.get("king_hash", "none")[:16], len(self.queue),
                  len(self.seen), len(self.completed_repos))
@@ -1187,6 +1211,7 @@ class State:
             return None
         cid = self.next_id()
         entry = {"challenge_id": cid, **reveal, "queued_at": _now(), "retry_count": int(reveal.get("retry_count", 0))}
+        entry.pop("reeval", None)
         self.queue.append(entry)
         self.stats["queued"] += 1
         # Mark this hf_repo as "ever enqueued" so future scan_reveals never
@@ -1212,7 +1237,8 @@ class State:
         """
         repo = entry.get("hf_repo", "")
         retry_count = int(entry.get("retry_count", 0)) + 1
-        new_entry = {**entry, "retry_count": retry_count, "queued_at": _now(), "reeval": False}
+        new_entry = {**entry, "retry_count": retry_count, "queued_at": _now()}
+        new_entry.pop("reeval", None)
 
         deduped = []
         for existing in self.queue:
@@ -1524,33 +1550,6 @@ class State:
             except Exception:
                 log.warning("backfill flush failed (non-fatal)", exc_info=True)
 
-    def replenish_reeval(self, subtensor, netuid):
-        """Fill queue with re-eval candidates so the dashboard never shows empty.
-
-        Defers per-item R2 flushes; one summary flush at the end. With ~150
-        re-eval candidates and ~5s per flush previously, this loop used to
-        block the eval pipeline for ~12-15 minutes."""
-        self.evaluated_repos.clear()
-        throwaway_seen = set()
-        reeval_reveals = scan_reveals(subtensor, netuid, throwaway_seen)
-        king_hk = self.king.get("hotkey", "")
-        reeval_reveals = [r for r in reeval_reveals
-                          if r["hotkey"] != king_hk
-                          and r["hf_repo"] not in self.failed_repos]
-        count = 0
-        for rev in reeval_reveals:
-            rev["reeval"] = True
-            cid = self.enqueue(rev, defer_flush=True)
-            if cid:
-                count += 1
-                log.info("queued %s from %s (re-eval)", cid, rev["hotkey"][:16])
-        if count:
-            self.flush()
-            self.flush_dashboard(force=True)
-            self.event({"event": "replenish_reeval", "count": count})
-            log.info("replenished queue with %d re-eval candidates", count)
-        return count
-
     def _with_fresh_uid(self, entry):
         """Return a copy of `entry` whose `uid` and `coldkey` are re-derived
         from the current metagraph. Insert-time uids can go stale (deregistration,
@@ -1663,7 +1662,7 @@ class State:
                             "uid": self.uid_map.get(e.get("hotkey", "")),
                             "coldkey": self.coldkey_for(e.get("hotkey", "")),
                             "hf_repo": e.get("hf_repo"), "queued_at": e.get("queued_at"),
-                            "block": e.get("block"), "reeval": e.get("reeval", False)}
+                            "block": e.get("block")}
                            for e in self.queue],
                 "history": [self._with_fresh_uid(h) for h in self.history],
             }
@@ -2416,9 +2415,6 @@ async def main():
     r2 = R2()
     state = State(r2)
     state.load()
-    if args.seen:
-        log.info("--seen flag is now a no-op: re-eval is disabled (each hf_repo "
-                 "gets exactly one eval, ever; new submissions need new repo names)")
 
     wallet = bt.wallet(name=WALLET_NAME, hotkey=WALLET_HOTKEY)
     subtensor = bt.subtensor(network=NETWORK)
@@ -2626,9 +2622,6 @@ async def main():
                         if cid:
                             queued_count += 1
                             log.info("queued %s from %s (new, mid-cycle)", cid, rev["hotkey"][:16])
-                    new_items = [e for e in state.queue if not e.get("reeval")]
-                    reeval_items = [e for e in state.queue if e.get("reeval")]
-                    state.queue = new_items + reeval_items
                     if queued_count:
                         state.flush()
                         state.flush_dashboard()
@@ -2643,13 +2636,12 @@ async def main():
 
             state.current_eval = None
 
-            # NOTE: --seen replenish_reeval was removed. Models are now
-            # evaluated exactly once (filtered by hf_repo via completed_repos
-            # in scan_reveals); re-running an already-evaluated model would
-            # let a miner replay the same checkpoint hoping to land on a
-            # weaker king. Miners who want another shot must upload to a
-            # *new* repo name and re-reveal on chain. The `--seen` flag is
-            # retained on the CLI for backward compat but is now a no-op.
+            # Re-eval is permanently disabled: each hf_repo gets exactly one
+            # eval, ever (filtered via `completed_repos` in scan_reveals).
+            # Re-running an already-evaluated model would let a miner replay
+            # the same checkpoint hoping to land on a weaker king. Miners
+            # who want another shot must upload to a *new* repo name and
+            # re-reveal on chain.
             if not state.queue:
                 log.info("idle: all known reveals processed, waiting for new submissions")
 
@@ -2692,10 +2684,11 @@ async def main():
 def parse_args():
     import argparse
     p = argparse.ArgumentParser()
+    # --seen / --no-seen are retained as no-ops for callers that still pass
+    # them. Re-eval is permanently disabled (one eval per hf_repo, ever); the
+    # flag has no effect either way.
     p.add_argument("--seen", action=argparse.BooleanOptionalAction, default=True,
-                   help="When idle, replenish queue with re-eval candidates (default: on). "
-                        "Use --no-seen to only evaluate genuinely new hotkeys and idle "
-                        "when the queue is empty.")
+                   help=argparse.SUPPRESS)
     return p.parse_args()
 
 

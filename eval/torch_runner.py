@@ -1035,6 +1035,38 @@ def trainability_probe(model) -> dict:
     saved_rg = {n: p.requires_grad for n, p in model.named_parameters()}
     was_training = model.training
 
+    # Enable gradient checkpointing for the probe so backward fits in VRAM
+    # on disk-tight pods. With an 82B Qwen3-MoE sharded across 4 B200s
+    # (TEUTONIC_SHARD_PER_GPU_GIB=120 leaves only ~58 GiB headroom per
+    # GPU) the un-checkpointed backward needs ~120 GiB of activations +
+    # gradients per shard and OOMs (observed live 2026-05-08 09:47 UTC,
+    # eval-0173, GPU 6 hit 176/178 GiB before crashing). Gradient
+    # checkpointing recomputes activations during backward instead of
+    # storing them — ~3-5x memory savings, ~30% slower. Probe is only
+    # ~5 s either way so the slowdown is invisible. Restored in finally.
+    saved_gc_enabled: bool | None = None
+    saved_use_cache: bool | None = None
+    try:
+        if hasattr(model, "is_gradient_checkpointing"):
+            saved_gc_enabled = bool(getattr(model, "is_gradient_checkpointing", False))
+        if hasattr(getattr(model, "config", None), "use_cache"):
+            saved_use_cache = bool(model.config.use_cache)
+            # `use_cache=True` is incompatible with gradient checkpointing
+            # in HF transformers — it silently disables checkpointing
+            # otherwise (would defeat the whole point).
+            model.config.use_cache = False
+        if hasattr(model, "gradient_checkpointing_enable"):
+            try:
+                model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+            except TypeError:
+                # Older transformers signature without kwargs.
+                model.gradient_checkpointing_enable()
+    except Exception:
+        log.warning("probe: failed to enable gradient checkpointing (proceeding)",
+                    exc_info=True)
+
     # Snapshot every buffer so any in-place mutation inside the train()-mode
     # forward (e.g. Quasar's MoE aux-loss-free bias EMA on `all_moe_bias`,
     # `all_moe_momentum`, `all_moe_max_vio`, per-MoE `max_vio`) is reverted on
@@ -1092,6 +1124,19 @@ def trainability_probe(model) -> dict:
                 if live is None:
                     continue
                 live.copy_(snapshot)
+        # Restore gradient-checkpointing + use_cache so the king/challenger
+        # evaluator path (forward-only, no_grad) doesn't pay the recompute
+        # cost on every batch.
+        try:
+            if saved_gc_enabled is False and hasattr(model, "gradient_checkpointing_disable"):
+                model.gradient_checkpointing_disable()
+        except Exception:
+            log.warning("probe: failed to restore gradient checkpointing", exc_info=True)
+        try:
+            if saved_use_cache is not None and hasattr(getattr(model, "config", None), "use_cache"):
+                model.config.use_cache = saved_use_cache
+        except Exception:
+            pass
         if not was_training:
             model.eval()
         torch.cuda.empty_cache()

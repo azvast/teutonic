@@ -553,6 +553,53 @@ def validate_challenger_config(hf_repo: str, challenger_revision: str,
     if not st_files:
         return "no .safetensors files in repo"
 
+    # Strict naming check. `from_pretrained(use_safetensors=True)` only
+    # discovers safetensors via three canonical names:
+    #   - model.safetensors                  (single-shard)
+    #   - model.safetensors.index.json       (sharded with index)
+    #   - model-NNNNN-of-NNNNN.safetensors   (sharded weights)
+    # A miner who uploads `weights.safetensors` (or any other naming) gets
+    # past the `not st_files` check above but then crashes the eval-server
+    # with the misleading "could not load model with any attention
+    # implementation" error after we've already burned ~5 min downloading
+    # 165 GB. Caught seed429/Teutonic-LXXX-5Gnciuez-b4a9f514 live
+    # 2026-05-08 10:47 UTC. Fail fast at validate-time instead.
+    has_canonical = (
+        "model.safetensors" in repo_files
+        or "model.safetensors.index.json" in repo_files
+        or any(_SAFETENSORS_SHARD_RE.match(f) for f in st_files)
+    )
+    if not has_canonical:
+        return (f"safetensors files present but none match the canonical "
+                f"transformers naming (expected `model.safetensors`, "
+                f"`model.safetensors.index.json`, or sharded "
+                f"`model-NNNNN-of-NNNNN.safetensors`); got {st_files[:3]}")
+
+    # Total-size guard. Disk-tight pods (the new B200 has ~538 GB usable
+    # for HF cache after host overhead) can't fit king + an oversized
+    # challenger. A normal Qwen3MoE 80B in bfloat16 is ~154 GB; we cap at
+    # 200 GB to leave 30 percent headroom for legitimate variation but
+    # reject the obvious busts (e.g. fp32 weights = ~308 GB or extra
+    # optimizer state shipped). Caught
+    # silvanus97930/Teutonic-LXXX-5Ev4MnNC-vv-05 live 2026-05-08 10:54 UTC
+    # at 293 GB on disk → ENOSPC mid-load.
+    try:
+        info = api.repo_info(hf_repo, token=HF_TOKEN or None,
+                              revision=challenger_revision, files_metadata=True)
+        total_st_bytes = sum((s.size or 0) for s in (info.siblings or [])
+                              if s.rfilename.endswith(".safetensors"))
+    except Exception as e:
+        log.warning("size-check: cannot fetch repo info for %s (%s); "
+                    "letting eval proceed", hf_repo, e)
+        total_st_bytes = 0
+    if total_st_bytes > 0:
+        size_gb = total_st_bytes / 1e9
+        max_gb = float(os.environ.get("TEUTONIC_MAX_CHALLENGER_SAFETENSORS_GB", "200"))
+        if size_gb > max_gb:
+            return (f"oversized: {size_gb:.1f} GB of .safetensors > {max_gb:.0f} GB cap "
+                    f"(normal Qwen3MoE 80B is ~154 GB; check for fp32 weights, "
+                    f"duplicated shards, or extra optimizer state)")
+
     # Trainability gate runs on the eval server (eval_torch.trainability_probe),
     # not here. The validator's job is just structural/architecture matching.
     return None
@@ -564,6 +611,7 @@ def validate_challenger_config(hf_repo: str, challenger_revision: str,
 
 import re
 _REPO_RE = re.compile(REPO_PATTERN)
+_SAFETENSORS_SHARD_RE = re.compile(r"^model-\d{5}-of-\d{5}\.safetensors$")
 
 def scan_reveals(subtensor, netuid, completed_repos):
     """Pull all on-chain reveals; return the latest per hotkey that we

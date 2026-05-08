@@ -553,26 +553,33 @@ def validate_challenger_config(hf_repo: str, challenger_revision: str,
     if not st_files:
         return "no .safetensors files in repo"
 
-    # Strict naming check. `from_pretrained(use_safetensors=True)` only
-    # discovers safetensors via three canonical names:
-    #   - model.safetensors                  (single-shard)
-    #   - model.safetensors.index.json       (sharded with index)
-    #   - model-NNNNN-of-NNNNN.safetensors   (sharded weights)
-    # A miner who uploads `weights.safetensors` (or any other naming) gets
-    # past the `not st_files` check above but then crashes the eval-server
-    # with the misleading "could not load model with any attention
-    # implementation" error after we've already burned ~5 min downloading
-    # 165 GB. Caught seed429/Teutonic-LXXX-5Gnciuez-b4a9f514 live
-    # 2026-05-08 10:47 UTC. Fail fast at validate-time instead.
-    has_canonical = (
-        "model.safetensors" in repo_files
-        or "model.safetensors.index.json" in repo_files
-        or any(_SAFETENSORS_SHARD_RE.match(f) for f in st_files)
-    )
-    if not has_canonical:
+    # Strict naming check. `from_pretrained(use_safetensors=True)` discovers
+    # safetensors via TWO canonical layouts:
+    #   - single-shard:  `model.safetensors` alone
+    #   - sharded:       `model.safetensors.index.json` PLUS one or more
+    #                    `model-NNNNN-of-NNNNN.safetensors` weight shards
+    # The shards alone are NOT enough — without the index.json, transformers
+    # raises "does not appear to have a file named model.safetensors or
+    # model.safetensors.index.json and thus cannot be loaded with
+    # `safetensors`" and the eval-server falls through every attn impl.
+    # Caught:
+    #   - seed429/Teutonic-LXXX-5Gnciuez-b4a9f514       (10:47 UTC) — non-
+    #     canonical naming entirely
+    #   - silvanus97930/Teutonic-LXXX-5Ev4MnNC-vv-07     (13:26 UTC) — shards
+    #     present but no `model.safetensors.index.json`
+    #   - seed429/Teutonic-LXXX-5Gnciuez-aa1d9d37        (13:41 UTC) — same
+    has_single = "model.safetensors" in repo_files
+    has_index = "model.safetensors.index.json" in repo_files
+    has_shards = any(_SAFETENSORS_SHARD_RE.match(f) for f in st_files)
+    if not (has_single or (has_index and has_shards)):
+        if has_shards and not has_index:
+            return (f"missing `model.safetensors.index.json` for sharded "
+                    f"safetensors layout (found {sum(1 for f in st_files if _SAFETENSORS_SHARD_RE.match(f))} "
+                    f"`model-NNNNN-of-NNNNN.safetensors` shards but no index "
+                    f"file — `from_pretrained` cannot load shards without it)")
         return (f"safetensors files present but none match the canonical "
-                f"transformers naming (expected `model.safetensors`, "
-                f"`model.safetensors.index.json`, or sharded "
+                f"transformers layout (expected `model.safetensors` OR "
+                f"`model.safetensors.index.json` + sharded "
                 f"`model-NNNNN-of-NNNNN.safetensors`); got {st_files[:3]}")
 
     # Total-size guard. Disk-tight pods (the new B200 has ~538 GB usable

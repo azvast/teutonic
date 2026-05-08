@@ -191,15 +191,30 @@ async def fetch_tmc_data() -> dict | None:
         asp = float(snap["alpha_sqrt_price"])
         tao_price = m["current_price"]
         alpha_tao = asp ** 2
-        # `subnet_alpha_out_emission` is the per-block alpha emission to
-        # miners (server side) on this subnet, in nanoalpha (1e-9). This is
-        # the "going rate" that gets carved up by validator weights — much
-        # more useful than the chain's lagging post-Yuma per-uid `emission`
-        # tensor for an at-a-glance dashboard. Falls back to 0 if absent.
+        # `subnet_alpha_out_emission` is the GROSS per-block alpha emission
+        # to this subnet (in nanoalpha, 1e-9). It's split between three pots
+        # before reaching miners:
+        #   - pending_server_emission    -> miners (server side)
+        #   - pending_validator_emission -> validators
+        #   - pending_owner_cut          -> subnet owner
+        # The dashboard cares about the MINER share, so we scale the gross
+        # rate by `pending_server / (server + validator + owner)`. Earlier
+        # versions used the gross number unscaled, which double-counted by
+        # ~2x (miners actually get ~40% on SN3, not 100%). Falls back to a
+        # 50/50 split if any pending field is missing or zero.
         try:
-            sn3_alpha_per_block = float(snap.get("subnet_alpha_out_emission", 0)) / 1e9
+            gross_apb = float(snap.get("subnet_alpha_out_emission", 0)) / 1e9
         except Exception:
-            sn3_alpha_per_block = 0.0
+            gross_apb = 0.0
+        try:
+            pend_srv = float(snap.get("pending_server_emission", 0))
+            pend_val = float(snap.get("pending_validator_emission", 0))
+            pend_own = float(snap.get("pending_owner_cut", 0))
+            pend_total = pend_srv + pend_val + pend_own
+            miner_share = (pend_srv / pend_total) if pend_total > 0 else 0.5
+        except Exception:
+            miner_share = 0.5
+        sn3_alpha_per_block = gross_apb * miner_share
         return {
             "tao_price_usd": tao_price,
             "tao_change_24h": m["usd_quote"]["percent_change_24h"],
@@ -207,6 +222,8 @@ async def fetch_tmc_data() -> dict | None:
             "sn3_alpha_price_usd": alpha_tao * tao_price,
             "sn3_reg_burn_tao": b[0]["burn"] / 1e9,
             "sn3_alpha_per_block": sn3_alpha_per_block,
+            "sn3_miner_share": miner_share,
+            "sn3_alpha_per_block_gross": gross_apb,
         }
     except Exception:
         log.warning("TMC fetch failed", exc_info=True)
@@ -548,7 +565,17 @@ def validate_challenger_config(hf_repo: str, challenger_revision: str,
 import re
 _REPO_RE = re.compile(REPO_PATTERN)
 
-def scan_reveals(subtensor, netuid, seen):
+def scan_reveals(subtensor, netuid, completed_repos):
+    """Pull all on-chain reveals; return the latest per hotkey that we
+    haven't already enqueued for eval.
+
+    Filtering is done by `hf_repo` (NOT hotkey): each unique repo gets
+    exactly one eval, ever. A miner who already had a model evaluated
+    can submit again by uploading to a *new* repo name and re-revealing.
+    Same repo + new commitment = treated as the same (idempotent) eval —
+    miners cannot replay the same checkpoint hoping to land on a weaker
+    king.
+    """
     try:
         all_reveals = subtensor.get_all_revealed_commitments(netuid)
     except Exception:
@@ -559,19 +586,21 @@ def scan_reveals(subtensor, netuid, seen):
 
     new = []
     for hotkey, entries in all_reveals.items():
-        if hotkey in seen or not entries:
+        if not entries:
             continue
         block, data = max(entries, key=lambda e: e[0])
         parts = data.split(":", 2)
         if len(parts) != 3:
             continue
         king_hash, hf_repo, model_hash = parts
-        if not _REPO_RE.match(hf_repo.strip()):
+        hf_repo = hf_repo.strip()
+        if not _REPO_RE.match(hf_repo):
             continue
-        seen.add(hotkey)
+        if hf_repo in completed_repos:
+            continue
         new.append({
             "hotkey": hotkey, "block": block,
-            "king_hash": king_hash.strip(), "hf_repo": hf_repo.strip(),
+            "king_hash": king_hash.strip(), "hf_repo": hf_repo,
             "model_hash": model_hash.strip(),
         })
     new.sort(key=lambda x: x["block"])
@@ -857,6 +886,14 @@ class State:
         self.seen = set()
         self.failed_repos: set[str] = set()
         self.evaluated_repos: set[str] = set()
+        # Persistent record of every hf_repo that was ever enqueued for eval.
+        # Used by `scan_reveals` to skip re-enqueueing the same repo a second
+        # time (closes the "wait until king is weak then get re-evaluated"
+        # exploit where a model that lost against king K1 could later win
+        # against a weaker king K2 via --seen replenish). Each model gets
+        # exactly one eval, ever — miners must upload to a new repo name to
+        # get a new shot. Persisted to R2 alongside `seen_hotkeys.json`.
+        self.completed_repos: set[str] = set()
         self.stats = {"queued": 0, "accepted": 0, "rejected": 0, "failed": 0}
         self.counter = 0
         self.current_eval = None
@@ -911,6 +948,9 @@ class State:
         s = self.r2.get("state/seen_hotkeys.json")
         if s:
             self.seen = set(s.get("hotkeys", []))
+        cr = self.r2.get("state/completed_repos.json")
+        if cr:
+            self.completed_repos = set(cr.get("repos", []))
         st = self.r2.get("state/validator_state.json")
         if st:
             loaded = st.get("stats", self.stats)
@@ -939,8 +979,25 @@ class State:
         wd = self.r2.get("state/watchdog.json")
         if wd:
             self.watchdog.update(wd)
-        log.info("loaded state: king=%s queue=%d seen=%d",
-                 self.king.get("king_hash", "none")[:16], len(self.queue), len(self.seen))
+        # Backfill `completed_repos` from history + queue if missing (one-shot
+        # migration on the first restart after this change). Without this, a
+        # restart would let scan_reveals re-pull every previously-evaluated
+        # reveal and re-enqueue it for re-eval — exactly the bug we're fixing.
+        if not self.completed_repos:
+            for h_entry in self.history:
+                repo = h_entry.get("challenger_repo")
+                if repo:
+                    self.completed_repos.add(repo)
+            for q_entry in self.queue:
+                repo = q_entry.get("hf_repo")
+                if repo:
+                    self.completed_repos.add(repo)
+            if self.completed_repos:
+                log.info("backfilled completed_repos from history+queue: %d repos",
+                         len(self.completed_repos))
+        log.info("loaded state: king=%s queue=%d seen=%d completed=%d",
+                 self.king.get("king_hash", "none")[:16], len(self.queue),
+                 len(self.seen), len(self.completed_repos))
 
         if (self.king
                 and self.king.get("king_hash") == "seed"
@@ -1095,6 +1152,9 @@ class State:
         self.r2.put("state/seen_hotkeys.json", {
             "hotkeys": sorted(self.seen), "updated_at": now,
         })
+        self.r2.put("state/completed_repos.json", {
+            "repos": sorted(self.completed_repos), "updated_at": now,
+        })
         self.r2.put("state/watchdog.json", self.watchdog)
 
     def event(self, data):
@@ -1129,6 +1189,14 @@ class State:
         entry = {"challenge_id": cid, **reveal, "queued_at": _now(), "retry_count": int(reveal.get("retry_count", 0))}
         self.queue.append(entry)
         self.stats["queued"] += 1
+        # Mark this hf_repo as "ever enqueued" so future scan_reveals never
+        # re-pulls it. Trade-off: if the validator crashes between enqueue
+        # and verdict, the eval is lost and the miner must re-submit to a
+        # new repo. This is rare (restarts ~hourly at most) and prevents
+        # the much worse re-eval-against-weaker-king exploit.
+        if repo:
+            self.completed_repos.add(repo)
+            self.seen.add(hotkey)
         if not defer_flush:
             self.flush()
             self.flush_dashboard(force=True)
@@ -1415,6 +1483,46 @@ class State:
         if not ck:
             return None
         return ck[:COLDKEY_PREFIX_LEN]
+
+    def backfill_completed_from_chain(self, subtensor, netuid):
+        """One-shot migration: for every hotkey already in `seen` (legacy
+        hotkey-based dedup), look up their CURRENT chain reveal and add the
+        hf_repo to `completed_repos`.
+
+        Without this, post-migration scan_reveals would re-enqueue every
+        previously-seen reveal whose verdict didn't make it into `history`
+        (stale entries, errors before LXXX cutover, etc.) — at ~10 min/eval
+        a 370-reveal stampede would queue ~62 hours of work. Idempotent."""
+        if not self.seen:
+            return
+        try:
+            all_reveals = subtensor.get_all_revealed_commitments(netuid)
+        except Exception:
+            log.warning("backfill_completed_from_chain: failed to fetch reveals",
+                        exc_info=True)
+            return
+        if not all_reveals:
+            return
+        added = 0
+        for hotkey in list(self.seen):
+            entries = all_reveals.get(hotkey)
+            if not entries:
+                continue
+            block, data = max(entries, key=lambda e: e[0])
+            parts = data.split(":", 2)
+            if len(parts) != 3:
+                continue
+            _, hf_repo, _ = parts
+            hf_repo = hf_repo.strip()
+            if hf_repo and hf_repo not in self.completed_repos:
+                self.completed_repos.add(hf_repo)
+                added += 1
+        if added:
+            log.info("backfilled completed_repos from chain (seen-hotkeys): +%d", added)
+            try:
+                self.flush()
+            except Exception:
+                log.warning("backfill flush failed (non-fatal)", exc_info=True)
 
     def replenish_reeval(self, subtensor, netuid):
         """Fill queue with re-eval candidates so the dashboard never shows empty.
@@ -1985,13 +2093,14 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
         log.info("%s: coldkey for %s not in metagraph yet, skipping coldkey check",
                  cid, hotkey[:16])
 
-    if check_stale:
-        current_hash = state.king.get("king_hash", "")
-        entry_king_hash = entry.get("king_hash", "")
-        if current_hash and entry_king_hash and not current_hash.startswith(entry_king_hash[:len(entry_king_hash)]):
-            log.info("stale %s: king changed (entry=%s current=%s)", cid, entry_king_hash[:16], current_hash[:16])
-            state.event({"event": "stale", "challenge_id": cid, "hotkey": hotkey})
-            return
+    # NOTE: The old "stale" check (reject if entry.king_hash != current king)
+    # was removed. Miners commit against the king at reveal time, so by the
+    # time we evaluate, the king may have changed. We let the eval proceed
+    # regardless — the bootstrap test compares the challenger to the *current*
+    # king either way, so a stale-king-hash entry that happens to also beat
+    # the new king is a valid coronation. The old `check_stale` parameter is
+    # kept on the signature for backward compat but no longer does anything.
+    _ = check_stale  # silence linter; intentionally unused now
 
     try:
         state.set_phase("hf_metadata", challenge_id=cid, notes=f"resolving {hf_repo}@main")
@@ -2308,13 +2417,16 @@ async def main():
     state = State(r2)
     state.load()
     if args.seen:
-        log.info("--seen: will re-evaluate old challengers when queue is empty")
-    else:
-        log.info("new-only mode: will idle when all hotkeys have been seen")
+        log.info("--seen flag is now a no-op: re-eval is disabled (each hf_repo "
+                 "gets exactly one eval, ever; new submissions need new repo names)")
 
     wallet = bt.wallet(name=WALLET_NAME, hotkey=WALLET_HOTKEY)
     subtensor = bt.subtensor(network=NETWORK)
     state.refresh_uid_map(subtensor, NETUID)
+    # One-shot chain backfill of completed_repos for already-seen hotkeys.
+    # Prevents post-migration re-eval stampede (see method docstring).
+    # Idempotent — after first run, completed_repos and seen converge.
+    state.backfill_completed_from_chain(subtensor, NETUID)
     state.flush_dashboard(force=True)
 
     html_path = os.path.join(os.path.dirname(__file__) or ".", "website", "index.html")
@@ -2400,8 +2512,19 @@ async def main():
                 state.market = tmc
 
             state.set_phase("scan_reveals", notes="polling chain for reveals")
-            reveals = scan_reveals(subtensor, NETUID, state.seen)
+            reveals = scan_reveals(subtensor, NETUID, state.completed_repos)
             if reveals:
+                # If any newly-revealed hotkey isn't in the uid_map snapshot we
+                # just refreshed (registration happened *between* refresh and
+                # this scan, or we're fresh out of startup), refresh once more
+                # so the dashboard shows the miner's UID immediately rather
+                # than rendering "--" until the next tick (~5-10 min away when
+                # an eval is running).
+                if any(r["hotkey"] not in state.uid_map for r in reveals):
+                    try:
+                        state.refresh_uid_map(subtensor, NETUID)
+                    except Exception:
+                        log.warning("uid_map refresh after scan failed (non-fatal)", exc_info=True)
                 queued_count = 0
                 for rev in reveals:
                     cid = state.enqueue(rev, defer_flush=True)
@@ -2419,7 +2542,6 @@ async def main():
                 # a large queue back-to-back.
                 eval_started_monotonic = _monotonic_now()
                 entry = state.queue.pop(0)
-                is_reeval = entry.get("reeval", False)
                 state.current_eval = {
                     "challenge_id": entry.get("challenge_id", "?"),
                     "challenger_repo": entry.get("hf_repo", ""),
@@ -2441,8 +2563,7 @@ async def main():
                 # 1800s hard kill.
                 async def _bounded_eval():
                     try:
-                        await process_challenge(state, r2, entry, subtensor, wallet,
-                                                check_stale=not is_reeval and args.seen)
+                        await process_challenge(state, r2, entry, subtensor, wallet)
                     except BaseException as inner:
                         # Re-raise inner exceptions wrapped so they don't collide
                         # with asyncio.wait_for's own TimeoutError sentinel.
@@ -2489,8 +2610,16 @@ async def main():
                                         notes=str(exc))
                         state.flush_dashboard()
 
-                fresh = scan_reveals(subtensor, NETUID, state.seen)
+                fresh = scan_reveals(subtensor, NETUID, state.completed_repos)
                 if fresh:
+                    # See same comment in tick scan above: refresh uid_map
+                    # eagerly so the dashboard never shows uid="--" for a
+                    # miner that's actually registered on chain right now.
+                    if any(r["hotkey"] not in state.uid_map for r in fresh):
+                        try:
+                            state.refresh_uid_map(subtensor, NETUID)
+                        except Exception:
+                            log.warning("uid_map refresh after mid-cycle scan failed (non-fatal)", exc_info=True)
                     queued_count = 0
                     for rev in fresh:
                         cid = state.enqueue(rev, defer_flush=True)
@@ -2514,11 +2643,15 @@ async def main():
 
             state.current_eval = None
 
-            if args.seen and not state.queue:
-                state.replenish_reeval(subtensor, NETUID)
-
-            if not args.seen and not state.queue:
-                log.info("idle: all hotkeys seen, waiting for new submissions")
+            # NOTE: --seen replenish_reeval was removed. Models are now
+            # evaluated exactly once (filtered by hf_repo via completed_repos
+            # in scan_reveals); re-running an already-evaluated model would
+            # let a miner replay the same checkpoint hoping to land on a
+            # weaker king. Miners who want another shot must upload to a
+            # *new* repo name and re-reveal on chain. The `--seen` flag is
+            # retained on the CLI for backward compat but is now a no-op.
+            if not state.queue:
+                log.info("idle: all known reveals processed, waiting for new submissions")
 
             state.complete_tick()
             state.flush_dashboard()

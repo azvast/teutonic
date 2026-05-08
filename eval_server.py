@@ -328,11 +328,54 @@ def _ensure_king(repo: str, king_hash: str = "", revision: str = "",
     return _king_evaluator
 
 
+def _evict_for_challenger(target_repo: str):
+    """Force-evict every cached repo that's NOT the king and NOT the
+    challenger we're about to load. This is the disk-pressure backstop:
+    `_cleanup_hf_cache`'s watermark check + tier-2 logic can still leave
+    a stale just-evaluated challenger pinned (it's the "most recent
+    preload" and gets self-protected). On a tight-disk pod (1.7T overlay
+    shared with other tenants, observed ~538 GB usable on the new B200
+    pod 2026-05-08) we cannot afford that — even if HF cache is below
+    watermark, the underlying disk can be at 0 free because of host-side
+    overhead/other tenants. Calling this BEFORE downloading a new
+    challenger guarantees we have ~165 GB headroom for the incoming
+    safetensors regardless of what `_cleanup_hf_cache` thinks.
+    """
+    try:
+        from huggingface_hub import scan_cache_dir
+        cache_info = scan_cache_dir()
+        kept_repos = {_king_repo, target_repo}
+        kept_repos.discard(None)
+        kept_repos.discard("")
+        hashes = []
+        bytes_to_free = 0
+        for repo_info in cache_info.repos:
+            if repo_info.repo_id in kept_repos:
+                continue
+            for rev_info in repo_info.revisions:
+                hashes.append(rev_info.commit_hash)
+                bytes_to_free += rev_info.size_on_disk
+        if not hashes:
+            return
+        log.info("pre-load eviction: freeing %d revisions (~%.1f GB) to make room for %s "
+                 "(keeping king=%s)",
+                 len(hashes), bytes_to_free / 1e9, target_repo, _king_repo)
+        cache_info.delete_revisions(*hashes).execute()
+    except Exception:
+        log.warning("pre-load eviction failed (non-fatal)", exc_info=True)
+
+
 def _load_challenger(repo: str, revision: str = "", on_phase=None):
     """Load challenger on the second half of GPUs.
 
     In sharded mode (TEUTONIC_SHARD_ACROSS_GPUS=1) the challenger occupies
     the full second-half GPU set as one accelerate-sharded replica."""
+    # Force-clear any stale challenger from a previous eval before we
+    # download this one. Otherwise on a disk-tight pod we can wedge at
+    # ENOSPC mid-download and surface as the misleading "could not load
+    # model with any attention implementation" error from the eager
+    # fallback in `load_model`.
+    _evict_for_challenger(repo)
     mid = len(_gpu_ids) // 2
     chall_gpus = _gpu_ids[mid:] or _gpu_ids[:1]
     return MultiGPUEvaluator(repo, chall_gpus, label="challenger",
@@ -355,6 +398,17 @@ def _cleanup_hf_cache():
     """Delete HF cached models, keeping the current king and recently
     preloaded challengers. Only acts above CACHE_HIGH_WATERMARK_GB so that
     speculative /preload downloads aren't immediately wiped between evals.
+
+    Tiered eviction (NEW): when cache is above watermark, we first try to
+    evict non-protected revisions (not king, not recently preloaded). If
+    that's not enough — which happens routinely with 80B (165GB) models on
+    a finite-disk pod where king + 1 just-evaluated + 1 preloading already
+    exceeds the watermark — we fall back to evicting the *oldest* protected
+    revisions too (still excluding the king and the most-recent preload
+    entry, which is the active eval). Without this fallback the cache used
+    to wedge at "above watermark but nothing eligible to delete" and every
+    subsequent download failed with ENOSPC (observed live 2026-05-08
+    05:55-05:58 UTC, blocked the validator for ~5 evals).
     """
     try:
         from huggingface_hub import scan_cache_dir
@@ -368,17 +422,20 @@ def _cleanup_hf_cache():
 
         keep_repo = _king_repo
         keep_rev = _king_revision
-        # Anything preloaded within the last PRELOAD_KEEP_S seconds should
-        # survive cleanup, otherwise we wipe the speculative download for
-        # the next eval. Older entries fall out of the keep window so the
-        # set doesn't grow unboundedly across long-running servers.
+        # Build (repo -> last preload timestamp) so we know *how* recent each
+        # preload is. The most recent preload is almost always the active
+        # eval — never evict that one even in fallback. Older protected
+        # entries are fair game once non-protected eviction isn't enough.
         now = time.time()
         with _preload_lock:
-            preload_repos: set[str] = {
-                repo for (repo, _rev), ts in _preload_seen.items()
-                if now - ts < PRELOAD_KEEP_S
-            }
-        hashes_to_delete = []
+            preload_ts: dict[str, float] = {}
+            for (repo, _rev), ts in _preload_seen.items():
+                if now - ts >= PRELOAD_KEEP_S:
+                    continue
+                if ts > preload_ts.get(repo, 0.0):
+                    preload_ts[repo] = ts
+        most_recent_preload_repo = (max(preload_ts, key=preload_ts.get)
+                                    if preload_ts else None)
 
         # Sort revisions by last_modified (oldest first). We delete oldest
         # until we're back under the watermark. Note: huggingface_hub's
@@ -391,27 +448,56 @@ def _cleanup_hf_cache():
                 all_revs.append((rev_info.last_modified, repo_info.repo_id, rev_info))
         all_revs.sort()
 
+        target_bytes = CACHE_HIGH_WATERMARK_GB * 0.7 * 1e9  # 30% headroom
+        hashes_to_delete: list[str] = []
         running_total = cache_info.size_on_disk
-        for _last, repo_id, rev_info in all_revs:
-            if running_total / 1e9 < CACHE_HIGH_WATERMARK_GB * 0.7:
-                break  # leave 30 percent headroom below watermark
-            if repo_id == keep_repo and (not keep_rev or rev_info.commit_hash == keep_rev):
-                continue
-            short = (rev_info.commit_hash or "")[:12]
-            if repo_id in preload_repos:
-                continue
-            hashes_to_delete.append(rev_info.commit_hash)
-            running_total -= rev_info.size_on_disk
-            log.info("marking for deletion: %s rev %s (%.1f MB)",
-                     repo_id, short, rev_info.size_on_disk / 1e6)
+
+        def _is_kept_king(repo_id: str, rev_info) -> bool:
+            return (repo_id == keep_repo
+                    and (not keep_rev or rev_info.commit_hash == keep_rev))
+
+        def _try_evict(allow_protected: bool, label: str) -> int:
+            nonlocal running_total
+            evicted_here = 0
+            for _last, repo_id, rev_info in all_revs:
+                if running_total < target_bytes:
+                    break
+                if rev_info.commit_hash in hashes_to_delete:
+                    continue
+                if _is_kept_king(repo_id, rev_info):
+                    continue
+                if not allow_protected and repo_id in preload_ts:
+                    continue
+                if allow_protected and repo_id == most_recent_preload_repo:
+                    continue  # never evict active eval
+                short = (rev_info.commit_hash or "")[:12]
+                hashes_to_delete.append(rev_info.commit_hash)
+                running_total -= rev_info.size_on_disk
+                evicted_here += 1
+                log.info("marking for deletion (%s): %s rev %s (%.1f MB)",
+                         label, repo_id, short, rev_info.size_on_disk / 1e6)
+            return evicted_here
+
+        # Pass 1: non-protected only.
+        _try_evict(allow_protected=False, label="tier-1 unprotected")
+        # Pass 2: if still above target, evict oldest protected too (LRU),
+        # excluding king and the active eval's repo.
+        if running_total >= target_bytes:
+            log.warning("hf cache cleanup: tier-1 didn't free enough (%.1f GB still > target %.1f GB), "
+                        "falling back to tier-2 (evicting older protected preloads)",
+                        running_total / 1e9, target_bytes / 1e9)
+            _try_evict(allow_protected=True, label="tier-2 protected-fallback")
 
         if not hashes_to_delete:
-            log.info("hf cache cleanup: above watermark but nothing eligible to delete")
+            log.warning("hf cache cleanup: above watermark but nothing eligible to delete "
+                        "(cache=%.1fGB king=%s active=%s)",
+                        cache_gb, keep_repo, most_recent_preload_repo)
             return
 
         strategy = cache_info.delete_revisions(*hashes_to_delete)
-        log.info("hf cache cleanup: deleting %d revisions, freeing %.1f MB (cache was %.1f GB)",
-                 len(hashes_to_delete), strategy.expected_freed_size / 1e6, cache_gb)
+        log.info("hf cache cleanup: deleting %d revisions, freeing %.1f MB (cache was %.1f GB, target %.1f GB)",
+                 len(hashes_to_delete), strategy.expected_freed_size / 1e6, cache_gb,
+                 target_bytes / 1e9)
         strategy.execute()
         log.info("hf cache cleanup: done")
 
@@ -578,6 +664,17 @@ def _run_eval(eval_id: str, req: EvalRequest):
         if same_model:
             challenger_eval = king_eval
         else:
+            # Pre-download cleanup: free space for the ~165 GB challenger
+            # before _load_challenger calls _prefetch_repo. Otherwise an
+            # earlier eval's challenger sitting in cache + king + new
+            # challenger can blow disk capacity, manifesting as the
+            # misleading "could not load model with any attention
+            # implementation" error (which is really ENOSPC during
+            # safetensors mmap). See _cleanup_hf_cache docstring.
+            try:
+                _cleanup_hf_cache()
+            except Exception:
+                log.warning("eval %s: pre-load cleanup failed", eval_id, exc_info=True)
             challenger_eval = _load_challenger(req.challenger_repo, req.challenger_revision,
                                                on_phase=_on_phase)
 
@@ -1005,6 +1102,20 @@ async def preload_endpoint(req: PreloadRequest):
                          key, sem_wait_s)
 
             try:
+                # Proactive cache cleanup BEFORE we start writing 165 GB to
+                # disk. The post-eval cleanup (in _run_eval's finally block)
+                # only runs after the *previous* eval finishes, which can
+                # leave the disk too full to accept the next preload —
+                # observed live 2026-05-08 06:00 UTC where 3 challengers
+                # in cache wedged the disk at 100% and every preload
+                # failed with ENOSPC. Running cleanup here gives the new
+                # tiered eviction (see _cleanup_hf_cache docstring) a
+                # chance to evict the oldest preloaded challenger so the
+                # incoming download fits.
+                try:
+                    _cleanup_hf_cache()
+                except Exception:
+                    log.warning("preload %s: pre-download cleanup failed", key, exc_info=True)
                 _prefetch_repo(req.repo, revision=req.revision or None,
                                timeout=int(os.environ.get("HF_PREFETCH_TIMEOUT", "600")))
                 log.info("preload complete: %s (defer=%.1fs net_wait=%.1fs total=%.1fs)",

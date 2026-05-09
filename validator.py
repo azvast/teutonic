@@ -620,16 +620,22 @@ import re
 _REPO_RE = re.compile(REPO_PATTERN)
 _SAFETENSORS_SHARD_RE = re.compile(r"^model-\d{5}-of-\d{5}\.safetensors$")
 
-def scan_reveals(subtensor, netuid, completed_repos):
+def scan_reveals(subtensor, netuid, completed_repos, seen_hotkeys):
     """Pull all on-chain reveals; return the latest per hotkey that we
     haven't already enqueued for eval.
 
-    Filtering is done by `hf_repo` (NOT hotkey): each unique repo gets
-    exactly one eval, ever. A miner who already had a model evaluated
-    can submit again by uploading to a *new* repo name and re-revealing.
-    Same repo + new commitment = treated as the same (idempotent) eval —
-    miners cannot replay the same checkpoint hoping to land on a weaker
-    king.
+    Policy: ONE HOTKEY = ONE EVAL, EVER. Once a hotkey is enqueued, it is
+    added to `seen_hotkeys` and never accepted again. A miner whose model
+    has been evaluated cannot submit a new model from the same hotkey;
+    they must register a fresh hotkey on subnet (which costs alpha) to
+    get another shot. This closes the spam vector where one operator
+    re-uses a single hotkey to drive unbounded evals by uploading to
+    fresh repo names.
+
+    Belt-and-suspenders: we also filter by `hf_repo` (`completed_repos`)
+    so a single reveal is idempotent across restarts and the
+    "wait until king is weak then re-eval same checkpoint" exploit
+    stays closed even if a hotkey somehow leaks through.
     """
     try:
         all_reveals = subtensor.get_all_revealed_commitments(netuid)
@@ -642,6 +648,8 @@ def scan_reveals(subtensor, netuid, completed_repos):
     new = []
     for hotkey, entries in all_reveals.items():
         if not entries:
+            continue
+        if hotkey in seen_hotkeys:
             continue
         block, data = max(entries, key=lambda e: e[0])
         parts = data.split(":", 2)
@@ -942,12 +950,14 @@ class State:
         self.failed_repos: set[str] = set()
         self.evaluated_repos: set[str] = set()
         # Persistent record of every hf_repo that was ever enqueued for eval.
-        # Used by `scan_reveals` to skip re-enqueueing the same repo a second
-        # time (closes the "wait until king is weak then get re-evaluated"
-        # exploit where a model that lost against king K1 could later win
-        # against a weaker king K2 via --seen replenish). Each model gets
-        # exactly one eval, ever — miners must upload to a new repo name to
-        # get a new shot. Persisted to R2 alongside `seen_hotkeys.json`.
+        # Belt-and-suspenders alongside `self.seen` (the primary 1-hotkey-1-eval
+        # gate in `scan_reveals`): closes the "wait until king is weak then
+        # get re-evaluated" exploit where a model that lost against king K1
+        # could later win against a weaker king K2 via --seen replenish.
+        # Each hf_repo gets exactly one eval, ever. The hotkey-level gate
+        # (`self.seen`) is what enforces the "one hotkey = one submission"
+        # policy: a miner cannot get a new shot just by uploading to a fresh
+        # repo name — they must register a fresh hotkey on subnet.
         self.completed_repos: set[str] = set()
         self.stats = {"queued": 0, "accepted": 0, "rejected": 0, "failed": 0}
         self.counter = 0
@@ -1257,6 +1267,16 @@ class State:
         if king_hotkey and hotkey == king_hotkey:
             log.info("skipping enqueue: hotkey %s is the current king", hotkey[:16])
             return None
+        # 1-hotkey-1-eval: this is the policy gate. `scan_reveals` already
+        # filters by `seen` at the chain-intake layer; this is the
+        # belt-and-suspenders check for any direct enqueue path. A hotkey
+        # that's already been enqueued (whether the eval succeeded, failed,
+        # or was lost to a validator crash) cannot submit again — the miner
+        # must register a fresh hotkey on subnet.
+        if hotkey and hotkey in self.seen:
+            log.info("skipping enqueue: hotkey %s already used its 1-eval slot "
+                     "(must re-register for another shot)", hotkey[:16])
+            return None
         for existing in self.queue:
             if existing.get("hf_repo") == repo:
                 log.info("skipping duplicate repo: %s already queued", repo)
@@ -1269,14 +1289,16 @@ class State:
         entry.pop("reeval", None)
         self.queue.append(entry)
         self.stats["queued"] += 1
-        # Mark this hf_repo as "ever enqueued" so future scan_reveals never
-        # re-pulls it. Trade-off: if the validator crashes between enqueue
-        # and verdict, the eval is lost and the miner must re-submit to a
-        # new repo. This is rare (restarts ~hourly at most) and prevents
-        # the much worse re-eval-against-weaker-king exploit.
+        # Burn the hotkey now (at enqueue, not at verdict). Per policy this
+        # is intentional: one reveal = one shot. If the validator crashes
+        # between enqueue and verdict the eval is lost and the miner must
+        # register a fresh hotkey to retry. Mirroring the burn into
+        # `completed_repos` keeps the per-repo idempotency check effective
+        # in case a hotkey is somehow ever revived (operator override).
+        if hotkey:
+            self.seen.add(hotkey)
         if repo:
             self.completed_repos.add(repo)
-            self.seen.add(hotkey)
         if not defer_flush:
             self.flush()
             self.flush_dashboard(force=True)
@@ -2563,7 +2585,7 @@ async def main():
                 state.market = tmc
 
             state.set_phase("scan_reveals", notes="polling chain for reveals")
-            reveals = scan_reveals(subtensor, NETUID, state.completed_repos)
+            reveals = scan_reveals(subtensor, NETUID, state.completed_repos, state.seen)
             if reveals:
                 # If any newly-revealed hotkey isn't in the uid_map snapshot we
                 # just refreshed (registration happened *between* refresh and
@@ -2661,7 +2683,7 @@ async def main():
                                         notes=str(exc))
                         state.flush_dashboard()
 
-                fresh = scan_reveals(subtensor, NETUID, state.completed_repos)
+                fresh = scan_reveals(subtensor, NETUID, state.completed_repos, state.seen)
                 if fresh:
                     # See same comment in tick scan above: refresh uid_map
                     # eagerly so the dashboard never shows uid="--" for a
@@ -2691,12 +2713,15 @@ async def main():
 
             state.current_eval = None
 
-            # Re-eval is permanently disabled: each hf_repo gets exactly one
-            # eval, ever (filtered via `completed_repos` in scan_reveals).
-            # Re-running an already-evaluated model would let a miner replay
-            # the same checkpoint hoping to land on a weaker king. Miners
-            # who want another shot must upload to a *new* repo name and
-            # re-reveal on chain.
+            # Re-eval is permanently disabled. Two layered gates enforce
+            # 1-hotkey-1-eval in scan_reveals:
+            #   1. hotkey -> in `seen`: the primary policy. A miner gets
+            #      exactly one shot per hotkey registration, period.
+            #   2. hf_repo -> in `completed_repos`: belt-and-suspenders to
+            #      prevent the "wait until king is weak then re-eval the
+            #      same checkpoint" replay even if a hotkey leaks through.
+            # Miners who want another shot must register a fresh hotkey
+            # on subnet (which costs alpha) and reveal from that new key.
             if not state.queue:
                 log.info("idle: all known reveals processed, waiting for new submissions")
 

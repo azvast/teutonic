@@ -8,7 +8,7 @@ and bootstrap math verbatim (`fetch_sequences`, `download_shard`,
 
   per-sequence loss = -mean_{i=1..seq_len-1} log p_model(token_i | token_<i)
   d_i               = king_loss_i - challenger_loss_i
-  accept iff lcb(d, alpha) > 1/N
+  accept iff lcb(d, alpha) > EVAL_DELTA  (default 0.0025 nats/token)
 
 The forward pass is a vLLM prefill-only request (`max_tokens=1`) with
 `prompt_logprobs=0`, which causes vLLM to return the model's logprob of every
@@ -34,6 +34,7 @@ from typing import Any
 import numpy as np
 
 from .torch_runner import (
+    EVAL_DELTA,
     download_shard,
     extract_sequences,
     get_shard_info,
@@ -346,7 +347,7 @@ def run_bootstrap_test_vllm(
       - same shard, same per-(block_hash, hotkey) seed -> indices
       - same per-token mean nats over (seq_len - 1) positions
       - same paired LCB at level `alpha`
-      - same accept rule: lcb > 1/N
+      - same accept rule: lcb > EVAL_DELTA (default 0.0025 nats/token)
 
     The only difference is the inner forward pass: vLLM prefill in two
     subprocess engines instead of HF teacher forcing on resident models.
@@ -354,7 +355,7 @@ def run_bootstrap_test_vllm(
     n_tokens = get_shard_info(r2, shard_key)
     n_sequences = n_tokens // seq_len
     actual_N = min(eval_n, n_sequences)
-    delta = 1.0 / actual_N if actual_N > 0 else 0.0
+    delta = EVAL_DELTA
     log.info("bootstrap[vllm] N=%d actual_N=%d alpha=%s delta=%.6f B=%d",
              eval_n, actual_N, alpha, delta, n_bootstrap)
 

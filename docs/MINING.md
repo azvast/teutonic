@@ -25,9 +25,9 @@ miner)**. If you want to actually dethrone the king, see **Real training**.
 The validator pulls every reveal commitment from chain, downloads the
 challenger from HF, runs a paired cross-entropy test against the king on a
 random Hippius shard, and crowns the challenger if its bootstrap LCB on the
-per-token NLL improvement clears `delta = 1/N`. Winner takes 100% of SN3
-emission until dethroned. Full mechanism in
-[`DESIGN.md`](DESIGN.md).
+per-token NLL improvement clears `delta = 0.0025` (fixed nats/token effect
+floor; see `EVAL_DELTA` in `eval/torch_runner.py`). Winner takes 100% of
+SN3 emission until dethroned. Full mechanism in [`DESIGN.md`](DESIGN.md).
 
 The architecture lock is enforced by `validate_challenger_config` in
 [`validator.py`](../validator.py): your challenger's `config.json`
@@ -345,7 +345,7 @@ Quasar's BigMac.
 
 Stays the same vs Quasar chain:
 - Reveal commitment payload format `<king_hash[:16]>:<challenger_repo>:<challenger_hash>`
-- Bootstrap LCB acceptance rule with `delta = 1/N`
+- Bootstrap LCB acceptance rule with fixed `delta = 0.0025` nats/token
 - Per-submission shard randomization via `blake2b(block_hash || hotkey)`
 - Coldkey-prefix repo gate (8-char ss58 prefix in repo namespace OR basename)
 - 5-king rolling payout

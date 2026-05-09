@@ -5,7 +5,7 @@ Loads model replicas across all available GPUs, fetches sequences from R2
 with prefetch overlap, and computes cross-entropy loss via chunked lm_head
 forward passes to minimize VRAM. Accepts the challenger only when the
 bootstrapped lower confidence bound on the per-token log-loss advantage
-exceeds delta = 1/N (N = the actual number of evaluated sequences).
+exceeds the fixed effect floor `EVAL_DELTA` (default 0.0025 nats/token).
 
 Usage:
     python eval_torch.py \
@@ -1399,6 +1399,17 @@ def compute_paired_multi_gpu(king_eval, chall_eval, token_batches):
 # Bootstrap test
 # ---------------------------------------------------------------------------
 
+# Effect-size floor in nats/token. The challenger's bootstrapped LCB on the
+# per-token log-loss advantage must exceed this for a dethrone. Restored
+# 2026-05-09 from the temporary `1/N` resolution-only floor (~1e-4 at
+# N=10000) which was too permissive once the king matured: at low per-seq
+# variance the LCB itself stops being the binding constraint and trivial
+# improvements were clearing the bar. 0.0025 nats/token (~0.25%) is a
+# meaningful effect floor that still lets real gains through but blocks
+# noise-grade wins.
+EVAL_DELTA = float(os.environ.get("EVAL_DELTA", "0.0025"))
+
+
 def run_bootstrap_test(king_eval, challenger_eval, r2, shard_key, eval_n,
                        alpha, seq_len, batch_size, seed_str,
                        n_bootstrap=10000, on_progress=None):
@@ -1407,16 +1418,17 @@ def run_bootstrap_test(king_eval, challenger_eval, r2, shard_key, eval_n,
     Scores M fixed-length blocks on both models, computes d_i = king_loss_i -
     challenger_loss_i (positive means challenger is better), then bootstraps the
     mean to get a one-sided lower confidence bound (LCB).  Accepts only if
-    LCB > delta, where delta = 1/N (N = actual evaluated sequences). The
-    1/N floor scales with the bootstrap's own resolution, so it just blocks
-    numerical-noise wins without imposing a fixed economic threshold.
+    LCB > delta, where delta = EVAL_DELTA (default 0.0025 nats/token). The
+    fixed effect floor blocks both numerical-noise wins and tiny real-but-
+    economically-trivial improvements, putting the burden on miners to ship
+    a meaningful gain rather than grinding the LCB toward zero.
 
     Calls on_progress(info_dict) after each batch if provided.
     """
     n_tokens = get_shard_info(r2, shard_key)
     n_sequences = n_tokens // seq_len
     actual_N = min(eval_n, n_sequences)
-    delta = 1.0 / actual_N if actual_N > 0 else 0.0
+    delta = EVAL_DELTA
     log.info("bootstrap test: N=%d actual_N=%d alpha=%s delta=%.6f B=%d",
              eval_n, actual_N, alpha, delta, n_bootstrap)
 
@@ -1583,8 +1595,8 @@ def main():
     log.info("  king:       %s", args.king)
     log.info("  challenger: %s", args.challenger)
     log.info("  GPUs:       %s (%s)", gpu_ids, "shared" if same_model else "split")
-    log.info("  N=%d  alpha=%s  delta=1/N  bootstrap=%d  batch=%d  seq_len=%d",
-             args.n, args.alpha, args.n_bootstrap, args.batch_size, args.seq_len)
+    log.info("  N=%d  alpha=%s  delta=%.6f  bootstrap=%d  batch=%d  seq_len=%d",
+             args.n, args.alpha, EVAL_DELTA, args.n_bootstrap, args.batch_size, args.seq_len)
     log.info("  shard: %s", shard_key)
     log.info("  seed:  %s", args.seed)
     log.info("=" * 60)

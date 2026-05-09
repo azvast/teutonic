@@ -97,7 +97,7 @@ def render(report):
 
     lines.append("")
     lines.append("## Notes")
-    lines.append("- Validator delta = 1/N nats/token (~1e-4 at N=10000). Offline target_mu = 0.05.")
+    lines.append("- Validator delta = 0.0025 nats/token (fixed effect floor). Offline target_mu = 0.05.")
     lines.append("- Iterates up to 3 attempts; uploads only if accepted.")
 
     return "\n".join(lines)

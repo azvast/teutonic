@@ -87,6 +87,7 @@ log = logging.getLogger("train_challenger")
 # ---------------------------------------------------------------------------
 SEQ_LEN = 2048
 EVAL_ALPHA = 0.001
+EVAL_DELTA = 0.0025  # validator's effect floor in nats/token; see eval/torch_runner.py
 LM_HEAD_CHUNK = 256
 DASHBOARD_URL = os.environ.get(
     "TEUTONIC_DASHBOARD_URL",
@@ -210,10 +211,10 @@ def paired_eval(king_dir: str, chall_dir: str, shard: np.ndarray,
                 n_bootstrap: int = 10000, alpha: float = EVAL_ALPHA) -> dict:
     """Mirrors validator's paired bootstrap test on a single GPU.
 
-    Acceptance floor delta = 1/N (N = len(indices)) matches the validator,
-    where the floor scales with the bootstrap's own resolution.
+    Acceptance floor delta = EVAL_DELTA (default 0.0025 nats/token) matches
+    the validator's restored fixed-effect-floor rule.
     """
-    delta = 1.0 / len(indices) if indices else 0.0
+    delta = EVAL_DELTA
     log.info("paired_eval: loading king %s on %s", king_dir, device)
     king = AutoModelForCausalLM.from_pretrained(
         king_dir, torch_dtype=torch.bfloat16, device_map={"": device},

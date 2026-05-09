@@ -29,9 +29,13 @@ The economic primitives are:
 - **Reward** — `1/5` of the SN3 alpha emission stream while you sit anywhere
   in the rolling 5-king window (i.e. for your reign + the next 4 dethrones).
 - **Acceptance rule** — paired bootstrap LCB on per-token log-loss difference,
-  one-sided at `alpha=0.001`, with effect floor `delta = 1/N` (N = actual
-  evaluated sequences; ~1e-4 at N=10000). The floor scales with the
-  bootstrap's own resolution rather than imposing a fixed economic threshold.
+  one-sided at `alpha=0.001`, with fixed effect floor `delta = 0.0025`
+  nats/token (`EVAL_DELTA`, override-able via env). A pure `1/N` resolution
+  floor was tried briefly (commit `e649d37`, May 2026) but proved too
+  permissive once the king matured — the binding constraint stopped being
+  the LCB and trivial wins started clearing the bar. 0.0025 is restored as
+  a meaningful economic threshold while still small enough to admit real
+  gains.
 
 ---
 
@@ -219,10 +223,12 @@ The full math lives in
 4. **Bootstrap LCB.** Resample `n_bootstrap=10_000` paired indices with
    replacement, take the `alpha=0.001` quantile of the bootstrap means as the
    one-sided lower confidence bound `lcb`.
-5. **Accept rule.** `accepted = lcb > delta` where `delta = 1/N` nats/token,
-   computed inside the test from the actual evaluated sequence count
-   (~1e-4 at N=10000). Equivalently: we are 99.9% confident the true mean
-   improvement is strictly larger than the per-sample-resolution floor.
+5. **Accept rule.** `accepted = lcb > delta` where `delta = EVAL_DELTA = 0.0025`
+   nats/token (a fixed economic floor, restored 2026-05-09 after a brief
+   experiment with a `1/N` resolution-only floor proved too permissive at
+   late-king maturity). Equivalently: we are 99.9% confident the true mean
+   improvement is strictly larger than 0.0025 nats/token (~0.25% relative
+   reduction in NLL).
 
 ```python
 # eval/torch_runner.py:614-625
@@ -378,11 +384,12 @@ that scale poorly:
   cross-entropy, currently `20_000 × 2048` tokens through full vocab. At 1B
   this is cheap; at 70B it is the dominant cost in the system, *paid by
   validators every time*.
-- **Diminishing-returns asymmetry against the bootstrap LCB.** Even with the
-  `delta = 1/N` floor (which only blocks numerical-noise wins), the binding
-  constraint near convergence is the LCB itself: as the king matures the
-  miner's required `mu_hat` grows with the per-sequence variance, so miners
-  face an ever-rising compute bill for an unchanged reward.
+- **Diminishing-returns asymmetry against the bootstrap LCB + delta floor.**
+  Near convergence the miner's required `mu_hat` is `max(LCB-bandwidth,
+  delta) = max(LCB-bandwidth, 0.0025)`. The LCB term grows with per-sequence
+  variance as the king matures, and on top of that the delta floor sets a
+  hard 0.25% relative-NLL minimum that no amount of variance-reduction can
+  duck. Miners face an ever-rising compute bill for an unchanged reward.
 - **No partial credit, no composition.** Every submission is a full,
   independent monolithic checkpoint. There is no notion of "I trained these
   layers", "I produced this dataset", "I distilled this teacher". Large-model
@@ -409,11 +416,11 @@ redesigning for larger models. Not prescriptions — just the dials:
 - `EVAL_N` (currently 20_000 sequences). Sets test power and per-eval cost.
 - `SEQ_LEN` (currently 2048). Multiplies eval cost linearly.
 - `EVAL_ALPHA` (`0.001`). Type-I error budget.
-- Effect floor `delta = 1/N` (computed inside the bootstrap test from the
-  actual evaluated sequence count, no longer a configurable knob). Blocks
-  numerical-noise wins; the LCB carries the real statistical work. Adding
-  back an economic floor (king-age- or `avg_king_loss`-scaled) is the next
-  lever if a fixed economic threshold becomes desirable.
+- Effect floor `delta = EVAL_DELTA` (default `0.0025` nats/token, override
+  via env). Restored 2026-05-09 from a brief `1/N` resolution-only experiment
+  after the king matured enough that the LCB stopped being the binding
+  constraint. A king-age- or `avg_king_loss`-scaled floor is the natural next
+  lever if 0.0025 ever becomes too generous.
 - `EVAL_BOOTSTRAP_B` (`10_000`).
 - Switching production from bootstrap LCB to the penalized t-test
   (`beta` knob).

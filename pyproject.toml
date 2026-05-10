@@ -9,16 +9,18 @@ dependencies = [
     "bittensor",
     "boto3",
     "httpx",
-    "numpy",
+    "numpy>=1.26",
     "scipy",
-    "huggingface-hub",
+    "huggingface-hub>=0.26",
     "hf_transfer>=0.1",
-    "safetensors",
-    "torch",
-    "transformers",
+    "safetensors>=0.4",
+    "torch>=2.5",
+    "transformers>=4.46",
     "fastapi",
     "uvicorn",
     "pydantic",
+    "peft>=0.13",
+    "accelerate>=1.0",
 ]
 
 [project.optional-dependencies]

@@ -47,6 +47,51 @@ import logging
 import math
 import os
 
+
+# ---------------------------------------------------------------------------
+# .env auto-loader — must run BEFORE any module-level os.environ.get(...)
+# below (DASHBOARD_URL, EVAL_DELTA env override, HF_TOKEN default, WANDB_*
+# defaults). Existing process env vars take precedence so a CLI-side
+# `WANDB_PROJECT=foo python train_challenger.py ...` still wins.
+# ---------------------------------------------------------------------------
+def _load_dotenv(path: str) -> int:
+    """Tiny dotenv parser. Supports `KEY=VALUE`, `# comment`, and quoted
+    values. Returns the count of newly-set vars. Existing vars are NEVER
+    overwritten — CLI / shell-exported values always win.
+    """
+    if not os.path.isfile(path):
+        return 0
+    n_loaded = 0
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip()
+            # Strip an optional inline comment that begins with ` #` (space+#).
+            # Don't strip `#` inside quoted values.
+            if not (val.startswith('"') or val.startswith("'")):
+                hash_pos = val.find(" #")
+                if hash_pos != -1:
+                    val = val[:hash_pos].rstrip()
+            # Strip surrounding quotes if matched.
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                val = val[1:-1]
+            if key and key not in os.environ:
+                os.environ[key] = val
+                n_loaded += 1
+    return n_loaded
+
+
+_DOTENV_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".env"
+)
+_DOTENV_COUNT = _load_dotenv(_DOTENV_PATH)
+
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
 import shutil
@@ -75,12 +120,57 @@ import chain_config  # noqa: E402
 
 chain_config.load_arch()
 
+# Chain-aware LoRA target presets. PEFT matches `target_modules` strings
+# against the END of each module's qualified name; substring matches do
+# NOT work (the prior `gate`/`up`/`down` defaults silently froze every
+# Qwen3-MoE expert). Mirrors LORA_TARGET_PRESETS in
+# scripts/training_bundle/train_lora_token_ids.py — keep in sync.
+LORA_TARGET_PRESETS: dict[str, list[str]] = {
+    "archs.qwen3_moe": [
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    ],
+    "archs.quasar": [
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "ffn.gate", "ffn.up", "ffn.down",
+        "w_down_proj", "w_up_proj",
+    ],
+}
+
+
+def default_lora_targets() -> list[str]:
+    return LORA_TARGET_PRESETS.get(
+        chain_config.ARCH_MODULE,
+        ["q_proj", "k_proj", "v_proj", "o_proj",
+         "gate_proj", "up_proj", "down_proj"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Optional W&B (orchestrator-level only — the inner training loop reports
+# its own per-step metrics directly to W&B via TrainingArguments.report_to).
+# ---------------------------------------------------------------------------
+try:
+    import wandb  # noqa: F401  type: ignore
+    _HAS_WANDB = True
+except ImportError:
+    _HAS_WANDB = False
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [train_challenger] %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("train_challenger")
+
+if _DOTENV_COUNT:
+    log.info("loaded %d env vars from %s (existing env vars unchanged)",
+             _DOTENV_COUNT, _DOTENV_PATH)
+elif os.path.isfile(_DOTENV_PATH):
+    log.info(".env exists at %s but added 0 new vars (all already set in env)",
+             _DOTENV_PATH)
+else:
+    log.info("no .env at %s — relying on shell env / CLI flags", _DOTENV_PATH)
 
 # ---------------------------------------------------------------------------
 # Defaults (mirror validator constants where applicable)
@@ -208,12 +298,23 @@ def compute_per_seq_loss(model, token_batches, device, chunk=LM_HEAD_CHUNK):
 
 def paired_eval(king_dir: str, chall_dir: str, shard: np.ndarray,
                 indices: list[int], device: str, batch_size: int = 8,
-                n_bootstrap: int = 10000, alpha: float = EVAL_ALPHA) -> dict:
+                n_bootstrap: int = 10000, alpha: float = EVAL_ALPHA,
+                wandb_iter: int | None = None) -> dict:
     """Mirrors validator's paired bootstrap test on a single GPU.
 
     Acceptance floor delta = EVAL_DELTA (default 0.0025 nats/token) matches
     the validator's restored fixed-effect-floor rule.
+
+    Intermediate mu_hat samples + final verdict are logged to W&B (if a
+    run is active) under `paired_eval/iter_{wandb_iter}/...` so you can
+    watch the offline test converge live.
     """
+    wb_run = None
+    if _HAS_WANDB:
+        import wandb as _wb
+        wb_run = _wb.run
+    wb_prefix = f"paired_eval/iter_{wandb_iter}" if wandb_iter is not None else "paired_eval"
+
     delta = EVAL_DELTA
     log.info("paired_eval: loading king %s on %s", king_dir, device)
     king = AutoModelForCausalLM.from_pretrained(
@@ -247,6 +348,13 @@ def paired_eval(king_dir: str, chall_dir: str, shard: np.ndarray,
             log.info("eval %d/%d | mu_hat=%.6f | king=%.4f chall=%.4f | %.1fs",
                      n_done, len(indices), mu,
                      king_sum / n_done, chall_sum / n_done, time.time() - t0)
+            if wb_run is not None:
+                wb_run.log({
+                    f"{wb_prefix}/progress_mu_hat": mu,
+                    f"{wb_prefix}/progress_king_loss": king_sum / n_done,
+                    f"{wb_prefix}/progress_chall_loss": chall_sum / n_done,
+                    f"{wb_prefix}/n_done": n_done,
+                })
 
     diffs = np.asarray(diffs, dtype=np.float64)
     mu_hat = float(diffs.mean())
@@ -255,11 +363,19 @@ def paired_eval(king_dir: str, chall_dir: str, shard: np.ndarray,
     for b in range(n_bootstrap):
         boot[b] = diffs[rng.integers(0, len(diffs), size=len(diffs))].mean()
     lcb = float(np.quantile(boot, alpha))
+    # Symmetric upper bound for context (not used in acceptance but useful
+    # for tracking how much headroom you have).
+    ucb = float(np.quantile(boot, 1.0 - alpha))
+    se_mu = float(diffs.std(ddof=1) / math.sqrt(len(diffs)))
     accepted = lcb > delta
+    margin = mu_hat - delta  # how far you cleared the validator's floor
     res = {
         "n_eval": n_done,
         "mu_hat": mu_hat,
         "lcb": lcb,
+        "ucb": ucb,
+        "se_mu": se_mu,
+        "margin_over_delta": margin,
         "delta": delta,
         "alpha": alpha,
         "accepted": accepted,
@@ -267,8 +383,11 @@ def paired_eval(king_dir: str, chall_dir: str, shard: np.ndarray,
         "avg_chall_loss": chall_sum / n_done,
         "elapsed_s": time.time() - t0,
     }
-    log.info("paired_eval: mu_hat=%.6f lcb=%.6f accepted=%s",
-             mu_hat, lcb, accepted)
+    log.info("paired_eval: mu_hat=%.6f lcb=%.6f (delta=%.6f, margin=%+.6f) accepted=%s",
+             mu_hat, lcb, delta, margin, accepted)
+    if wb_run is not None:
+        wb_run.log({f"{wb_prefix}/{k}": v for k, v in res.items()
+                    if isinstance(v, (int, float, bool))})
     del king, chall
     torch.cuda.empty_cache()
     return res
@@ -391,9 +510,19 @@ def score_and_curate(king_dir: str, shards: list[np.ndarray],
 # ---------------------------------------------------------------------------
 def run_lora_training(base_model: str, train_p: Path, val_p: Path,
                       out_dir: Path, n_gpus: int, args: argparse.Namespace,
-                      bundle: Path) -> Path:
-    """Spawn torchrun on the existing training_bundle script."""
+                      bundle: Path, iter_idx: int,
+                      resume_adapter: Path | None = None) -> Path:
+    """Spawn torchrun on the inner training script.
+
+    Forwards the optimizer / scheduler / W&B / LoRA-target knobs so the
+    inner loop's TrainingArguments + LoraConfig pick them up. The inner
+    script reports per-step metrics directly to W&B (under the same run if
+    we initialize one).
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    targets_csv = ",".join(args.lora_targets) if args.lora_targets else ""
+
     cmd = [
         "torchrun", f"--nproc_per_node={n_gpus}",
         str(bundle / "train_lora_token_ids.py"),
@@ -401,23 +530,47 @@ def run_lora_training(base_model: str, train_p: Path, val_p: Path,
         "--train-data", str(train_p),
         "--val-data", str(val_p),
         "--output-dir", str(out_dir),
-        "--seq-len", "2048",
+        "--seq-len", str(SEQ_LEN),
         "--micro-batch-size", str(args.micro_batch),
         "--grad-accum", str(args.grad_accum),
         "--learning-rate", str(args.lr),
         "--epochs", str(args.epochs),
+        "--warmup-ratio", str(args.warmup_ratio),
+        "--weight-decay", str(args.weight_decay),
+        "--max-grad-norm", str(args.max_grad_norm),
+        "--adam-beta1", str(args.adam_beta1),
+        "--adam-beta2", str(args.adam_beta2),
+        "--lr-scheduler-type", args.lr_scheduler,
+        "--optim", args.optim,
         "--lora-r", str(args.lora_r),
         "--lora-alpha", str(args.lora_alpha),
-        "--lora-dropout", "0.05",
+        "--lora-dropout", str(args.lora_dropout),
+        "--logging-steps", str(args.logging_steps),
+        "--eval-steps", str(args.eval_steps_inner),
+        "--save-steps", str(args.save_steps_inner),
     ]
+    if targets_csv:
+        cmd += ["--lora-target-modules", targets_csv]
+    if args.lora_rslora:
+        cmd += ["--lora-rslora"]
+    if resume_adapter is not None and resume_adapter.exists():
+        cmd += ["--resume-adapter", str(resume_adapter)]
+        log.info("warm-starting iter %d from %s", iter_idx, resume_adapter)
+    if args.wandb_project:
+        cmd += ["--wandb-project", args.wandb_project]
+        run_name = args.wandb_run_name or f"iter{iter_idx:02d}"
+        cmd += ["--wandb-run-name", f"{run_name}-train"]
+        if args.wandb_tags:
+            cmd += ["--wandb-tags", args.wandb_tags]
+
     log.info("training: %s", " ".join(cmd))
     t0 = time.time()
     subprocess.check_call(cmd)
     log.info("training done in %.1fs", time.time() - t0)
+
     adapter = out_dir / "best_adapter"
     if not adapter.exists():
         # Trainer.save_model may have only put the adapter in the root output_dir.
-        # Look for adapter_model files.
         if (out_dir / "adapter_model.safetensors").exists() or \
            (out_dir / "adapter_model.bin").exists():
             adapter = out_dir
@@ -453,6 +606,7 @@ def merge_lora(base_model: str, adapter: Path, out: Path) -> Path:
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
+    # I/O + iteration topology
     ap.add_argument("--work", default="/root/teutonic-mining/work",
                     help="Working dir on this box")
     ap.add_argument("--bundle", default="/root/teutonic-mining/bundle",
@@ -472,12 +626,45 @@ def main():
                     help="Retry training with new seed if first attempt insufficient")
     ap.add_argument("--target-mu", type=float, default=0.05,
                     help="Stop training as soon as offline mu_hat exceeds this")
+    ap.add_argument("--target-lcb", type=float, default=EVAL_DELTA + 0.0001,
+                    help="Stop early when LCB clears this (default just above "
+                         "validator delta, so essentially `accepted=True`).")
+    ap.add_argument("--warm-start-iters", action="store_true",
+                    help="Each iteration after the first warm-starts from the "
+                         "previous best LoRA adapter instead of re-initing.")
+    # Optimizer / scheduler / training loop
     ap.add_argument("--micro-batch", type=int, default=2)
     ap.add_argument("--grad-accum", type=int, default=8)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--epochs", type=float, default=1.0)
+    ap.add_argument("--warmup-ratio", type=float, default=0.05)
+    ap.add_argument("--weight-decay", type=float, default=0.01)
+    ap.add_argument("--max-grad-norm", type=float, default=1.0)
+    ap.add_argument("--adam-beta1", type=float, default=0.9)
+    ap.add_argument("--adam-beta2", type=float, default=0.95)
+    ap.add_argument("--lr-scheduler", default="cosine",
+                    choices=["linear", "cosine", "cosine_with_restarts",
+                             "polynomial", "constant", "constant_with_warmup"])
+    ap.add_argument("--optim", default="adamw_torch_fused",
+                    choices=["adamw_torch", "adamw_torch_fused",
+                             "paged_adamw_8bit", "paged_adamw_32bit",
+                             "adafactor"])
+    # LoRA
     ap.add_argument("--lora-r", type=int, default=16)
     ap.add_argument("--lora-alpha", type=int, default=32)
+    ap.add_argument("--lora-dropout", type=float, default=0.05)
+    ap.add_argument("--lora-rslora", action="store_true",
+                    help="Rank-stabilized LoRA (alpha / sqrt(r)). Recommended "
+                         "when bumping --lora-r above ~32.")
+    ap.add_argument("--lora-targets", default="",
+                    help="Comma-separated module names to LoRA-target. "
+                         "Default is chain-aware (Qwen3-MoE: q/k/v/o + "
+                         "gate/up/down_proj). Pass to override.")
+    # Inner trainer logging cadence
+    ap.add_argument("--logging-steps", type=int, default=10)
+    ap.add_argument("--eval-steps-inner", type=int, default=50)
+    ap.add_argument("--save-steps-inner", type=int, default=100)
+    # Misc
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--n-gpus", type=int, default=8)
     ap.add_argument("--upload-repo", default="",
@@ -489,7 +676,50 @@ def main():
     ap.add_argument("--hf-token", default=os.environ.get("HF_TOKEN", ""))
     ap.add_argument("--report-out", default="",
                     help="Write a final JSON verdict to this path")
+    # W&B
+    ap.add_argument("--wandb-project", default=os.environ.get("WANDB_PROJECT", ""),
+                    help="If set, init a W&B run; per-iter verdicts and inner "
+                         "training metrics are logged to it.")
+    ap.add_argument("--wandb-entity", default=os.environ.get("WANDB_ENTITY", ""))
+    ap.add_argument("--wandb-run-name", default="",
+                    help="W&B run name. Defaults to "
+                         "`<chain.NAME>-<n_gpus>g-r<lora_r>-lr<lr>-<seed>`.")
+    ap.add_argument("--wandb-tags", default="",
+                    help="Comma-separated tags for the W&B run.")
     args = ap.parse_args()
+
+    # Resolve LoRA targets (comma string -> list, with chain-aware default).
+    args.lora_targets = (
+        [s.strip() for s in args.lora_targets.split(",") if s.strip()]
+        if args.lora_targets
+        else default_lora_targets()
+    )
+    log.info("lora targets (chain=%s, arch=%s): %s",
+             chain_config.NAME, chain_config.ARCH_MODULE, args.lora_targets)
+
+    # ----------------------------------------------------------------- W&B
+    wb_run = None
+    if args.wandb_project:
+        if not _HAS_WANDB:
+            log.error("--wandb-project set but `wandb` is not installed; "
+                      "`pip install wandb` and rerun.")
+            sys.exit(2)
+        import wandb
+        run_name = (args.wandb_run_name
+                    or f"{chain_config.NAME}-{args.n_gpus}g-r{args.lora_r}"
+                       f"-lr{args.lr:.0e}-s{args.seed}")
+        tags = [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
+        tags = list({*tags, chain_config.NAME, chain_config.ARCH_MODULE})
+        wb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity or None,
+            name=run_name,
+            tags=tags,
+            config={k: v for k, v in vars(args).items()
+                    if k not in {"hf_token"}},
+            reinit=True,
+        )
+        log.info("wandb run: %s", wb_run.url if wb_run else "?")
 
     work = Path(args.work)
     work.mkdir(parents=True, exist_ok=True)
@@ -534,6 +764,7 @@ def main():
              args.eval_shard, len(eval_arr), len(eval_indices))
 
     best = None
+    best_adapter: Path | None = None
     history = []
     for it in range(args.max_iters):
         log.info("=" * 60)
@@ -549,11 +780,12 @@ def main():
             args.train_per_iter, args.val_size, seed, "cuda:0", iter_work,
         )
 
-        # 5. LoRA train
+        # 5. LoRA train (optionally warm-start from previous best adapter)
         out_dir = iter_work / "lora_out"
+        resume = best_adapter if (args.warm_start_iters and best_adapter) else None
         adapter = run_lora_training(
             str(king_dir), train_p, val_p, out_dir, args.n_gpus, args,
-            Path(args.bundle),
+            Path(args.bundle), iter_idx=it, resume_adapter=resume,
         )
 
         # 6. merge
@@ -563,17 +795,47 @@ def main():
         # 7. paired eval
         verdict = paired_eval(
             str(king_dir), str(merged_dir), eval_arr, eval_indices, "cuda:0",
+            wandb_iter=it,
         )
         verdict["iter"] = it
         verdict["seed"] = seed
         history.append(verdict)
         json.dump(verdict, open(iter_work / "verdict.json", "w"), indent=2)
 
+        if wb_run is not None:
+            wb_run.log({
+                "iter/mu_hat": verdict["mu_hat"],
+                "iter/lcb": verdict["lcb"],
+                "iter/ucb": verdict.get("ucb", 0.0),
+                "iter/se_mu": verdict.get("se_mu", 0.0),
+                "iter/margin_over_delta": verdict.get("margin_over_delta", 0.0),
+                "iter/avg_king_loss": verdict["avg_king_loss"],
+                "iter/avg_chall_loss": verdict["avg_chall_loss"],
+                "iter/accepted": int(bool(verdict["accepted"])),
+                "iter/elapsed_s": verdict["elapsed_s"],
+                "iter/seed": seed,
+                "iter/index": it,
+            })
+            wb_run.summary["best_mu_hat"] = max(
+                wb_run.summary.get("best_mu_hat", float("-inf")),
+                verdict["mu_hat"],
+            )
+            wb_run.summary["best_lcb"] = max(
+                wb_run.summary.get("best_lcb", float("-inf")),
+                verdict["lcb"],
+            )
+
         if best is None or verdict["mu_hat"] > best["mu_hat"]:
             best = {**verdict, "iter_dir": str(iter_work),
-                    "merged_dir": str(merged_dir)}
-        if verdict["mu_hat"] >= args.target_mu and verdict["accepted"]:
-            log.info("target reached at iter %d", it)
+                    "merged_dir": str(merged_dir),
+                    "adapter_dir": str(adapter)}
+            best_adapter = adapter
+        if verdict["accepted"] and (
+            verdict["mu_hat"] >= args.target_mu
+            or verdict["lcb"] >= args.target_lcb
+        ):
+            log.info("target reached at iter %d (mu_hat=%.6f lcb=%.6f)",
+                     it, verdict["mu_hat"], verdict["lcb"])
             break
 
     final = {
@@ -610,6 +872,18 @@ def main():
         log.info("uploaded -> %s @ %s", args.upload_repo, info.sha[:12])
     elif args.upload_repo:
         log.warning("not uploading: best=%s", best)
+
+    if wb_run is not None:
+        if best:
+            wb_run.summary["final_best_mu_hat"] = best["mu_hat"]
+            wb_run.summary["final_best_lcb"] = best["lcb"]
+            wb_run.summary["final_accepted"] = bool(best["accepted"])
+            wb_run.summary["final_avg_king_loss"] = best["avg_king_loss"]
+            wb_run.summary["final_avg_chall_loss"] = best["avg_chall_loss"]
+        if final.get("uploaded_repo"):
+            wb_run.summary["uploaded_repo"] = final["uploaded_repo"]
+            wb_run.summary["uploaded_revision"] = final.get("uploaded_revision", "")
+        wb_run.finish()
 
     log.info("DONE — best mu_hat=%.6f accepted=%s",
              best["mu_hat"] if best else float("nan"),

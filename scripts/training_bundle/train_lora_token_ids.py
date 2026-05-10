@@ -170,7 +170,12 @@ def main():
                          "useful when targeting all Qwen3-MoE experts.")
     ap.add_argument("--lora-r", type=int, default=16)
     ap.add_argument("--lora-alpha", type=int, default=32)
-    ap.add_argument("--lora-dropout", type=float, default=0.05)
+    ap.add_argument("--lora-dropout", type=float, default=0.0,
+                    help="MUST be 0.0 when LoRA targets `nn.Parameter` blocks "
+                         "(e.g. Qwen3-MoE fused expert weights). PEFT's "
+                         "ParamWrapper raises `does not work with "
+                         "lora_dropout != 0.` otherwise. Standard `nn.Linear` "
+                         "targets accept any value.")
     ap.add_argument("--lora-target-modules", type=str, default=None,
                     help="comma-separated module name suffixes. Default is "
                          f"chain-aware (current arch={_ARCH_MODULE!r}).")

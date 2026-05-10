@@ -150,7 +150,9 @@ PY_CMD=( torchrun --nproc-per-node="$N_GPUS" train_challenger.py
   # --- LoRA ---
   --lora-r           32
   --lora-alpha       64
-  --lora-dropout     0.05
+  # PEFT requires lora_dropout == 0 when targets are nn.Parameter blocks
+  # (Qwen3-MoE fused experts go through ParamWrapper). Do NOT raise this.
+  --lora-dropout     0.0
   --lora-rslora
   # --- inner-trainer logging cadence ---
   --logging-steps    5

@@ -652,7 +652,10 @@ def main():
     # LoRA
     ap.add_argument("--lora-r", type=int, default=16)
     ap.add_argument("--lora-alpha", type=int, default=32)
-    ap.add_argument("--lora-dropout", type=float, default=0.05)
+    ap.add_argument("--lora-dropout", type=float, default=0.0,
+                    help="MUST be 0.0 for Qwen3-MoE / any chain whose target "
+                         "modules are stored as `nn.Parameter` (PEFT's "
+                         "ParamWrapper rejects non-zero dropout).")
     ap.add_argument("--lora-rslora", action="store_true",
                     help="Rank-stabilized LoRA (alpha / sqrt(r)). Recommended "
                          "when bumping --lora-r above ~32.")

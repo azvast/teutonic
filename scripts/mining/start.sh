@@ -115,7 +115,13 @@ unset EVAL_DELTA || true
 
 # Build the python command. Heredoc array is easier to maintain than a
 # giant single-line string.
-PY_CMD=( torchrun --nproc-per-node="$N_GPUS" train_challenger.py
+#
+# IMPORTANT: train_challenger.py is the *orchestrator* — single Python
+# process. It internally launches `torchrun --nproc_per_node=N_GPUS` for
+# the inner LoRA trainer (train_lora_token_ids.py). Wrapping the
+# orchestrator in torchrun would fork it into N copies, each downloading
+# the king and racing on `cuda:0`. Use plain `python` here.
+PY_CMD=( python train_challenger.py
   # --- I/O ---
   --work          "$WORK_DIR"
   --bundle        "$BUNDLE_DIR"

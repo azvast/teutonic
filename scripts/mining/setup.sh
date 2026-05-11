@@ -84,23 +84,36 @@ chain_config.load_arch()
 print("[ok] active arch registered with HF Auto*")
 EOF
 
-# ---- 8. Work dirs --------------------------------------------------------
+# ---- 8. Work + bundle dirs ----------------------------------------------
 mkdir -p "$WORK_DIR"
 _info "WORK_DIR ready: $WORK_DIR (free: $(df -h "$WORK_DIR" | awk 'NR==2{print $4}'))"
-
-# Mark sibling shell scripts executable (needed if you cloned on Windows
-# and rsync'd to Linux without preserving +x).
-for f in setup.sh smoke.sh start.sh eval.sh submit.sh noise.sh tail.sh; do
-  [ -f "$_LIB_DIR/$f" ] && chmod +x "$_LIB_DIR/$f"
-done
-_info "made *.sh executable"
 
 # Resolve BUNDLE_DIR (relative paths resolved from this script's dir).
 case "$BUNDLE_DIR" in
   /*) bundle_abs="$BUNDLE_DIR" ;;
-  *)  bundle_abs="$(cd "$_LIB_DIR/$BUNDLE_DIR" 2>/dev/null && pwd || echo "$BUNDLE_DIR")" ;;
+  *)  bundle_abs="$_LIB_DIR/$BUNDLE_DIR" ;;
 esac
-[ -d "$bundle_abs" ] || _warn "BUNDLE_DIR=$BUNDLE_DIR (resolved $bundle_abs) does not exist — train_lora_token_ids.py won't be found"
+mkdir -p "$bundle_abs"
+
+# Copy / refresh the training bundle. The orchestrator calls
+# `torchrun $BUNDLE_DIR/train_lora_token_ids.py ...` so the file MUST be at
+# that path. We re-copy every setup run so the bundle stays in sync with
+# the repo if you `git pull` and rerun setup.sh.
+SRC_BUNDLE="$_REPO_ROOT/scripts/training_bundle"
+if [ -d "$SRC_BUNDLE" ]; then
+  cp -r "$SRC_BUNDLE"/* "$bundle_abs"/
+  _info "bundle synced: $SRC_BUNDLE/* -> $bundle_abs/"
+else
+  _warn "source bundle not found at $SRC_BUNDLE — train_lora_token_ids.py won't be available"
+fi
+[ -f "$bundle_abs/train_lora_token_ids.py" ] || _die "FATAL: $bundle_abs/train_lora_token_ids.py missing after sync"
+
+# Mark sibling shell scripts executable (needed if you cloned on Windows
+# and rsync'd to Linux without preserving +x).
+for f in setup.sh smoke.sh start.sh train.sh eval.sh submit.sh noise.sh tail.sh; do
+  [ -f "$_LIB_DIR/$f" ] && chmod +x "$_LIB_DIR/$f"
+done
+_info "made *.sh executable"
 
 # ---- 9. Reminders --------------------------------------------------------
 cat <<EOF
@@ -129,7 +142,9 @@ Next steps (manual — not automated for safety):
   5. Validate the pipeline (~20 min, ~\$10 of GPU):
        ./smoke.sh
 
-  6. Real training (~hours, will push to HF if accepted):
-       ./start.sh
+  6. Real training (~hours, pushes to HF when accepted):
+       ./start.sh                            # production: tmux-managed, prompts
+       # — OR —
+       tmux new -s miner './train.sh'        # manual: bare command, no prompts
 
 EOF

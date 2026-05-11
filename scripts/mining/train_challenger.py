@@ -299,11 +299,19 @@ def compute_per_seq_loss(model, token_batches, device, chunk=LM_HEAD_CHUNK):
 def paired_eval(king_dir: str, chall_dir: str, shard: np.ndarray,
                 indices: list[int], device: str, batch_size: int = 8,
                 n_bootstrap: int = 10000, alpha: float = EVAL_ALPHA,
-                wandb_iter: int | None = None) -> dict:
-    """Mirrors validator's paired bootstrap test on a single GPU.
+                wandb_iter: int | None = None,
+                chall_device: str | None = None) -> dict:
+    """Mirrors validator's paired bootstrap test.
 
     Acceptance floor delta = EVAL_DELTA (default 0.0025 nats/token) matches
     the validator's restored fixed-effect-floor rule.
+
+    Memory note: Qwen3-MoE in bf16 is ~155 GiB, so loading king + challenger
+    on the *same* GPU OOMs even on 192 GiB B200s. If a second CUDA device is
+    available we place king on `device` and challenger on `chall_device`
+    (defaults to `cuda:1` when `device == cuda:0`). With only one visible
+    GPU we fall back to a sequential-load strategy: score king first, evict,
+    then load + score challenger.
 
     Intermediate mu_hat samples + final verdict are logged to W&B (if a
     run is active) under `paired_eval/iter_{wandb_iter}/...` so you can
@@ -315,48 +323,111 @@ def paired_eval(king_dir: str, chall_dir: str, shard: np.ndarray,
         wb_run = _wb.run
     wb_prefix = f"paired_eval/iter_{wandb_iter}" if wandb_iter is not None else "paired_eval"
 
+    # Resolve placement. Two-GPU path is strongly preferred (interleaved
+    # scoring keeps both GPUs warm and halves wall-clock). One-GPU path is
+    # the safety net for smoke tests on a single card.
+    n_cuda = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if chall_device is None:
+        if device.startswith("cuda") and n_cuda >= 2:
+            king_idx = int(device.split(":")[1]) if ":" in device else 0
+            chall_idx = (king_idx + 1) % n_cuda
+            chall_device = f"cuda:{chall_idx}"
+        else:
+            chall_device = device
+    two_gpu = (chall_device != device)
+
     delta = EVAL_DELTA
-    log.info("paired_eval: loading king %s on %s", king_dir, device)
-    king = AutoModelForCausalLM.from_pretrained(
-        king_dir, torch_dtype=torch.bfloat16, device_map={"": device},
-        use_safetensors=True,
-    )
-    king.eval()
-    log.info("paired_eval: loading challenger %s on %s", chall_dir, device)
-    chall = AutoModelForCausalLM.from_pretrained(
-        chall_dir, torch_dtype=torch.bfloat16, device_map={"": device},
-        use_safetensors=True,
-    )
-    chall.eval()
 
-    diffs = []
-    king_sum = chall_sum = 0.0
-    n_done = 0
-    t0 = time.time()
-    for i in range(0, len(indices), batch_size):
-        batch_idx = indices[i:i + batch_size]
-        toks = [shard[j].tolist() for j in batch_idx]
-        kl = compute_per_seq_loss(king, toks, device)
-        cl = compute_per_seq_loss(chall, toks, device)
-        for k, c in zip(kl, cl):
-            diffs.append(k - c)
-            king_sum += k
-            chall_sum += c
-            n_done += 1
-        if (i // batch_size) % 5 == 0:
-            mu = float(np.mean(diffs))
-            log.info("eval %d/%d | mu_hat=%.6f | king=%.4f chall=%.4f | %.1fs",
-                     n_done, len(indices), mu,
-                     king_sum / n_done, chall_sum / n_done, time.time() - t0)
-            if wb_run is not None:
-                wb_run.log({
-                    f"{wb_prefix}/progress_mu_hat": mu,
-                    f"{wb_prefix}/progress_king_loss": king_sum / n_done,
-                    f"{wb_prefix}/progress_chall_loss": chall_sum / n_done,
-                    f"{wb_prefix}/n_done": n_done,
-                })
+    def _score_pair(king_model, chall_model) -> tuple[np.ndarray, float, float, int]:
+        diffs_l: list[float] = []
+        king_sum_l = chall_sum_l = 0.0
+        n_done_l = 0
+        t0_local = time.time()
+        for i in range(0, len(indices), batch_size):
+            batch_idx = indices[i:i + batch_size]
+            toks = [shard[j].tolist() for j in batch_idx]
+            kl = compute_per_seq_loss(king_model, toks, device)
+            cl = compute_per_seq_loss(chall_model, toks, chall_device)
+            for k, c in zip(kl, cl):
+                diffs_l.append(k - c)
+                king_sum_l += k
+                chall_sum_l += c
+                n_done_l += 1
+            if (i // batch_size) % 5 == 0:
+                mu = float(np.mean(diffs_l))
+                log.info("eval %d/%d | mu_hat=%.6f | king=%.4f chall=%.4f | %.1fs",
+                         n_done_l, len(indices), mu,
+                         king_sum_l / n_done_l, chall_sum_l / n_done_l,
+                         time.time() - t0_local)
+                if wb_run is not None:
+                    wb_run.log({
+                        f"{wb_prefix}/progress_mu_hat": mu,
+                        f"{wb_prefix}/progress_king_loss": king_sum_l / n_done_l,
+                        f"{wb_prefix}/progress_chall_loss": chall_sum_l / n_done_l,
+                        f"{wb_prefix}/n_done": n_done_l,
+                    })
+        return np.asarray(diffs_l, dtype=np.float64), king_sum_l, chall_sum_l, n_done_l
 
-    diffs = np.asarray(diffs, dtype=np.float64)
+    if two_gpu:
+        log.info("paired_eval: loading king %s on %s", king_dir, device)
+        king = AutoModelForCausalLM.from_pretrained(
+            king_dir, torch_dtype=torch.bfloat16, device_map={"": device},
+            use_safetensors=True,
+        )
+        king.eval()
+        log.info("paired_eval: loading challenger %s on %s", chall_dir, chall_device)
+        chall = AutoModelForCausalLM.from_pretrained(
+            chall_dir, torch_dtype=torch.bfloat16, device_map={"": chall_device},
+            use_safetensors=True,
+        )
+        chall.eval()
+        t0 = time.time()
+        diffs, king_sum, chall_sum, n_done = _score_pair(king, chall)
+        del king, chall
+        torch.cuda.empty_cache()
+    else:
+        # Sequential-load fallback: score king, evict, score challenger,
+        # then pair them up by index. Doubles wall-clock vs the two-GPU
+        # path but works on a single card.
+        log.warning(
+            "paired_eval: only one CUDA device visible — falling back to "
+            "sequential king→challenger scoring. Expect ~2x wall-clock vs "
+            "the two-GPU path."
+        )
+        log.info("paired_eval: loading king %s on %s", king_dir, device)
+        king = AutoModelForCausalLM.from_pretrained(
+            king_dir, torch_dtype=torch.bfloat16, device_map={"": device},
+            use_safetensors=True,
+        )
+        king.eval()
+        king_losses: list[float] = []
+        t0 = time.time()
+        for i in range(0, len(indices), batch_size):
+            batch_idx = indices[i:i + batch_size]
+            toks = [shard[j].tolist() for j in batch_idx]
+            king_losses.extend(compute_per_seq_loss(king, toks, device))
+        del king
+        torch.cuda.empty_cache()
+
+        log.info("paired_eval: loading challenger %s on %s", chall_dir, device)
+        chall = AutoModelForCausalLM.from_pretrained(
+            chall_dir, torch_dtype=torch.bfloat16, device_map={"": device},
+            use_safetensors=True,
+        )
+        chall.eval()
+        chall_losses: list[float] = []
+        for i in range(0, len(indices), batch_size):
+            batch_idx = indices[i:i + batch_size]
+            toks = [shard[j].tolist() for j in batch_idx]
+            chall_losses.extend(compute_per_seq_loss(chall, toks, device))
+        del chall
+        torch.cuda.empty_cache()
+
+        diffs = np.asarray(king_losses, dtype=np.float64) - np.asarray(chall_losses, dtype=np.float64)
+        king_sum = float(np.sum(king_losses))
+        chall_sum = float(np.sum(chall_losses))
+        n_done = len(diffs)
+
     mu_hat = float(diffs.mean())
     boot = np.empty(n_bootstrap)
     rng = np.random.default_rng(0xB007)
@@ -388,8 +459,6 @@ def paired_eval(king_dir: str, chall_dir: str, shard: np.ndarray,
     if wb_run is not None:
         wb_run.log({f"{wb_prefix}/{k}": v for k, v in res.items()
                     if isinstance(v, (int, float, bool))})
-    del king, chall
-    torch.cuda.empty_cache()
     return res
 
 

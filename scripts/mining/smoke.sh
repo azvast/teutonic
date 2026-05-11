@@ -50,8 +50,11 @@ _info "  WANDB run   = $WB_RUN_NAME (project=${WANDB_PROJECT:-<unset>})"
 # Tip: unset EVAL_DELTA so the validator's default 0.0025 floor is used.
 unset EVAL_DELTA || true
 
+# IMPORTANT: train_challenger.py is the *orchestrator* — single Python
+# process. It internally launches `torchrun --nproc_per_node=N_GPUS` for
+# the inner LoRA trainer. Do NOT wrap the orchestrator in torchrun.
 # shellcheck disable=SC2086
-torchrun --nproc-per-node="$N_GPUS" train_challenger.py \
+python train_challenger.py \
   --work       "$SMOKE_WORK" \
   --bundle     "$BUNDLE_DIR" \
   --n-gpus     "$N_GPUS" \

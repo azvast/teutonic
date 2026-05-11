@@ -88,16 +88,16 @@ exec python train_challenger.py \
   --n-score          8000          `# samples scored by king for curation`  \
   --train-per-iter   8000          `# training samples per iteration`       \
   --val-size         400           `# per-iter val (early-stop signal)`     \
-  --n-eval           5000          `# paired-eval samples vs delta=0.0025`  \
+  --n-eval           8000          `# tighter bootstrap CI for thin-margin runs` \
   --max-iters        5             `# up to 5 iters; stops early if target hit` \
   --warm-start-iters               `# iter N starts from iter N-1's LoRA`   \
-  --target-mu        0.012         `# ~5x delta — bootstrap can certify`    \
-  --target-lcb       0.005         `# 2x delta — shard-variance buffer`     \
+  --target-mu        0.005         `# 2x delta; current king won by only 0.0031` \
+  --target-lcb       0.003         `# delta + 0.0005 buffer for shard variance` \
   `# === optimizer / scheduler =========================================` \
-  --micro-batch      1                                                     \
-  --grad-accum       16            `# effective batch = N_GPUS * mb * ga`   \
-  --lr               1e-4                                                  \
-  --epochs           1.5                                                   \
+  --micro-batch      2             `# mb=2 fits on B200 with ~25GiB headroom` \
+  --grad-accum       8             `# effective batch = N_GPUS * mb * ga = 64` \
+  --lr               5e-5            `# conservative for strong-king fine-tuning` \
+  --epochs           2.0                                                   \
   --warmup-ratio     0.05                                                  \
   --weight-decay     0.01                                                  \
   --max-grad-norm    1.0                                                   \
@@ -106,8 +106,8 @@ exec python train_challenger.py \
   --lr-scheduler     cosine                                                \
   --optim            paged_adamw_8bit  `# saves ~10GiB vs adamw_torch_fused` \
   `# === LoRA ==========================================================` \
-  --lora-r           32                                                    \
-  --lora-alpha       64                                                    \
+  --lora-r           64            `# higher capacity for 128-expert MoE`   \
+  --lora-alpha       128           `# 2*r — rslora-friendly`                \
   --lora-dropout     0.0           `# MUST be 0; PEFT ParamWrapper rejects >0` \
   --lora-rslora                                                            \
   `# === inner-trainer log cadence =====================================` \

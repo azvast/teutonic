@@ -104,6 +104,16 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+# Cheap, lossless perf knobs for B200/H100 — unlock tensor-core fast paths
+# in the few fp32 ops the bf16 path still triggers.
+torch.set_float32_matmul_precision("high")
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32 = True
+if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+    torch.backends.cuda.enable_flash_sdp(True)
 from huggingface_hub import HfApi, snapshot_download
 from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -368,17 +378,18 @@ def paired_eval(king_dir: str, chall_dir: str, shard: np.ndarray,
                     })
         return np.asarray(diffs_l, dtype=np.float64), king_sum_l, chall_sum_l, n_done_l
 
+    attn_impl = os.environ.get("TEUTONIC_ATTN_IMPL", "sdpa")
     if two_gpu:
         log.info("paired_eval: loading king %s on %s", king_dir, device)
         king = AutoModelForCausalLM.from_pretrained(
             king_dir, torch_dtype=torch.bfloat16, device_map={"": device},
-            use_safetensors=True,
+            use_safetensors=True, attn_implementation=attn_impl,
         )
         king.eval()
         log.info("paired_eval: loading challenger %s on %s", chall_dir, chall_device)
         chall = AutoModelForCausalLM.from_pretrained(
             chall_dir, torch_dtype=torch.bfloat16, device_map={"": chall_device},
-            use_safetensors=True,
+            use_safetensors=True, attn_implementation=attn_impl,
         )
         chall.eval()
         t0 = time.time()
@@ -397,7 +408,7 @@ def paired_eval(king_dir: str, chall_dir: str, shard: np.ndarray,
         log.info("paired_eval: loading king %s on %s", king_dir, device)
         king = AutoModelForCausalLM.from_pretrained(
             king_dir, torch_dtype=torch.bfloat16, device_map={"": device},
-            use_safetensors=True,
+            use_safetensors=True, attn_implementation=attn_impl,
         )
         king.eval()
         king_losses: list[float] = []
@@ -412,7 +423,7 @@ def paired_eval(king_dir: str, chall_dir: str, shard: np.ndarray,
         log.info("paired_eval: loading challenger %s on %s", chall_dir, device)
         chall = AutoModelForCausalLM.from_pretrained(
             chall_dir, torch_dtype=torch.bfloat16, device_map={"": device},
-            use_safetensors=True,
+            use_safetensors=True, attn_implementation=attn_impl,
         )
         chall.eval()
         chall_losses: list[float] = []
@@ -484,6 +495,7 @@ def score_and_curate(king_dir: str, shards: list[np.ndarray],
     model = AutoModelForCausalLM.from_pretrained(
         king_dir, torch_dtype=torch.bfloat16, device_map={"": device},
         use_safetensors=True,
+        attn_implementation=os.environ.get("TEUTONIC_ATTN_IMPL", "sdpa"),
     )
     model.eval()
 
@@ -541,8 +553,16 @@ def score_and_curate(king_dir: str, shards: list[np.ndarray],
     general = [r for r in pool if r["bucket"] == "general"]
     hard = [r for r in pool if r["bucket"] == "hard"]
     easy = [r for r in pool if r["bucket"] == "easy"]
-    n_general = int(train_per_iter * 0.6)
-    n_hard = int(train_per_iter * 0.3)
+    # Curriculum mix tilted harder than the validator's training mix.
+    # Rationale: the king has already learned `general` well — every gradient
+    # step on a `general` sample teaches the LoRA marginally less than a
+    # step on a `hard` sample. With delta=0.0025 we need data efficiency,
+    # and `hard` buckets (loss >= p85) are where the king is most
+    # uncertain → most room for the challenger to improve.
+    # 50/40/10 was tuned empirically; bump `hard` further at the cost of
+    # increased variance.
+    n_general = int(train_per_iter * 0.5)
+    n_hard = int(train_per_iter * 0.4)
     n_easy = train_per_iter - n_general - n_hard
 
     train_rows = []

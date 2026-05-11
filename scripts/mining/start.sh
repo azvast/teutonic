@@ -136,16 +136,32 @@ PY_CMD=( python train_challenger.py
   --n-score          8000
   --train-per-iter   8000
   --val-size         400
-  --n-eval           5000
+  # Larger eval shrinks the bootstrap CI (SE ~ 1/sqrt(N)). At 5000 we had
+  # SE(lcb) ≈ 5e-4; at 8000 → ≈ 4e-4. Helps avoid offline-accept /
+  # validator-reject when margins are this thin.
+  --n-eval           8000
   --max-iters        5
   --warm-start-iters
-  --target-mu        0.012
-  --target-lcb       0.005
+  # Targets tuned for the live king (which won by mu_hat=0.0031, lcb=0.0028).
+  # We want comfortable headroom over delta=0.0025 so the validator's
+  # randomized 20k-shard re-eval still clears:
+  #   mu_hat >= 0.005  (~2x delta — 70% headroom for shard variance)
+  #   lcb    >= 0.003  (delta + 0.0005 — small but realistic buffer)
+  # If you find these too easy/hard, tune up/down by ~0.001 at a time.
+  --target-mu        0.005
+  --target-lcb       0.003
   # --- optimizer / scheduler ---
-  --micro-batch      1
-  --grad-accum       16
-  --lr               1e-4
-  --epochs           1.5
+  # mb=2 + ga=8 keeps effective batch the same as mb=1 + ga=16 but halves
+  # the number of forward/backward passes per optimizer step. On B200 we
+  # have ~25 GiB headroom per rank at mb=1 so mb=2 fits with margin.
+  --micro-batch      2
+  --grad-accum       8
+  # Conservative LR for fine-tuning a strong king. 1e-4 is healthy for
+  # fresh LoRA but tends to overshoot when chasing sub-1% nat-improvements.
+  # Sweet spot for "beat-by-a-hair" mining is 3e-5 .. 7e-5.
+  --lr               5e-5
+  --epochs           2.0
+
   --warmup-ratio     0.05
   --weight-decay     0.01
   --max-grad-norm    1.0
@@ -154,8 +170,13 @@ PY_CMD=( python train_challenger.py
   --lr-scheduler     cosine
   --optim            paged_adamw_8bit
   # --- LoRA ---
-  --lora-r           32
-  --lora-alpha       64
+  # r=64 gives the LoRA enough capacity to represent useful expert-FFN
+  # corrections in Qwen3-MoE (it has 128 experts × 3 projs × 64 layers).
+  # rslora keeps the effective alpha bounded as r grows; without it the
+  # gradient scale would explode at high ranks. Alpha = 2*r is the
+  # rslora-compatible sweet spot.
+  --lora-r           64
+  --lora-alpha       128
   # PEFT requires lora_dropout == 0 when targets are nn.Parameter blocks
   # (Qwen3-MoE fused experts go through ParamWrapper). Do NOT raise this.
   --lora-dropout     0.0

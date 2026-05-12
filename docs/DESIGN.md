@@ -148,12 +148,18 @@ From [miner.py](../miner.py):
 7. Submit a reveal commitment whose payload is exactly:
 
    ```
-   <king_hash[:16]>:<challenger_repo>:<challenger_hash>
+   <king_hash[:16]>:<challenger_repo>:<revision_sha>
    ```
 
-   with `blocks_until_reveal=3`. The leading `king_hash[:16]` lets the
-   validator drop submissions targeting an old king (see "stale" handling in
-   §7).
+   with `blocks_until_reveal=3`. The 3rd field is the 40-char HF commit
+   SHA returned by `huggingface_hub.upload_folder(...).oid` — the binding
+   cryptographic commitment to the file tree at upload time. Validator
+   pins evaluation to exactly this revision so any post-commit upload to
+   the same repo is invisible. The leading `king_hash[:16]` is kept for
+   audit visibility but is no longer enforced (stale-king-hash check was
+   removed; see §7). Pre-2026-05-12 the 3rd field was a sha256 of the
+   challenger safetensors and was never verified — that gap let the
+   "empty repo + late upload" exploit work; the revision pin closes it.
 
 ---
 

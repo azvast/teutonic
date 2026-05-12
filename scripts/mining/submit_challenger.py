@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """Submit a pre-built challenger to the chain.
 
-Reads a verdict.json produced by train_challenger.py (which contains the
-king_hash, uploaded HF repo, uploaded revision, challenger_hash) and posts
-the bittensor reveal commitment.
+Reads a verdict.json produced by train_challenger.py (king_hash,
+uploaded_repo, uploaded_revision) and posts the bittensor reveal commitment
+in the form `{king_hash[:16]}:{repo}:{revision_sha}`.
+
+The HF revision SHA is the binding cryptographic commitment to the file
+tree — the validator pins evaluation to exactly that revision, so any
+post-commit upload to the same repo is invisible to evaluation. Pre-
+2026-05-12 the 3rd field was a sha256(safetensors) which was parsed but
+never verified — see miner.py docstring for the empty-repo + late-upload
+exploit it enabled.
 
 Run this on the templar host where the wallet lives.
 
@@ -60,9 +67,12 @@ def main():
     v = json.loads(Path(args.verdict).read_text())
     king_hash = v["king_hash"][:16]
     repo = v.get("uploaded_repo")
-    chall_hash = v.get("challenger_hash")
-    if not repo or not chall_hash:
-        log.error("verdict missing uploaded_repo / challenger_hash — train script must run with --upload-repo and accept the model")
+    revision = v.get("uploaded_revision")
+    if not repo or not revision:
+        log.error("verdict missing uploaded_repo / uploaded_revision — train script must run with --upload-repo and accept the model")
+        sys.exit(2)
+    if len(revision) != 40 or not all(c in "0123456789abcdef" for c in revision.lower()):
+        log.error("uploaded_revision %r is not a 40-char HF commit SHA — re-run train_challenger.py to regenerate verdict.json", revision)
         sys.exit(2)
     if not v["best"]["accepted"]:
         log.error("offline eval rejected (mu_hat=%.6f, lcb=%.6f, delta=%.6f) — refusing to burn TAO",
@@ -93,8 +103,8 @@ def main():
     log.info("coldkey gate ok: repo '%s' contains coldkey prefix '%s'",
              repo, expected_prefix)
 
-    payload = f"{king_hash}:{repo}:{chall_hash}"
-    log.info("payload: %s", payload)
+    payload = f"{king_hash}:{repo}:{revision}"
+    log.info("payload: %s (rev=%s)", payload, revision[:12])
 
     if args.dry_run:
         log.info("[dry-run] not submitting")

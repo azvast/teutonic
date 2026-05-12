@@ -619,10 +619,30 @@ def validate_challenger_config(hf_repo: str, challenger_revision: str,
 import re
 _REPO_RE = re.compile(REPO_PATTERN)
 _SAFETENSORS_SHARD_RE = re.compile(r"^model-\d{5}-of-\d{5}\.safetensors$")
+# HF revision SHAs are git-style: 40 lowercase hex chars. Used to discriminate
+# the new revision-pinned format from the legacy 64-char sha256(model_hash).
+_HF_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+_LEGACY_MODEL_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
-def scan_reveals(subtensor, netuid, completed_repos, seen_hotkeys):
+
+def scan_reveals(subtensor, netuid, completed_repos, seen_hotkeys, legacy_drop_set):
     """Pull all on-chain reveals; return the latest per hotkey that we
     haven't already enqueued for eval.
+
+    Wire format (post-2026-05-12 hard fork): 3 colon-separated fields
+    `{king_hash[:16]}:{hf_repo}:{revision_sha}` where `revision_sha` is the
+    40-char HF commit SHA returned by `huggingface_hub.upload_folder`. The
+    revision is the binding cryptographic commit to the file tree at upload
+    time — `process_challenge` pins evaluation to exactly this revision so
+    any post-commit upload to the same repo is invisible to evaluation.
+
+    Pre-fork (legacy) commits had a 64-char `sha256(safetensors)` in the 3rd
+    field, which was parsed but never verified. That gap let the empty-repo
+    + late-upload exploit work: commit empty repo, then upload a copy of any
+    winning model into the repo before the validator dequeued the entry. We
+    drop those legacy commits at this layer with a one-time WARN per hotkey
+    (no hotkey burn — the miner can simply update miner.py and resubmit on
+    the same hotkey, since `seen` is only mutated by `enqueue`).
 
     Policy: ONE HOTKEY = ONE EVAL, EVER. Once a hotkey is enqueued, it is
     added to `seen_hotkeys` and never accepted again. A miner whose model
@@ -655,16 +675,41 @@ def scan_reveals(subtensor, netuid, completed_repos, seen_hotkeys):
         parts = data.split(":", 2)
         if len(parts) != 3:
             continue
-        king_hash, hf_repo, model_hash = parts
+        king_hash, hf_repo, third = parts
         hf_repo = hf_repo.strip()
+        third = third.strip()
         if not _REPO_RE.match(hf_repo):
             continue
         if hf_repo in completed_repos:
             continue
+        # Format gate: 40-char hex = new revision-pinned format; 64-char hex
+        # = legacy model_hash from pre-fork miner clients (rejected). Anything
+        # else is malformed / never a valid commit (also rejected).
+        if _HF_REVISION_RE.match(third):
+            revision = third
+        elif _LEGACY_MODEL_HASH_RE.match(third):
+            if hotkey not in legacy_drop_set:
+                log.warning(
+                    "dropping legacy 3-field commit from %s (repo=%s, "
+                    "model_hash=%s...) — miner must update miner.py to "
+                    "the post-2026-05-12 revision-pinned format. Hotkey "
+                    "NOT burned; resubmission with the new format on the "
+                    "same hotkey will be accepted.",
+                    hotkey[:16], hf_repo, third[:16])
+                legacy_drop_set.add(hotkey)
+            continue
+        else:
+            if hotkey not in legacy_drop_set:
+                log.warning("dropping malformed reveal from %s (3rd field "
+                            "%r is neither a 40-char HF revision SHA nor a "
+                            "64-char legacy model_hash)",
+                            hotkey[:16], third[:32])
+                legacy_drop_set.add(hotkey)
+            continue
         new.append({
             "hotkey": hotkey, "block": block,
             "king_hash": king_hash.strip(), "hf_repo": hf_repo,
-            "model_hash": model_hash.strip(),
+            "revision": revision,
         })
     new.sort(key=lambda x: x["block"])
     return new
@@ -959,6 +1004,14 @@ class State:
         # policy: a miner cannot get a new shot just by uploading to a fresh
         # repo name — they must register a fresh hotkey on subnet.
         self.completed_repos: set[str] = set()
+        # Per-hotkey dedupe set for legacy 3-field commit warnings. Without
+        # this, every scan_reveals tick (every ~30s) re-warns about the same
+        # un-updated miners and floods the log. In-memory only — fine for a
+        # warning dedupe; on validator restart the WARN re-fires once per
+        # hotkey which is the right behavior (re-surfaces who's still on the
+        # old client). Populated by scan_reveals at the call site for the
+        # 2026-05-12 revision-pinning hard fork.
+        self.legacy_drop_set: set[str] = set()
         self.stats = {"queued": 0, "accepted": 0, "rejected": 0, "failed": 0}
         self.counter = 0
         self.current_eval = None
@@ -2178,16 +2231,48 @@ async def process_challenge(state, r2, entry, subtensor, wallet, *, check_stale=
     # kept on the signature for backward compat but no longer does anything.
     _ = check_stale  # silence linter; intentionally unused now
 
-    try:
-        state.set_phase("hf_metadata", challenge_id=cid, notes=f"resolving {hf_repo}@main")
-        challenger_info = HfApi(token=HF_TOKEN or None).model_info(hf_repo, revision="main")
-        challenger_revision = challenger_info.sha
-        state.remember_revision(hotkey, hf_repo, challenger_revision)
-        log.info("challenger %s pinned at revision %s", hf_repo, challenger_revision[:12])
-    except Exception as exc:
-        log.warning("cannot get commit SHA for %s, skipping", hf_repo)
+    # Pin to the revision SHA that the miner committed on-chain. Per the
+    # 2026-05-12 hard fork, every reveal entry MUST have a `revision` field
+    # (40-char HF commit SHA) — `scan_reveals` rejects everything else at
+    # the chain-intake layer. We still verify the committed SHA actually
+    # exists on HF (catches typos / forged commits where the miner pointed
+    # at a SHA they don't own); a missing revision is a `revision_not_found`
+    # failure rather than the legacy "fall back to HEAD" behavior.
+    #
+    # NOTE: any in-flight queue entry from before the fork lacks `revision`
+    # — those were purged from R2 state at deploy time so they shouldn't
+    # exist; if one slips through we fail it explicitly rather than silently
+    # falling back to `revision="main"` (which would re-open the exploit).
+    challenger_revision = entry.get("revision", "").strip()
+    if not challenger_revision:
+        log.warning("eval %s: legacy queue entry without committed revision "
+                    "(repo=%s) — failing rather than falling back to HEAD",
+                    cid, hf_repo)
         state.failed_repos.add(hf_repo)
-        state.record_failure(entry, "hf_metadata_error", str(exc))
+        state.record_failure(entry, "legacy_format",
+                              "queue entry predates the revision-pinned hard fork; "
+                              "miner must resubmit with the new miner.py")
+        return
+    if not _HF_REVISION_RE.match(challenger_revision):
+        log.warning("eval %s: revision %r is not a valid 40-char HF SHA",
+                    cid, challenger_revision[:32])
+        state.failed_repos.add(hf_repo)
+        state.record_failure(entry, "revision_malformed",
+                              f"on-chain revision {challenger_revision!r} is not 40 hex chars")
+        return
+    try:
+        state.set_phase("hf_metadata", challenge_id=cid,
+                         notes=f"verifying {hf_repo}@{challenger_revision[:12]}")
+        HfApi(token=HF_TOKEN or None).model_info(hf_repo, revision=challenger_revision)
+        state.remember_revision(hotkey, hf_repo, challenger_revision)
+        log.info("challenger %s pinned at revision %s (committed on-chain)",
+                 hf_repo, challenger_revision[:12])
+    except Exception as exc:
+        log.warning("cannot resolve committed revision %s of %s, skipping",
+                    challenger_revision[:12], hf_repo)
+        state.failed_repos.add(hf_repo)
+        state.record_failure(entry, "revision_not_found",
+                              f"HF returned no metadata for {hf_repo}@{challenger_revision[:12]}: {exc}")
         return
 
     state.set_phase("validate_config", challenge_id=cid, notes=f"validating {hf_repo}")
@@ -2585,7 +2670,8 @@ async def main():
                 state.market = tmc
 
             state.set_phase("scan_reveals", notes="polling chain for reveals")
-            reveals = scan_reveals(subtensor, NETUID, state.completed_repos, state.seen)
+            reveals = scan_reveals(subtensor, NETUID, state.completed_repos, state.seen,
+                                    state.legacy_drop_set)
             if reveals:
                 # If any newly-revealed hotkey isn't in the uid_map snapshot we
                 # just refreshed (registration happened *between* refresh and
@@ -2683,7 +2769,8 @@ async def main():
                                         notes=str(exc))
                         state.flush_dashboard()
 
-                fresh = scan_reveals(subtensor, NETUID, state.completed_repos, state.seen)
+                fresh = scan_reveals(subtensor, NETUID, state.completed_repos, state.seen,
+                                      state.legacy_drop_set)
                 if fresh:
                     # See same comment in tick scan above: refresh uid_map
                     # eagerly so the dashboard never shows uid="--" for a

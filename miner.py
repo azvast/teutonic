@@ -3,9 +3,14 @@
 
 1. Downloads the current king model
 2. Applies a small random perturbation to the weights
-3. Uploads as a challenger repo on HuggingFace
-4. Computes SHA256 of the safetensors
-5. Submits a reveal commitment on Bittensor chain
+3. Uploads as a challenger repo on HuggingFace; captures the commit SHA
+4. Submits a reveal commitment on Bittensor chain in the form
+   `{king_hash[:16]}:{repo}:{revision_sha}`. The revision SHA is the
+   binding cryptographic commitment to the file tree — the validator
+   pins evaluation to exactly that revision, so any post-commit upload
+   to the same repo (e.g. swapping in a copy of a winning model after
+   the chain commit lands) is invisible to evaluation. This closed the
+   "empty repo + late upload" exploit on 2026-05-12.
 """
 import argparse
 import hashlib
@@ -89,13 +94,15 @@ def validate_local_config(king_dir: str, challenger_dir: str) -> str | None:
 
 
 def sha256_dir(path):
+    """sha256 over the safetensors of `path`. Used only for the king digest
+    that fills the `king_hash[:16]` field of the on-chain commit (a soft
+    integrity ping; the actual binding is the challenger's HF revision)."""
     h = hashlib.sha256()
     for p in sorted(Path(path).glob("*.safetensors")):
         with open(p, "rb") as f:
             while chunk := f.read(1 << 20):
                 h.update(chunk)
     return h.hexdigest()
-
 
 
 def main():
@@ -203,30 +210,33 @@ def main():
                 new_sd[name] = tensor
         save_file(new_sd, str(st_file))
 
-    challenger_hash = sha256_dir(challenger_dir)
-    log.info("challenger hash: %s", challenger_hash[:16])
-
-    # Pre-flight: validate challenger config matches king
     rejection = validate_local_config(king_dir, challenger_dir)
     if rejection:
         log.error("config validation failed: %s", rejection)
         sys.exit(1)
     log.info("config validation passed")
 
-    # Upload to HuggingFace
     api = HfApi(token=HF_TOKEN)
     api.create_repo(challenger_repo, exist_ok=True, private=False)
     log.info("uploading to %s", challenger_repo)
-    api.upload_folder(
+    commit_info = api.upload_folder(
         folder_path=challenger_dir,
         repo_id=challenger_repo,
         commit_message=f"Challenger from {args.hotkey} (noise={args.noise})",
         allow_patterns=["*.safetensors", "config.json", "tokenizer*", "special_tokens*"],
     )
-    log.info("uploaded to https://huggingface.co/%s", challenger_repo)
+    challenger_revision = commit_info.oid
+    log.info("uploaded to https://huggingface.co/%s @ %s",
+             challenger_repo, challenger_revision[:12])
 
-    # Submit reveal commitment
-    payload = f"{king_hash[:16]}:{challenger_repo}:{challenger_hash}"
+    # On-chain reveal: 3 fields separated by ':' — king_hash[:16]:repo:revision.
+    # The 40-char HF revision SHA is the binding cryptographic commitment to the
+    # file tree at upload time; validator pins evaluation to exactly this SHA so
+    # any post-commit upload to the same repo is invisible. Pre-2026-05-12 the
+    # 3rd field was a sha256(safetensors), which was parsed but never verified —
+    # the empty-repo + late-upload exploit used that gap. Total payload length
+    # ~108 chars, well under the chain commit limit.
+    payload = f"{king_hash[:16]}:{challenger_repo}:{challenger_revision}"
     log.info("submitting reveal: %s", payload)
 
     success, block = subtensor.set_reveal_commitment(

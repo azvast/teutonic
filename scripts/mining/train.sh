@@ -20,9 +20,15 @@
 # use ./start.sh instead.
 #
 # Usage:
-#   ./train.sh [TAG]
+#   ./train.sh [TAG] [EXTRA_FLAGS...]
 #       TAG defaults to "v1". HF repo becomes:
 #         $HF_ACCOUNT/Teutonic-LXXX-$COLDKEY_PREFIX-$TAG
+#
+#       Any flags after TAG are forwarded to train_challenger.py and
+#       override the defaults in this script. Examples:
+#         ./train.sh                         # plain run
+#         ./train.sh v2 --reuse-king         # skip 155 GiB king download
+#         ./train.sh v3 --max-iters 8 --lr 3e-5    # multi-flag override
 # =============================================================================
 set -euo pipefail
 
@@ -42,6 +48,7 @@ _require_var BUNDLE_DIR
 _require_cmd torchrun
 
 TAG="${1:-v1}"
+shift || true   # consume TAG; remaining "$@" are forwarded to train_challenger.py
 UPLOAD_REPO="$(_default_upload_repo "$TAG")"
 WB_RUN_NAME="${WANDB_RUN_NAME:-real-${TAG}-$(date +%Y%m%d-%H%M)}"
 
@@ -85,6 +92,10 @@ exec python train_challenger.py \
   --n-shards         8             `# 8 token-shards loaded into memory`    \
   --shard-start      0                                                     \
   --eval-shard       10            `# held-out shard for paired eval`       \
+  `# Uncomment to skip the ~155 GiB king re-download when restarting a run` \
+  `# after a crash. Safe: falls back to fresh download if the on-chain`     \
+  `# king has flipped since the cached copy was downloaded.`                \
+  `# --reuse-king` \
   --n-score          8000          `# samples scored by king for curation`  \
   --train-per-iter   8000          `# training samples per iteration`       \
   --val-size         400           `# per-iter val (early-stop signal)`     \
@@ -118,4 +129,5 @@ exec python train_challenger.py \
   --wandb-run-name "$WB_RUN_NAME"                                          \
   --wandb-tags     "real,$TAG,$(uname -n),${BT_WALLET_NAME:-nokey}-${BT_WALLET_HOTKEY:-nokey}" \
   ${WANDB_PROJECT:+--wandb-project "$WANDB_PROJECT"}                       \
-  ${WANDB_ENTITY:+--wandb-entity  "$WANDB_ENTITY"}
+  ${WANDB_ENTITY:+--wandb-entity  "$WANDB_ENTITY"}                         \
+  "$@"   # forward any extra flags (e.g. --reuse-king); user flags win

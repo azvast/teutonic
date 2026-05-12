@@ -133,6 +133,9 @@ PY_CMD=( python train_challenger.py
   --n-shards         8
   --shard-start      0
   --eval-shard       10
+  # Uncomment to skip the ~155 GiB king re-download when restarting after a
+  # crash. Auto-falls back to fresh download if the king flipped on chain.
+  # --reuse-king
   --n-score          8000
   --train-per-iter   8000
   --val-size         400

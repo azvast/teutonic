@@ -18,7 +18,16 @@
 # Does NOT push to HF. Does NOT submit on-chain. Safe to run repeatedly.
 #
 # Usage:
-#   ./smoke.sh
+#   ./smoke.sh                       # plain smoke run
+#   ./smoke.sh --reuse-king          # skip re-downloading the king (~155 GiB)
+#                                     # if it's already cached in $SMOKE_WORK/king
+#   ./smoke.sh --max-iters 2 ...     # any other train_challenger.py flag is
+#                                     # forwarded as-is (overrides smoke defaults)
+#
+# Note: smoke.sh uses its own work dir (`${WORK_DIR}-smoke`), so the first run
+# downloads its own king. Subsequent `./smoke.sh --reuse-king` runs reuse it.
+# To share start.sh's king cache, symlink it once:
+#   ln -s /root/teutonic-mining/work/king /root/teutonic-mining/work-smoke/king
 # =============================================================================
 set -euo pipefail
 
@@ -53,6 +62,10 @@ unset EVAL_DELTA || true
 # IMPORTANT: train_challenger.py is the *orchestrator* — single Python
 # process. It internally launches `torchrun --nproc_per_node=N_GPUS` for
 # the inner LoRA trainer. Do NOT wrap the orchestrator in torchrun.
+#
+# Any extra CLI flags passed to smoke.sh (e.g. --reuse-king) are appended
+# via "$@" as the LAST positional args. argparse honors the last
+# occurrence of a repeated flag, so user overrides win.
 # shellcheck disable=SC2086
 python train_challenger.py \
   --work       "$SMOKE_WORK" \
@@ -87,7 +100,8 @@ python train_challenger.py \
   ${WANDB_PROJECT:+--wandb-project "$WANDB_PROJECT"} \
   ${WANDB_ENTITY:+--wandb-entity  "$WANDB_ENTITY"} \
   --wandb-run-name "$WB_RUN_NAME" \
-  --wandb-tags     "smoke,${BT_WALLET_NAME:-nokey},$(uname -n)"
+  --wandb-tags     "smoke,${BT_WALLET_NAME:-nokey},$(uname -n)" \
+  "$@"
 
 echo
 _info "smoke completed. Verdict:"

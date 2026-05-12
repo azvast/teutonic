@@ -694,6 +694,13 @@ def main():
                     help="Index of first shard to use (other than eval shard)")
     ap.add_argument("--eval-shard", type=int, default=10,
                     help="Held-out shard index for offline paired eval")
+    ap.add_argument("--reuse-king", action="store_true",
+                    help="If a previously-downloaded king at $WORK/king matches "
+                         "the live king (same repo + revision), reuse it "
+                         "instead of re-downloading ~155 GiB. Falls back to "
+                         "fresh download if the king has flipped on chain or "
+                         "the local dir is incomplete. Dataset shards and "
+                         "manifest are always cached regardless of this flag.")
     ap.add_argument("--n-eval", type=int, default=2000,
                     help="Sequences for offline paired eval (validator uses 20k)")
     ap.add_argument("--n-score", type=int, default=4000)
@@ -809,12 +816,46 @@ def main():
     # 1. king
     king = fetch_king()
     king_dir = work / "king"
-    if king_dir.exists():
-        shutil.rmtree(king_dir)
-    log.info("downloading king to %s", king_dir)
-    snapshot_download(king["hf_repo"], local_dir=str(king_dir),
-                      revision=king.get("king_revision") or None,
-                      token=args.hf_token or None, max_workers=16)
+    king_meta_path = king_dir / ".king_meta.json"
+    want_repo = king["hf_repo"]
+    want_rev = king.get("king_revision") or ""
+
+    # Decide: reuse the cached king or wipe + re-download.
+    # The marker file is written LAST during a successful download, so its
+    # mere existence is a strong proof that the previous download finished.
+    reuse_ok = False
+    if args.reuse_king and king_meta_path.is_file():
+        try:
+            meta = json.loads(king_meta_path.read_text())
+            if meta.get("hf_repo") == want_repo and (
+                    not want_rev or meta.get("king_revision") == want_rev):
+                reuse_ok = True
+        except Exception as e:  # noqa: BLE001
+            log.warning("--reuse-king: cannot parse %s (%s); re-downloading",
+                        king_meta_path, e)
+
+    if reuse_ok:
+        log.info("--reuse-king: cached king matches live (%s @ %s); "
+                 "skipping ~155 GiB download",
+                 want_repo, (want_rev or "HEAD")[:12])
+    else:
+        if king_dir.exists():
+            if args.reuse_king:
+                log.warning("--reuse-king set but cached king does not match "
+                            "live king (or is incomplete); wiping and "
+                            "re-downloading.")
+            shutil.rmtree(king_dir)
+        log.info("downloading king to %s", king_dir)
+        snapshot_download(want_repo, local_dir=str(king_dir),
+                          revision=want_rev or None,
+                          token=args.hf_token or None, max_workers=16)
+        # Persist a marker LAST so a killed download doesn't leave a stale
+        # "good" marker that --reuse-king would later trust.
+        king_meta_path.write_text(json.dumps({
+            "hf_repo": want_repo,
+            "king_revision": want_rev,
+        }))
+
     king_hash = sha256_dir(king_dir)
     log.info("king sha256[:16]=%s", king_hash[:16])
 

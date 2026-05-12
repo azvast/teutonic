@@ -71,8 +71,7 @@ pip install \
   bitsandbytes \
   wandb \
   hf_transfer \
-  httpx \
-  flash-attn --no-build-isolation
+  httpx
 
 # ---- 7. Arch sanity (matches docs/MINING.md §1) -------------------------
 _info "verifying chain_config + arch import..."

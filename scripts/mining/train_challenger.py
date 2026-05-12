@@ -104,16 +104,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-
-# Cheap, lossless perf knobs for B200/H100 — unlock tensor-core fast paths
-# in the few fp32 ops the bf16 path still triggers.
-torch.set_float32_matmul_precision("high")
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cuda.matmul.allow_tf32 = True
-if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
-    torch.backends.cuda.enable_mem_efficient_sdp(True)
-if hasattr(torch.backends.cuda, "enable_flash_sdp"):
-    torch.backends.cuda.enable_flash_sdp(True)
 from huggingface_hub import HfApi, snapshot_download
 from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -378,18 +368,17 @@ def paired_eval(king_dir: str, chall_dir: str, shard: np.ndarray,
                     })
         return np.asarray(diffs_l, dtype=np.float64), king_sum_l, chall_sum_l, n_done_l
 
-    attn_impl = os.environ.get("TEUTONIC_ATTN_IMPL", "sdpa")
     if two_gpu:
         log.info("paired_eval: loading king %s on %s", king_dir, device)
         king = AutoModelForCausalLM.from_pretrained(
             king_dir, torch_dtype=torch.bfloat16, device_map={"": device},
-            use_safetensors=True, attn_implementation=attn_impl,
+            use_safetensors=True,
         )
         king.eval()
         log.info("paired_eval: loading challenger %s on %s", chall_dir, chall_device)
         chall = AutoModelForCausalLM.from_pretrained(
             chall_dir, torch_dtype=torch.bfloat16, device_map={"": chall_device},
-            use_safetensors=True, attn_implementation=attn_impl,
+            use_safetensors=True,
         )
         chall.eval()
         t0 = time.time()
@@ -408,7 +397,7 @@ def paired_eval(king_dir: str, chall_dir: str, shard: np.ndarray,
         log.info("paired_eval: loading king %s on %s", king_dir, device)
         king = AutoModelForCausalLM.from_pretrained(
             king_dir, torch_dtype=torch.bfloat16, device_map={"": device},
-            use_safetensors=True, attn_implementation=attn_impl,
+            use_safetensors=True,
         )
         king.eval()
         king_losses: list[float] = []
@@ -423,7 +412,7 @@ def paired_eval(king_dir: str, chall_dir: str, shard: np.ndarray,
         log.info("paired_eval: loading challenger %s on %s", chall_dir, device)
         chall = AutoModelForCausalLM.from_pretrained(
             chall_dir, torch_dtype=torch.bfloat16, device_map={"": device},
-            use_safetensors=True, attn_implementation=attn_impl,
+            use_safetensors=True,
         )
         chall.eval()
         chall_losses: list[float] = []
@@ -495,7 +484,6 @@ def score_and_curate(king_dir: str, shards: list[np.ndarray],
     model = AutoModelForCausalLM.from_pretrained(
         king_dir, torch_dtype=torch.bfloat16, device_map={"": device},
         use_safetensors=True,
-        attn_implementation=os.environ.get("TEUTONIC_ATTN_IMPL", "sdpa"),
     )
     model.eval()
 
@@ -959,41 +947,9 @@ def main():
         final["uploaded_repo"] = args.upload_repo
         final["uploaded_revision"] = info.sha
         final["challenger_hash"] = sha256_dir(Path(best["merged_dir"]))
-        log.info("uploaded -> %s @ %s", args.upload_repo, info.sha[:12])
-
-        # Pre-flight: run the validator's exact reject-logic against our
-        # just-uploaded repo. If it fails here, the validator will fail
-        # too — better to know now than after burning TAO on chain commit.
-        try:
-            from preflight import preflight_check  # local module
-        except Exception as e:
-            log.warning("preflight: module import failed (%s); skipping check", e)
-            preflight_check = None  # type: ignore
-        if preflight_check is not None:
-            log.info("preflight: replaying validator checks against %s @ %s",
-                     args.upload_repo, info.sha[:12])
-            reasons = preflight_check(
-                hf_repo=args.upload_repo,
-                revision=info.sha,
-                king_repo=final.get("king_repo", ""),
-                king_revision=final.get("king_revision", ""),
-                coldkey_prefix=os.environ.get("COLDKEY_PREFIX", ""),
-                hf_token=args.hf_token,
-            )
-            final["preflight"] = {
-                "ok": len(reasons) == 0,
-                "reasons": reasons,
-            }
-            if reasons:
-                log.error("preflight: validator WOULD REJECT this repo:")
-                for r in reasons:
-                    log.error("  - %s", r)
-                log.error("preflight: do NOT submit on-chain (./submit.sh will burn TAO)")
-            else:
-                log.info("preflight: ✓ all checks pass — repo is ready to submit")
-
         if args.report_out:
             json.dump(final, open(args.report_out, "w"), indent=2)
+        log.info("uploaded -> %s @ %s", args.upload_repo, info.sha[:12])
     elif args.upload_repo:
         log.warning("not uploading: best=%s", best)
 

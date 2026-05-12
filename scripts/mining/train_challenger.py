@@ -94,11 +94,13 @@ _DOTENV_COUNT = _load_dotenv(_DOTENV_PATH)
 
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
+import multiprocessing as mp
 import shutil
 import struct
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -583,6 +585,102 @@ def score_and_curate(king_dir: str, shards: list[np.ndarray],
 
 
 # ---------------------------------------------------------------------------
+# Subprocess isolation for GPU-heavy steps
+# ---------------------------------------------------------------------------
+# Background: Python cannot fully release a CUDA context without exiting the
+# process. `del model; torch.cuda.empty_cache()` returns *cached* memory to
+# PyTorch's allocator, but the CUDA context's reserved VRAM stays attached
+# to the process until it exits. If the orchestrator loads the king on
+# cuda:0 for scoring (~155 GiB), then spawns `torchrun` for the inner
+# trainer, the parent process keeps holding 155 GiB on cuda:0 while waiting
+# on the subprocess — and rank 0 of the inner trainer OOMs trying to load
+# its own king on the same GPU.
+#
+# Fix: spawn each GPU-heavy phase in a child process. When the child
+# exits, the OS releases its CUDA context unconditionally. Workers must be
+# module-level (so spawn-pickling can find them by name).
+# ---------------------------------------------------------------------------
+def _score_worker(king_dir: str, shard_paths: list[str], n_score: int,
+                  train_per_iter: int, val_size: int, seed: int,
+                  device: str, work_str: str) -> None:
+    """Spawn-target for score_and_curate. Loads shards from disk and runs
+    the in-process scoring. Exit code 0 on success, non-zero on failure."""
+    shards = [load_shard(Path(p))[0] for p in shard_paths]
+    score_and_curate(king_dir, shards, n_score, train_per_iter, val_size,
+                     seed, device, Path(work_str))
+
+
+def score_and_curate_isolated(king_dir: str, shard_paths: list[Path],
+                               n_score: int, train_per_iter: int,
+                               val_size: int, seed: int, device: str,
+                               work: Path) -> tuple[Path, Path]:
+    """CUDA-safe wrapper around score_and_curate. Runs the scoring in a
+    fresh Python process so the king's ~155 GiB CUDA context is fully
+    released when scoring finishes (before torchrun spawns)."""
+    ctx = mp.get_context("spawn")
+    p = ctx.Process(
+        target=_score_worker,
+        args=(king_dir, [str(sp) for sp in shard_paths], n_score,
+              train_per_iter, val_size, seed, device, str(work)),
+    )
+    log.info("[isolate] scoring in subprocess (device=%s)", device)
+    p.start()
+    p.join()
+    if p.exitcode != 0:
+        raise RuntimeError(
+            f"score_and_curate subprocess failed with exit code {p.exitcode}; "
+            f"see traceback above")
+    log.info("[isolate] scoring subprocess released CUDA context cleanly")
+    return work / "train.jsonl", work / "val.jsonl"
+
+
+def _paired_eval_worker(q: "mp.Queue", king_dir: str, chall_dir: str,
+                         eval_shard_path: str, eval_indices: list[int],
+                         device: str, batch_size: int, n_bootstrap: int,
+                         alpha: float, wandb_iter: int | None) -> None:
+    """Spawn-target for paired_eval. Returns the verdict dict via queue.
+    Exceptions are serialized into the queue so the parent can re-raise."""
+    try:
+        eval_arr, _ = load_shard(Path(eval_shard_path))
+        verdict = paired_eval(
+            king_dir, chall_dir, eval_arr, eval_indices, device,
+            batch_size=batch_size, n_bootstrap=n_bootstrap, alpha=alpha,
+            wandb_iter=wandb_iter,
+        )
+        q.put(("ok", verdict))
+    except Exception as e:  # noqa: BLE001
+        q.put(("err", f"{type(e).__name__}: {e}\n{traceback.format_exc()}"))
+
+
+def paired_eval_isolated(king_dir: str, chall_dir: str,
+                          eval_shard_path: Path, eval_indices: list[int],
+                          device: str, batch_size: int = 8,
+                          n_bootstrap: int = 10000,
+                          alpha: float = EVAL_ALPHA,
+                          wandb_iter: int | None = None) -> dict:
+    """CUDA-safe wrapper around paired_eval. The king (~155 GiB) and
+    challenger (~155 GiB) live on cuda:0 and cuda:1 during eval; when the
+    subprocess exits, ~310 GiB across both GPUs is released so the next
+    iteration's scoring can start clean."""
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    p = ctx.Process(
+        target=_paired_eval_worker,
+        args=(q, king_dir, chall_dir, str(eval_shard_path), eval_indices,
+              device, batch_size, n_bootstrap, alpha, wandb_iter),
+    )
+    log.info("[isolate] paired_eval in subprocess (king=%s, chall on cuda:1 if available)",
+             device)
+    p.start()
+    status, payload = q.get()  # blocks until worker reports
+    p.join()
+    if status != "ok":
+        raise RuntimeError(f"paired_eval subprocess failed:\n{payload}")
+    log.info("[isolate] paired_eval subprocess released CUDA context cleanly")
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # Multi-GPU LoRA training (delegated to torchrun)
 # ---------------------------------------------------------------------------
 def run_lora_training(base_model: str, train_p: Path, val_p: Path,
@@ -859,30 +957,36 @@ def main():
     king_hash = sha256_dir(king_dir)
     log.info("king sha256[:16]=%s", king_hash[:16])
 
-    # 2. dataset shards
+    # 2. dataset shards.
+    # NOTE: we only download + verify; arrays are NOT held in orchestrator
+    # RAM. The subprocesses (score_and_curate_isolated / paired_eval_isolated)
+    # re-load from disk so the orchestrator stays CPU-only between phases.
     manifest = fetch_manifest(cache)
     train_shard_idxs = list(range(args.shard_start, args.shard_start + args.n_shards))
     if args.eval_shard in train_shard_idxs:
         raise ValueError("eval_shard cannot overlap training shards")
-    shards = []
+    shard_paths: list[Path] = []
     for idx in train_shard_idxs:
         key = manifest["shards"][idx]["key"]
         path = cache / Path(key).name
         download_shard(key, path)
-        arr, _ = load_shard(path)
-        log.info("loaded shard %d: %d sequences", idx, len(arr))
-        shards.append(arr)
+        shard_paths.append(path)
+        log.info("training shard %d ready at %s", idx, path)
 
     eval_key = manifest["shards"][args.eval_shard]["key"]
     eval_path = cache / Path(eval_key).name
     download_shard(eval_key, eval_path)
-    eval_arr, _ = load_shard(eval_path)
+    # Load eval shard JUST to get the sequence count for index sampling,
+    # then immediately drop it. The paired_eval subprocess will re-load.
+    _eval_arr_tmp, _ = load_shard(eval_path)
+    eval_count = len(_eval_arr_tmp)
+    del _eval_arr_tmp
     rng_eval = np.random.default_rng(0xE1A)
     eval_indices = rng_eval.choice(
-        len(eval_arr), size=min(args.n_eval, len(eval_arr)), replace=False,
+        eval_count, size=min(args.n_eval, eval_count), replace=False,
     ).tolist()
     log.info("held-out eval shard %d: %d sequences (sampling %d)",
-             args.eval_shard, len(eval_arr), len(eval_indices))
+             args.eval_shard, eval_count, len(eval_indices))
 
     best = None
     best_adapter: Path | None = None
@@ -893,11 +997,13 @@ def main():
         log.info("=" * 60)
         seed = args.seed + 1000 * it
 
-        # 3+4. score+curate
+        # 3+4. score+curate (in a subprocess so the king's ~155 GiB CUDA
+        # context is released before torchrun spawns — otherwise rank 0 of
+        # the inner trainer OOMs on cuda:0)
         iter_work = work / f"iter_{it:02d}"
         iter_work.mkdir(exist_ok=True)
-        train_p, val_p = score_and_curate(
-            str(king_dir), shards, args.n_score,
+        train_p, val_p = score_and_curate_isolated(
+            str(king_dir), shard_paths, args.n_score,
             args.train_per_iter, args.val_size, seed, "cuda:0", iter_work,
         )
 
@@ -913,9 +1019,10 @@ def main():
         merged_dir = iter_work / "merged"
         merge_lora(str(king_dir), adapter, merged_dir)
 
-        # 7. paired eval
-        verdict = paired_eval(
-            str(king_dir), str(merged_dir), eval_arr, eval_indices, "cuda:0",
+        # 7. paired eval (in a subprocess so king + challenger ~310 GiB
+        # across cuda:0+cuda:1 is released before the next iter's scoring)
+        verdict = paired_eval_isolated(
+            str(king_dir), str(merged_dir), eval_path, eval_indices, "cuda:0",
             wandb_iter=it,
         )
         verdict["iter"] = it

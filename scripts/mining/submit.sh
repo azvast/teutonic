@@ -61,6 +61,22 @@ if not v.get("uploaded_repo") or not v.get("challenger_hash"):
     sys.exit("[error] verdict missing uploaded_repo / challenger_hash; was --upload-repo set?")
 PY
 
+# Pre-flight: replay the validator's reject-logic locally. This catches
+# config_rejected / model_not_found / coldkey_required *before* you burn
+# TAO on the chain commit. Exits nonzero on any reason; press y to override
+# if you've manually verified it's OK (rare).
+_info "running preflight against ${VERDICT}..."
+if python "$_LIB_DIR/preflight.py" --verdict "$VERDICT"; then
+  _info "preflight: ✓ validator should accept this repo."
+else
+  _warn "preflight reported issues above. The validator will likely REJECT this repo."
+  read -r -p "[mining] override and submit anyway? (y/N) " ovr
+  case "$ovr" in
+    y|Y|yes|YES) _warn "proceeding despite preflight failures (TAO at risk)" ;;
+    *) _die "aborted by preflight." ;;
+  esac
+fi
+
 read -r -p "[mining] proceed with on-chain reveal? (y/N) " ans
 case "$ans" in
   y|Y|yes|YES) ;;

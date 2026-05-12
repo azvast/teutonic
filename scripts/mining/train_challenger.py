@@ -959,9 +959,41 @@ def main():
         final["uploaded_repo"] = args.upload_repo
         final["uploaded_revision"] = info.sha
         final["challenger_hash"] = sha256_dir(Path(best["merged_dir"]))
+        log.info("uploaded -> %s @ %s", args.upload_repo, info.sha[:12])
+
+        # Pre-flight: run the validator's exact reject-logic against our
+        # just-uploaded repo. If it fails here, the validator will fail
+        # too — better to know now than after burning TAO on chain commit.
+        try:
+            from preflight import preflight_check  # local module
+        except Exception as e:
+            log.warning("preflight: module import failed (%s); skipping check", e)
+            preflight_check = None  # type: ignore
+        if preflight_check is not None:
+            log.info("preflight: replaying validator checks against %s @ %s",
+                     args.upload_repo, info.sha[:12])
+            reasons = preflight_check(
+                hf_repo=args.upload_repo,
+                revision=info.sha,
+                king_repo=final.get("king_repo", ""),
+                king_revision=final.get("king_revision", ""),
+                coldkey_prefix=os.environ.get("COLDKEY_PREFIX", ""),
+                hf_token=args.hf_token,
+            )
+            final["preflight"] = {
+                "ok": len(reasons) == 0,
+                "reasons": reasons,
+            }
+            if reasons:
+                log.error("preflight: validator WOULD REJECT this repo:")
+                for r in reasons:
+                    log.error("  - %s", r)
+                log.error("preflight: do NOT submit on-chain (./submit.sh will burn TAO)")
+            else:
+                log.info("preflight: ✓ all checks pass — repo is ready to submit")
+
         if args.report_out:
             json.dump(final, open(args.report_out, "w"), indent=2)
-        log.info("uploaded -> %s @ %s", args.upload_repo, info.sha[:12])
     elif args.upload_repo:
         log.warning("not uploading: best=%s", best)
 

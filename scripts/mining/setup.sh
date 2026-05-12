@@ -111,7 +111,8 @@ fi
 
 # Mark sibling shell scripts executable (needed if you cloned on Windows
 # and rsync'd to Linux without preserving +x).
-for f in setup.sh smoke.sh start.sh train.sh eval.sh submit.sh noise.sh tail.sh; do
+for f in setup.sh smoke.sh start.sh train.sh eval.sh submit.sh \
+         preflight.sh noise.sh tail.sh; do
   [ -f "$_LIB_DIR/$f" ] && chmod +x "$_LIB_DIR/$f"
 done
 _info "made *.sh executable"

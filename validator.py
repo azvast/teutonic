@@ -2145,8 +2145,24 @@ def _is_transient_eval_error(exc: Exception | str) -> tuple[bool, str]:
     if isinstance(exc, asyncio.CancelledError):
         return True, "validator_cancelled"
     text = str(exc).lower()
+    # Eval-server-reported failures are categorically PERMANENT for that model:
+    # the eval-server already gave it a full prefetch budget / GPU window, so
+    # retrying just burns another 30-min budget on the same dead CDN (or the
+    # same OOM, or the same rejected config). Caught by the explicit
+    # "prefetch ... exceeded ... (likely stuck CDN)" string the eval-server
+    # raises, plus any error structured as `eval server error: {...}` coming
+    # via the SSE error event. Genuine infra hiccups (network reset, stream
+    # truncation, CancelledError above) still match the remaining
+    # transient_markers below and are retried as today. Pre-2026-05-13 these
+    # both fell into the "eval server error" wildcard marker and got 3 retry
+    # attempts each — observed live with jenny08311 v5.13 (2026-05-12, ~90
+    # min wasted) and ClarenceDan A5518/A5519 (2026-05-13, ~3 hours wasted
+    # back-to-back).
+    if ("stuck cdn" in text) or ("prefetch" in text and "exceeded" in text):
+        return False, "prefetch_exhausted"
+    if text.startswith("eval server error") or "'eval server error'" in text:
+        return False, "eval_server_reported"
     transient_markers = (
-        "eval server error",
         "internal error",
         "stream idle",
         "watchdog timeout",

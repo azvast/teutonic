@@ -47,13 +47,16 @@ module.exports = {
       TMC_API_KEY: doppler("TMC_API_KEY"),
       DISCORD_BOT_TOKEN: doppler("DISCORD_BOT_TOKEN"),
       DISCORD_CHANNEL_ID: doppler("DISCORD_CHANNEL_ID"),
-      // LXXX 80B per-eval wall is ~10 min steady (153 GiB chall HF prefetch
-      // ~270s + sharded load ~22s + sharded probe ~4s + bootstrap ~330s at
-      // EVAL_N=5000 + cleanup ~15s) and ~14 min cold-page-cache (load grows
-      // to ~218s when chall safetensors aren't in OS page cache). The 3600s
-      // (1h) restart envelope gives ~4-5x safety margin. Pre-LXXX value was
-      // 1800s for the 24B Quasar chain at ~5 min/eval.
-      TEUTONIC_TICK_RESTART_AFTER: "3600",
+      // Hard wall-clock cap per model: validator's `_bounded_eval` aborts
+      // and records `eval_hard_timeout` at this mark — no retry, next entry
+      // runs. Aligned with eval-server's HF_PREFETCH_TIMEOUT=1800s so a
+      // stalled HF CDN burns exactly one 30-min budget before being skipped.
+      // Pre-2026-05-13 value was 3600s (1h envelope, 3x retries on transient
+      // errors = up to 90 min wasted per stuck CDN — observed live with the
+      // jenny08311 v5.13 case 2026-05-12 and ClarenceDan A5518/A5519 cases
+      // 2026-05-13). Steady-state eval is ~10 min so 1800s still gives ~3x
+      // headroom for legitimate slow downloads on the new B200 pod.
+      TEUTONIC_TICK_RESTART_AFTER: "1800",
       TEUTONIC_MAX_CONSECUTIVE_TICK_ERRORS: "20",
       // Stream-idle watchdog envelope must accommodate the multi-minute
       // chall HF prefetch + sharded model load. The eval_server emits SSE

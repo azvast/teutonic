@@ -2736,9 +2736,29 @@ async def main():
                 # watchdog), since TimeoutError == asyncio.TimeoutError in py3.11+
                 # and we don't want to confuse a 423s stream-idle event with a
                 # 1800s hard kill.
+                #
+                # CancelledError is special: asyncio.wait_for cancels the inner
+                # task when the timer fires, then re-raises as asyncio.TimeoutError
+                # *iff* the CancelledError propagates up unmodified. Wrapping it
+                # in _EvalInnerError(CancelledError) breaks that path — the outer
+                # `except asyncio.TimeoutError` never fires and we fall through
+                # to the transient-error retry branch (validator_cancelled), which
+                # then burns the full TICK_RESTART_AFTER * MAX_TRANSIENT_EVAL_RETRIES
+                # = 30 min × 3 = 90 min on every wall-clocked eval. Observed live
+                # 2026-05-13 with eval-0479 burning ~2 hours in 4 retries before
+                # being noticed. Re-raise CancelledError directly so
+                # asyncio.wait_for can do its job; SIGTERM cancellations during
+                # `pm2 restart` also ride this path and propagate cleanly out of
+                # the main loop (the entry was already popped from the queue, so
+                # losing it on hard-kill matches the previous behavior anyway —
+                # the prior `validator_cancelled` retry path didn't actually
+                # rescue SIGTERM-cancelled evals because the process exited via
+                # sys.exit(0) in the signal handler before the requeue ran).
                 async def _bounded_eval():
                     try:
                         await process_challenge(state, r2, entry, subtensor, wallet)
+                    except asyncio.CancelledError:
+                        raise
                     except BaseException as inner:
                         # Re-raise inner exceptions wrapped so they don't collide
                         # with asyncio.wait_for's own TimeoutError sentinel.
